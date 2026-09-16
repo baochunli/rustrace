@@ -13,8 +13,8 @@ binaries. Release CI verifies macOS Apple Silicon and Linux x86-64.
 Install rustup 1.28.1 or newer and your system's native compiler/linker tools
 first: Xcode Command Line Tools on macOS, or `build-essential` on Debian/Ubuntu.
 Debian/Ubuntu also needs `pkg-config`; Fedora uses `gcc`, `gcc-c++`, `make`,
-and `pkgconf-pkg-config`. See [native build prerequisites and CI measurements](supported-environment.md#native-build-prerequisites)
-for the platform commands. Installation requires curl, Git, and dependency
+and `pkgconf-pkg-config`. Install these prerequisites with your platform's
+package manager. Installation requires curl, Git, and dependency
 network access. The installer never installs rustup; when it is missing, it prints the official command:
 
 ```sh
@@ -89,8 +89,8 @@ once a release is published. It identifies the source repository and tag; its
 (`.rprov`, currently 1). `assignment_format` is the highest accepted assignment
 package version (`.rta`, currently 2). `event_format` identifies the event
 envelope version (currently 1). These fields match `rustrace --version --verbose`.
-See [Releasing Rustrace](releasing.md) for the contract
-and publication procedure.
+Together, these fields define the release manifest contract used by installation
+and update checks.
 
 ## Uninstall
 
@@ -161,12 +161,11 @@ rustup component add rust-src
 
 The `doctor` command reports a missing rust-analyzer component as a warning,
 not a blocker. Recording, editing, Cargo commands, and submission remain
-available without language services. See
-[Supported pilot environment](supported-environment.md#rust-toolchain) for the
-complete component policy.
+available without language services. The Rust language-service components are
+optional for those operations.
 
 ## Deferred targets and guarantees
 
 Prebuilt binaries and native Windows support remain deferred. Other source-build
-platforms follow the [supported environment policy](supported-environment.md).
+platforms are outside the pilot's supported environment.
 Source distribution makes no byte-identical reproducible-build claim.

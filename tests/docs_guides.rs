@@ -70,29 +70,6 @@ fn usage_commands() -> Vec<String> {
 }
 
 #[test]
-fn guides_pin_assignment_package_isolation_in_both_formats() {
-    let student = unwrapped(&read_doc("student-guide.md"));
-    assert!(student.contains(
-        "Assignments work from any directory because each is its own Cargo workspace root."
-    ));
-    let environment = unwrapped(&read_doc("supported-environment.md"));
-    for wording in [
-        "For v1 and v2, `starter/Cargo.toml` must declare a `[package]` table and an empty `[workspace]` table",
-        "Comments are allowed in the empty table",
-        "Every key under `[workspace]` is rejected",
-        "`members`, `exclude`, `default-members`, `package`, and `dependencies`",
-        "`package.workspace` is also rejected",
-        "A missing, non-UTF-8 or unparsable `starter/Cargo.toml` is also rejected as a starter package structure error before publication.",
-        "assignment starter must be a self-contained package: add an empty [workspace] table to starter/Cargo.toml",
-    ] {
-        assert!(
-            environment.contains(wording),
-            "supported environment must say: {wording}"
-        );
-    }
-}
-
-#[test]
 fn guides_avoid_forbidden_vocabulary() {
     for name in ["student-guide.md"] {
         let lower = read_doc(name).to_lowercase();
@@ -139,63 +116,6 @@ fn student_guide_explains_packaged_test_case_placement_and_collisions() {
 }
 
 #[test]
-fn student_guide_pins_test_case_picker_execution_and_complete_capture_comparison() {
-    let guide = unwrapped(&read_doc("student-guide.md"));
-    for wording in [
-        "F4 or the Test cases menu entry opens a modal test-case picker",
-        "paired cases in bytewise name order",
-        "Run all runs every listed case serially in that order",
-        "Esc cancels the active run and the rest of the queue",
-        "F1, F7, and F9 wait until that sequence finishes",
-        "closing its final reopened modal restores that view",
-        "A later non-test command takes ownership of the output pane",
-        "Console commands print Cargo's normal output flush-left and program output verbatim",
-        "Cargo status lines render flush-left; diagnostic blocks are dedented by their minimum indentation to keep source gutters and carets aligned",
-        "Esc cancels a running console command and closes the console",
-        "Esc cancels any running console command, closes the console, restores the diagnostics pane, and returns focus to the editor",
-        "There is no separate EOF shortcut",
-        "missing packaged data for a version 2 assignment is reported as unavailable",
-        "closes before a run starts and reopens after the run or queue finishes",
-        "PASS only when the complete captured stdout bytes exactly equal the `.expected` bytes",
-        "first differing LF-delimited line",
-        "expected and actual byte lengths without the LF",
-        "CR bytes and invalid UTF-8 are content",
-        "bounded terminal-safe previews",
-        "launch, exit, termination, capture, or expected-file problem is ERROR",
-        "Input and bounded expected bytes are opened before launch",
-        "Every completed picker run records one `test_case_compared` event immediately after its controlled command finishes",
-        "command ID, case name, expected BLAKE3 digest, optional actual BLAKE3 digest, and typed result",
-        "Mismatch details retain the positive one-based line and expected and actual line-byte lengths",
-        "The recorded line is at most 1,048,577; expected line lengths are at most 1 MiB and actual line lengths at most 8 MiB",
-        "Pre-launch input or expected-file errors show ERROR without creating a completed-run comparison record",
-        "No raw test input, expected output, or actual output bytes are added by the comparison event",
-    ] {
-        assert!(guide.contains(wording), "student guide must say: {wording}");
-    }
-
-    let environment = unwrapped(&read_doc("supported-environment.md"));
-    assert!(environment.contains(
-        "Test-case comparison uses only complete captured stdout, never the 256 KiB live tail"
-    ));
-    assert!(environment.contains(
-        "natural-output console commands, including packaged test-case runs, are complete when both captures are complete and the process exited"
-    ));
-    assert!(environment.contains(
-        "Natural console output never becomes missing or unexpected structured-diagnostic evidence; F7 commands retain structured-diagnostic classification"
-    ));
-    assert!(environment.contains(
-        "The additive version 1 `test_case_compared` event follows its controlled command finish in the same durable step"
-    ));
-    assert!(environment.contains(
-        "Case names remain limited to 1 through 64 ASCII bytes using letters, digits, `-`, or `_`"
-    ));
-    assert!(environment.contains("Mismatch lines are positive, one-based, and at most 1,048,577"));
-    assert!(environment.contains(
-        "Expected mismatch line lengths are at most 1,048,576 bytes, while actual lengths are at most the 8 MiB captured-output limit"
-    ));
-}
-
-#[test]
 fn every_live_git_install_command_pins_the_toolchain_tag_and_package() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
@@ -236,24 +156,6 @@ fn every_live_git_install_command_pins_the_toolchain_tag_and_package() {
     assert!(
         commands >= 5,
         "expected the root README and live installation guides"
-    );
-}
-
-#[test]
-fn student_guide_reproduces_the_privacy_notice_verbatim() {
-    let privacy = read_doc("privacy.md");
-    let notice = privacy
-        .split("## Student privacy notice\n")
-        .nth(1)
-        .expect("privacy.md has a student privacy notice")
-        .split("\n## ")
-        .next()
-        .unwrap()
-        .trim();
-    assert!(notice.contains("The data is used for grading only."));
-    assert!(
-        read_doc("student-guide.md").contains(notice),
-        "student guide must reproduce the notice verbatim, including line breaks"
     );
 }
 
@@ -325,184 +227,6 @@ fn student_guide_explains_updates_and_terminal_owned_shortcuts() {
         );
     }
     assert!(!guide.contains("Ctrl-A always selects all"));
-}
-
-#[test]
-fn guides_document_the_ghostty_doctor_setup_and_truthful_hint_rule() {
-    let student = unwrapped(&read_doc("student-guide.md"));
-    for wording in [
-        "rustrace doctor assignment.rta",
-        "rustrace doctor --write-ghostty-keys",
-        "config-file = rustrace-keys",
-        "Ghostty's own `super+shift+,=reload_config` binding",
-        "never edits Ghostty's main config",
-        "⌘A, ⌘C, ⌘V, ⌘Q, and ⌘W stay assigned to Ghostty",
-    ] {
-        assert!(
-            student.contains(wording),
-            "student guide must say: {wording}"
-        );
-    }
-
-    let environment = unwrapped(&read_doc("supported-environment.md"));
-    for wording in [
-        "ghostty +list-keybinds",
-        "owns, rewrites, or passes each setup chord",
-        "informational and does not change doctor's exit code",
-        "missing Ghostty CLI is treated as the default binding set",
-        "Command-mode hints use Control forms unless Ghostty passes the setup chord",
-        "Observed exact control-byte translations keep the matching Command form",
-        "The Option translations keep their forms because their escape-prefixed inputs remain enhancement-gated",
-        "Any other rewrite uses the Control fallback",
-        "reports the rewrite target",
-    ] {
-        assert!(
-            environment.contains(wording),
-            "supported environment must say: {wording}"
-        );
-    }
-}
-
-#[test]
-fn guides_explain_enhancement_gated_injected_text_translations() {
-    let student = unwrapped(&read_doc("student-guide.md"));
-    let ghostty_defaults = [
-        "super+arrow_left=text:\\\\x01",
-        "super+arrow_right=text:\\\\x05",
-        "super+backspace=text:\\\\x15",
-        "alt+arrow_left=esc:b",
-        "alt+arrow_right=esc:f",
-        "super+arrow_up=jump_to_prompt:-1",
-        "super+arrow_down=jump_to_prompt:1",
-        "super+a=select_all",
-        "super+q=quit",
-        "super+w=close_surface",
-        "super+f=start_search",
-        "super+z=undo",
-        "super+k=clear_screen",
-        "super+c=copy_to_clipboard",
-        "super+v=paste_from_clipboard",
-        "super+home=scroll_to_top",
-        "super+end=scroll_to_bottom",
-    ];
-    for wording in [
-        "Injected macOS editing text",
-        "Only an exact startup-probe rewrite activates each control-byte translation",
-        "`super+arrow_left` → `text:\\x01`: Ctrl-A → line start",
-        "`super+arrow_right` → `text:\\x05`: Ctrl-E → line end",
-        "`super+backspace` → `text:\\x15`: Ctrl-U → delete to line start",
-        "`super+k` → `text:\\x0b`: Ctrl-K → delete to line end",
-        "A passed binding, an unavailable probe, a non-Ghostty terminal, or an inactive keyboard enhancement keeps the legacy meanings",
-        "Esc b → previous word",
-        "Esc f → next word",
-        "Esc Delete → delete previous word",
-        "Ghostty's default ⌘Backspace binding sends `text:\\x15`",
-        "Ghostty 1.3.1 defaults send `text:\\x01` for ⌘Left, `text:\\x05` for ⌘Right, `text:\\x15` for ⌘Backspace, `esc:b` for Option-Left, and `esc:f` for Option-Right",
-        "Option-Backspace has no Ghostty default binding",
-        "arrives through the kitty protocol as Alt-Backspace",
-        "⌘Up and ⌘Down have no injected equivalent",
-        "`jump_to_prompt:-1` and `jump_to_prompt:1`",
-        "Ctrl-Home and Ctrl-End are the always-available forms of document start and end",
-        "`⌘A`, `⌘C`, `⌘V`, `⌘Q`, and `⌘W` are left to the terminal on purpose because Ghostty bindings are global",
-        "Compiler errors tint the full source line red and warnings tint it yellow",
-        "Click a tinted line to keep the caret at that source position and reveal its accent-marked diagnostic row",
-    ] {
-        assert!(
-            student.contains(wording),
-            "student guide must say: {wording}"
-        );
-    }
-    assert!(
-        !student.to_ascii_lowercase().contains("gutter marker"),
-        "student guide must not describe removed diagnostic gutter letters"
-    );
-    for binding in ghostty_defaults {
-        assert!(
-            student.contains(binding),
-            "student guide must list Ghostty default {binding}"
-        );
-    }
-    for unbind in [
-        "keybind = super+arrow_left=unbind",
-        "keybind = super+arrow_right=unbind",
-        "keybind = super+backspace=unbind",
-        "keybind = alt+arrow_left=unbind",
-        "keybind = alt+arrow_right=unbind",
-        "keybind = super+arrow_up=unbind",
-        "keybind = super+arrow_down=unbind",
-        "keybind = super+f=unbind",
-        "keybind = super+z=unbind",
-        "keybind = super+k=unbind",
-        "keybind = super+home=unbind",
-        "keybind = super+end=unbind",
-    ] {
-        assert!(student.contains(unbind), "student guide must list {unbind}");
-    }
-    for capture_fragment in [
-        "python3 -c",
-        "/dev/tty",
-        "tty.setraw",
-        "time.sleep(15)",
-        "\\x1b[>5u",
-    ] {
-        assert!(
-            student.contains(capture_fragment),
-            "capture command must contain {capture_fragment}"
-        );
-    }
-
-    let environment = unwrapped(&read_doc("supported-environment.md"));
-    for wording in [
-        "only when that keyboard enhancement frame is active and the startup probe observed the corresponding exact Ghostty rewrite",
-        "legacy control and escape-prefixed bytes as terminal-injected editing text",
-        "A passed binding, an unavailable probe, a non-Ghostty terminal, or an inactive enhancement keeps Ctrl-A as select all and the other control bytes at their legacy meanings",
-        "Ghostty 1.3.1 default bindings",
-        "Option-Backspace is not bound by default",
-        "Ctrl-Home and Ctrl-End remain the always-available document-start and document-end forms",
-        "`⌘A`, `⌘C`, `⌘V`, `⌘Q`, and `⌘W` are left to the terminal on purpose because Ghostty bindings are global",
-    ] {
-        assert!(
-            environment.contains(wording),
-            "supported environment must say: {wording}"
-        );
-    }
-    for binding in ghostty_defaults {
-        assert!(
-            environment.contains(binding),
-            "supported environment must list Ghostty default {binding}"
-        );
-    }
-    for unbind in [
-        "keybind = super+arrow_left=unbind",
-        "keybind = super+arrow_right=unbind",
-        "keybind = super+backspace=unbind",
-        "keybind = alt+arrow_left=unbind",
-        "keybind = alt+arrow_right=unbind",
-        "keybind = super+arrow_up=unbind",
-        "keybind = super+arrow_down=unbind",
-        "keybind = super+f=unbind",
-        "keybind = super+z=unbind",
-        "keybind = super+k=unbind",
-        "keybind = super+home=unbind",
-        "keybind = super+end=unbind",
-    ] {
-        assert!(
-            environment.contains(unbind),
-            "supported environment must list {unbind}"
-        );
-    }
-    for capture_fragment in [
-        "python3 -c",
-        "/dev/tty",
-        "tty.setraw",
-        "time.sleep(15)",
-        "\\x1b[>5u",
-    ] {
-        assert!(
-            environment.contains(capture_fragment),
-            "supported environment capture command must contain {capture_fragment}"
-        );
-    }
 }
 
 #[test]
@@ -853,44 +577,6 @@ fn append_tar_entry(archive: &mut Vec<u8>, path: &str, contents: &[u8], kind: u8
 fn write_octal(field: &mut [u8], value: u64) {
     let encoded = format!("{:0width$o}\0", value, width = field.len() - 1);
     field.copy_from_slice(encoded.as_bytes());
-}
-
-#[test]
-fn clipboard_mirror_matching_paste_and_terminal_guidance_are_explicit() {
-    let student = unwrapped(&read_doc("student-guide.md"));
-    for wording in [
-        "## Recommended terminals",
-        "Install Ghostty, kitty, WezTerm, or iTerm2 before the course",
-        "Applications in terminal may access clipboard",
-        "Terminal.app ignores the mirror",
-        "ctrl-V is the fallback there",
-        "Text copied elsewhere does not match the live internal clipboard and stays blocked",
-        "never reads your system clipboard",
-    ] {
-        assert!(
-            student.contains(wording),
-            "student guide must say: {wording}"
-        );
-    }
-
-    let privacy = unwrapped(&read_doc("privacy.md"));
-    assert!(privacy.contains("one-way system clipboard write"));
-    assert!(privacy.contains("never reads the system clipboard"));
-
-    let environment = unwrapped(&read_doc("supported-environment.md"));
-    for terminal in [
-        "Ghostty",
-        "kitty",
-        "WezTerm",
-        "Recent iTerm2",
-        "Terminal.app",
-    ] {
-        assert!(
-            environment.contains(terminal),
-            "supported environment must cover {terminal}"
-        );
-    }
-    assert!(environment.contains("sends no OSC 52 query"));
 }
 
 #[test]

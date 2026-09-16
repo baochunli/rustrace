@@ -31,7 +31,7 @@ fn release_contract_scripts() {
 }
 
 #[test]
-fn workflow_keeps_source_releases_draft_and_dry_runs_in_actions() {
+fn workflow_publishes_source_releases_and_keeps_dry_runs_in_actions() {
     let workflow = include_str!("../.github/workflows/release.yml");
     assert!(workflow.contains("tags: ['v*']"));
     assert!(workflow.contains("workflow_dispatch:"));
@@ -45,12 +45,14 @@ fn workflow_keeps_source_releases_draft_and_dry_runs_in_actions() {
     assert!(proof_jobs.contains("./scripts/verify-release.sh"));
     assert!(release_job.contains("./scripts/manifest.sh --verify"));
     let creation = release_job
-        .split_once("      - name: Create draft release\n")
-        .expect("draft creation step")
+        .split_once("      - name: Publish release\n")
+        .expect("release publication step")
         .1;
     assert!(creation.contains("if: github.event_name == 'push'"));
-    assert!(creation.contains("gh release create"));
-    assert!(creation.contains("--draft --verify-tag"));
+    assert!(creation.contains(
+        "gh release create \"$RELEASE_TAG\" dist/latest.json --verify-tag --latest --title"
+    ));
+    assert!(!creation.contains("--draft"));
     assert!(creation.contains("dist/latest.json"));
     assert!(!creation.contains("dist/*"));
     assert!(!creation.contains(".tar.gz"));
