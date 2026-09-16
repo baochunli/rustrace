@@ -1,0 +1,58 @@
+[
+  {
+    "name": "ascii",
+    "initial": "",
+    "move_right": 0,
+    "select_right": 0,
+    "start_byte": 0,
+    "end_byte": 0,
+    "inserted": "fn main() {}",
+    "after": "fn main() {}",
+    "characters": 12,
+    "lines": 1,
+    "undo_characters": 0,
+    "undo_lines": 0
+  },
+  {
+    "name": "unicode_multiline",
+    "initial": "",
+    "move_right": 0,
+    "select_right": 0,
+    "start_byte": 0,
+    "end_byte": 0,
+    "inserted": "é🦀\né\n",
+    "after": "é🦀\né\n",
+    "characters": 6,
+    "lines": 3,
+    "undo_characters": 0,
+    "undo_lines": 0
+  },
+  {
+    "name": "crlf_selection",
+    "initial": "Lé🦀R",
+    "move_right": 1,
+    "select_right": 2,
+    "start_byte": 1,
+    "end_byte": 7,
+    "inserted": "漢\r\n🦀\r\n",
+    "after": "L漢\r\n🦀\r\nR",
+    "characters": 6,
+    "lines": 3,
+    "undo_characters": 2,
+    "undo_lines": 1
+  },
+  {
+    "name": "empty_selection_deletes",
+    "initial": "Lé🦀R",
+    "move_right": 1,
+    "select_right": 2,
+    "start_byte": 1,
+    "end_byte": 7,
+    "inserted": "",
+    "after": "LR",
+    "characters": 0,
+    "lines": 0,
+    "undo_characters": 2,
+    "undo_lines": 1
+  }
+]

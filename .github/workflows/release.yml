@@ -1,0 +1,101 @@
+name: Verify source release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check_tag:
+    name: Check release identity
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+      - name: Check tag against Cargo version
+        id: identity
+        env:
+          REQUESTED_TAG: ${{ github.event_name == 'push' && github.ref_name || '' }}
+        run: |
+          tag=$REQUESTED_TAG
+          if [ -z "$tag" ]; then
+            tag=$(python3 -c 'import tomllib; print("v" + tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          fi
+          ./scripts/check-release-tag.sh "$tag"
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Verify ${{ matrix.target }} source build
+    needs: check_tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    env:
+      RUSTUP_AUTO_INSTALL: '0'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+      - name: Use temporary config
+        run: printf 'XDG_CONFIG_HOME=%s/rustrace-xdg\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Build and verify source release
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          unset TMPDIR
+          ./scripts/release.sh
+          ./scripts/verify-release.sh "dist/$RELEASE_TARGET"
+      - name: Upload build proof to Actions only
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustrace-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Prepare source release manifest
+    needs: [check_tag, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.check_tag.outputs.tag }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+      - name: Use temporary config
+        run: printf 'XDG_CONFIG_HOME=%s/rustrace-xdg\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Download verified build metadata
+        uses: actions/download-artifact@v5
+        with:
+          pattern: rustrace-*
+          path: dist/
+          merge-multiple: true
+      - name: Generate and verify source manifest
+        run: |
+          ./scripts/manifest.sh "$RELEASE_TAG" dist/aarch64-apple-darwin dist/x86_64-unknown-linux-gnu > dist/latest.json
+          ./scripts/manifest.sh --verify dist/latest.json "$RELEASE_TAG" dist/aarch64-apple-darwin dist/x86_64-unknown-linux-gnu
+      - name: Upload manifest to Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-release-manifest
+          path: dist/latest.json
+          if-no-files-found: error
+      - name: Create draft release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/latest.json --draft --verify-tag --title "$RELEASE_TAG" --generate-notes

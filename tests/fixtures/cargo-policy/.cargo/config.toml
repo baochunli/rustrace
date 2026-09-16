@@ -1,0 +1,11 @@
+# These must be overridden by explicit command preparation, even without
+# inherited override variables. Never create these marker executables.
+[build]
+rustc = "/nonexistent-t43-compiler"
+rustdoc = "/nonexistent-t43-rustdoc"
+rustc-wrapper = "/nonexistent-t43-wrapper"
+rustc-workspace-wrapper = "/nonexistent-t43-workspace-wrapper"
+rustflags = ["--invalid-t43-rustflag"]
+rustdocflags = ["--invalid-t43-rustdocflag"]
+target-dir = "/nonexistent-t43-target"
+build-dir = "/nonexistent-t43-build"

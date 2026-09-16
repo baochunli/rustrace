@@ -1,0 +1,49 @@
+name: Clean-machine installation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 9 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: Install from source on ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, ubuntu-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Set up fixture generator Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Linux native prerequisites and both awk implementations
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config curl git gawk mawk
+      - name: Fresh rustup, source installer, and fixture update check
+        run: ./scripts/install-smoke.sh
+      - name: Install, notice, update, and restart through a PTY
+        run: |
+          unset TMPDIR
+          export HOME="$PWD/.tmp/install-smoke/home"
+          export CARGO_HOME="$PWD/.tmp/install-smoke/cargo"
+          export RUSTUP_HOME="$PWD/.tmp/install-smoke/rustup"
+          export CARGO_TARGET_DIR="$PWD/.tmp/install-smoke/target"
+          export XDG_CONFIG_HOME="$PWD/.tmp/install-smoke/config"
+          export XDG_STATE_HOME="$PWD/.tmp/install-smoke/state"
+          export PATH="$CARGO_HOME/bin:$PWD/.tmp/install-smoke/tools:/usr/bin:/bin:/usr/sbin:/sbin"
+          export RUSTUP_AUTO_INSTALL=0 CARGO_BUILD_JOBS=2
+          # Populate test-only dependencies before the hermetic offline scenario.
+          rustup run 1.98.1 cargo fetch --locked
+          rustup run 1.98.1 cargo test -p rustrace --test install_update_e2e --locked --offline -- --test-threads=1 --nocapture

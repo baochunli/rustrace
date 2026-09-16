@@ -1,0 +1,21 @@
+[package]
+name = "rustrace-replay"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+rustrace-editor = { path = "../editor" }
+rustrace-journal = { path = "../journal" }
+rustrace-model = { path = "../model" }
+rustrace-workspace = { path = "../workspace" }
+
+[dev-dependencies]
+# Recomputes framing and captured-output digests in adversarial fixtures.
+blake3 = "=1.8.7"
+serde_json = "=1.0.151"
+# Current maintained release; its Rust 1.85 MSRV is below Rustrace's 1.98 floor.
+# Only `std` is needed, avoiding the default fork, timeout, and bit-set stack.
+proptest = { version = "=1.11.0", default-features = false, features = ["std"] }

@@ -1,0 +1,2 @@
+# Seeds for minimized tamper-validation failures are persisted and replayed here.
+cc ee721b52c79d30f0b2946addd9e32e92e8b29252d686c8605857a3ed88068eb1 # shrinks to (ScenarioSeed { initial: 0, actions: [] }, 0, 12)

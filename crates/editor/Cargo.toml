@@ -1,0 +1,18 @@
+[package]
+name = "rustrace-editor"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+ropey = "=1.6.1"
+rustrace-model = { path = "../model" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+unicode-segmentation = "=1.13.3"
+unicode-width = "=0.2.0"
+
+[dev-dependencies]
+proptest = { version = "=1.11.0", default-features = false, features = ["std"] }

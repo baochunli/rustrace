@@ -1,0 +1,6 @@
+[package]
+name = "t43-controlled-fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

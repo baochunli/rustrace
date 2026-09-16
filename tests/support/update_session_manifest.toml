@@ -1,0 +1,14 @@
+format_version = 1
+course_id = "course"
+assignment_id = "assignment"
+assignment_version = "v1"
+title = "Update identity"
+toolchain = "1.98.1"
+edition = "2024"
+allowed_paths = ["*.rs"]
+[commands]
+check = ["cargo", "check"]
+test = ["cargo", "test"]
+run = ["cargo", "run"]
+clippy = ["cargo", "clippy"]
+format = ["cargo", "fmt"]

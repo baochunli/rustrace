@@ -1,0 +1,223 @@
+{
+  "format_version": 1,
+  "seed": 54,
+  "consumers": ["verify", "scan", "replay-controller"],
+  "measurement_references": [
+    {
+      "id": "g3-paced-hour",
+      "expectation": "paced hour referenced, not rerun; 3600.748 s, 4006 events, typing/render p95 35.058 ms and p99 38.868 ms"
+    },
+    {
+      "id": "g6-fast-hour-and-maximum-export",
+      "expectation": "seed 54 fast-hour and maximum export/storage measurements referenced; unpaced fixture shapes rerun"
+    },
+    {
+      "id": "g7-replay-budgets",
+      "expectation": "paced-hour and maximum open, 200-seek p95, charged cache, and quiet-host RSS stayed within G7 limits"
+    }
+  ],
+  "process_matrix_sources": [
+    "src/process_indicators.rs::exact_sample_and_observation_boundaries_are_inclusive",
+    "src/process_indicators.rs::zero_denominators_low_build_count_and_single_signals_never_suggest",
+    "src/process_indicators.rs::zero_feedback_opportunities_is_ineligible_when_every_other_guard_passes",
+    "src/process_indicators.rs::suggestion_is_deduplicated_and_uses_exact_neutral_wording",
+    "src/process_indicators.rs::streamed_edit_counts_use_unicode_scalars_crlf_eof_and_forward_origins",
+    "src/process_indicators.rs::deletion_replacement_and_multi_range_or_inverse_events_are_classified_exactly",
+    "src/process_indicators.rs::append_requires_an_empty_removal_range_at_pre_edit_eof",
+    "src/process_indicators.rs::genesis_is_excluded_file_creation_allows_later_append_and_lifecycle_blocks_rule",
+    "src/process_indicators.rs::factual_paste_and_rejection_metrics_are_exact_linked_and_bounded",
+    "src/process_indicators.rs::complete_pairing_distinguishes_known_nonzero_and_compiler_errors",
+    "src/process_indicators.rs::streamed_eligible_entry_plus_before_build_suggests_once_with_exact_links",
+    "src/process_indicators.rs::launch_timeout_cancel_truncated_and_malformed_or_missing_diagnostics_suppress_rule",
+    "src/process_indicators.rs::unpaired_commands_are_unknown_and_resume_breaks_feedback_adjacency",
+    "src/process_indicators.rs::orphan_finish_is_unavailable_and_context_commands_are_not_opportunities",
+    "src/process_indicators.rs::every_disallowed_edit_shape_has_a_specific_unavailable_result",
+    "src/process_indicators.rs::checked_counters_report_overflow_without_wrapping"
+  ],
+  "fixtures": [
+    {
+      "id": "test-case-pass",
+      "scenario": "packaged test case matches captured stdout",
+      "construction": "production-session-test-case",
+      "source": "tests/golden_sessions.rs::test_case_comparison_goldens_reach_verify_scan_replay_and_cli_rows",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"Cargo.toml": "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n[workspace]\n", "Cargo.lock": "fixture", "main.rs": ""}, "comparison": {"runs": 1, "passes": 1, "mismatches": 0, "errors": 0, "evidence": "recorded-unverified"}, "flags": []}
+    },
+    {
+      "id": "test-case-mismatch",
+      "scenario": "packaged expected output differs from captured stdout",
+      "construction": "production-session-test-case",
+      "source": "tests/golden_sessions.rs::test_case_comparison_goldens_reach_verify_scan_replay_and_cli_rows",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"Cargo.toml": "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n[workspace]\n", "Cargo.lock": "fixture", "main.rs": ""}, "comparison": {"runs": 1, "passes": 0, "mismatches": 1, "errors": 0, "first": "sample:1", "evidence": "recorded-unverified"}, "flags": []}
+    },
+    {
+      "id": "test-case-error",
+      "scenario": "packaged test case command exits nonzero",
+      "construction": "production-session-test-case",
+      "source": "tests/golden_sessions.rs::test_case_comparison_goldens_reach_verify_scan_replay_and_cli_rows",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"Cargo.toml": "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n[workspace]\n", "Cargo.lock": "fixture", "main.rs": ""}, "comparison": {"runs": 1, "passes": 0, "mismatches": 0, "errors": 1, "first": "sample", "evidence": "recorded-unverified"}, "flags": []}
+    },
+    {
+      "id": "normal-exploratory",
+      "scenario": "normal exploratory development",
+      "construction": "production-session-controlled-command",
+      "source": "tests/golden_sessions.rs::production_development_fixtures_reach_verify_scan_and_replay",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"Cargo.lock": "fixture", "main.rs": "a*24+b*24"}, "flags": [], "factual": [0, 0, 0, 0, 0], "process": {"outcome": "not-eligible", "values": [48, 48, 48, 0, 48, 24, 1, 1]}, "links": "edit-and-command"}
+    },
+    {
+      "id": "fluent-legitimate",
+      "scenario": "very fluent legitimate development; review must not be suggested",
+      "construction": "production-session-controlled-command",
+      "source": "tests/golden_sessions.rs::production_development_fixtures_reach_verify_scan_and_replay",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"Cargo.lock": "fixture", "main.rs": "x*800+y*200"}, "flags": [], "factual": [0, 0, 0, 0, 0], "process": {"outcome": "not-eligible", "values": [1200, 1200, 1200, 200, 1200, 1000, 1, 1]}, "links": "edit-and-command"}
+    },
+    {
+      "id": "paste-policy",
+      "scenario": "large allowed internal paste plus repeated blocked external and unverifiable attempts",
+      "construction": "production-session-clipboard",
+      "source": "tests/golden_sessions.rs::clipboard_and_external_reconciliation_fixtures_reach_consumers",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"a.rs": "x*3000", "b.rs": "x*3000"}, "flags": [], "factual": [1, 0, 0, 0, 2], "process": {"outcome": "not-eligible", "values": [0, 0, 0, 0, 3000, 0, 0, 0]}, "links": "paste-source-and-rejections"}
+    },
+    {
+      "id": "manual-transcription",
+      "scenario": "manual forward transcription qualifying pattern",
+      "construction": "production-session-controlled-command",
+      "source": "tests/golden_sessions.rs::production_development_fixtures_reach_verify_scan_and_replay",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"Cargo.lock": "fixture", "main.rs": "x*1000+y"}, "flags": [], "factual": [0, 0, 0, 0, 0], "process": {"outcome": "suggested", "values": [1001, 1001, 1001, 0, 1001, 1000, 1, 1]}, "links": "edit-and-command"}
+    },
+    {
+      "id": "compiler-debugging",
+      "scenario": "repeated compiler-driven debugging with controlled commands",
+      "construction": "production-session-controlled-command",
+      "source": "tests/golden_sessions.rs::production_development_fixtures_reach_verify_scan_and_replay",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"Cargo.lock": "fixture", "main.rs": "abc"}, "flags": [], "factual": [0, 0, 0, 0, 0], "process": {"outcome": "not-eligible", "values": [3, 3, 3, 0, 3, 1, 2, 2]}, "links": "edit-and-command"}
+    },
+    {
+      "id": "external-replacement",
+      "scenario": "rejected external replacement preserves A/B/C and restores canonical B",
+      "construction": "t8.7-real-pty",
+      "source": "tests/support/integrated_production_pty.py::run_suite",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"Cargo.toml": "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n[workspace]\n", "a.rs": "!source", "b.rs": "destination"}, "flags": [], "factual": [0, 0, 0, 1, 0], "process": {"outcome": "unavailable", "values": [1, 1, 0, 0, 1, 1, 0, 0]}, "links": "external-observation"}
+    },
+    {
+      "id": "external-create-delete",
+      "scenario": "canonical creation and deletion restoration with unmanaged-path preservation",
+      "construction": "production-session",
+      "source": "tests/production_session.rs::external_p2_canonical_presence_and_excluded_files",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"main.rs": "A"}, "flags": [], "factual": [0, 0, 0, 2, 0], "process": {"outcome": "not-eligible", "values": [0, 0, 0, 0, 0, 0, 0, 0]}, "links": "external-observation"}
+    },
+    {
+      "id": "external-failure-recovery",
+      "scenario": "unsafe external failure stops and preserves before linked recovery",
+      "construction": "accepted-production-test-and-recovery-session",
+      "source": "tests/production_session.rs::external_p2_out_of_policy_and_binary_stop_without_sweep",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"main.rs": "RA"}, "flags": [], "factual": [0, 0, 0, 0, 0], "process": {"outcome": "not-eligible", "values": [1, 1, 0, 0, 1, 1, 0, 0]}, "links": "preserved-parent-evidence"}
+    },
+    {
+      "id": "external-restart",
+      "scenario": "valid restart automatically restores dirty canonical contents",
+      "construction": "production-session-resume",
+      "source": "tests/production_session.rs::external_p2_valid_restart_automatically_restores_dirty_canonical",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"main.rs": "BA"}, "flags": [], "factual": [0, 0, 0, 1, 0], "process": {"outcome": "not-eligible", "values": [1, 1, 0, 0, 1, 1, 0, 0]}, "links": "external-observation"}
+    },
+    {
+      "id": "crash-recovery",
+      "scenario": "journal/checkpoint crash and exact recovery",
+      "construction": "post-recovery-production-control-plus-t8.4-probe-reference",
+      "source": "tests/crash_injection.rs::assert_after_kill",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"main.rs": "BA", "scope": "post-recovery control; exact crash prefixes are asserted by T8.4 probes"}, "flags": [], "factual": [0, 0, 0, 0, 0], "process": {"outcome": "not-eligible", "values": [1, 1, 0, 0, 1, 1, 0, 0]}, "links": "recovered-prefix"}
+    },
+    {
+      "id": "completion-basic",
+      "scenario": "basic explicit-trigger completion recorded exactly once",
+      "construction": "t5.4-fake-server-pty",
+      "source": "tests/golden_sessions.rs::fake_server_completion_and_degradation_fixtures_reach_all_consumers",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"Cargo.toml": "[package]\nname = \"student\"\nversion = \"0.1.0\"\n[workspace]\n", "main.rs": "λ// naïve 東京 🦀\r\nfn main() {}\r\n", "other.rs": "// deuxième\r\npub fn other() {}\r\n"}, "flags": [], "factual": [0, 0, 0, 0, 0], "process": {"outcome": "unavailable", "values": [1, 1, 0, 0, 2, 1, 0, 0]}, "links": "completion-edit"}
+    },
+    {
+      "id": "completion-unavailable",
+      "scenario": "completion unavailable while editing and recording continue",
+      "construction": "t5.4-fake-server-pty",
+      "source": "tests/golden_sessions.rs::fake_server_completion_and_degradation_fixtures_reach_all_consumers",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"Cargo.toml": "[package]\nname = \"student\"\nversion = \"0.1.0\"\n[workspace]\n", "main.rs": "X// naïve 東京 🦀\r\nfn main() {}\r\n", "other.rs": "// deuxième\r\npub fn other() {}\r\n"}, "flags": [], "factual": [0, 0, 0, 0, 0], "process": {"outcome": "not-eligible", "values": [1, 1, 0, 0, 1, 1, 0, 0]}, "links": "none"}
+    },
+    {
+      "id": "completion-stale",
+      "scenario": "stale completion loses authority across view transition",
+      "construction": "t5.4-fake-server-pty",
+      "source": "tests/golden_sessions.rs::fake_server_completion_and_degradation_fixtures_reach_all_consumers",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"Cargo.toml": "[package]\nname = \"student\"\nversion = \"0.1.0\"\n[workspace]\n", "main.rs": "// naïve 東京 🦀\r\nfn main() {}\r\n", "other.rs": "// deuxième\r\npub fn other() {}\r\n"}, "flags": [], "factual": [0, 0, 0, 0, 0], "process": {"outcome": "not-eligible", "values": [0, 0, 0, 0, 0, 0, 0, 0]}, "links": "completion-request"}
+    },
+    {
+      "id": "completion-failing-server",
+      "scenario": "failing language server degrades without blocking editing",
+      "construction": "t5.4-fake-server-pty",
+      "source": "tests/golden_sessions.rs::fake_server_completion_and_degradation_fixtures_reach_all_consumers",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"Cargo.toml": "[package]\nname = \"student\"\nversion = \"0.1.0\"\n[workspace]\n", "main.rs": "X// naïve 東京 🦀\r\nfn main() {}\r\n", "other.rs": "Y// deuxième\r\npub fn other() {}\r\n"}, "flags": [], "factual": [0, 0, 0, 0, 0], "process": {"outcome": "not-eligible", "values": [2, 2, 0, 0, 2, 2, 0, 0]}, "links": "edit"}
+    },
+    {
+      "id": "formatting-heavy",
+      "scenario": "formatting-heavy development through exclusive controlled Format ownership",
+      "construction": "production-session-controlled-format",
+      "source": "tests/golden_sessions.rs::production_development_fixtures_reach_verify_scan_and_replay",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"Cargo.lock": "fixture", "file-[0-4].rs": "// Formatter fixture [0-4]\\n"}, "flags": [], "factual": [0, 0, 0, 0, 0], "process": {"outcome": "not-eligible", "values": [0, 0, 0, 0, 5, 0, 0, 0]}, "links": "format-command-and-edits"}
+    },
+    {
+      "id": "source-mismatch",
+      "scenario": "outer submitted source differs from verified provenance",
+      "construction": "production-bundle-mutation",
+      "source": "tests/verify_cli.rs::verify_reports_source_and_reference_independently_of_replay",
+      "expected": {"verify": "failed", "source": "mismatch", "replay": "available", "final_state": {"replayed": {"main.rs": "A"}, "outer-submitted": {"main.rs": "B"}}, "flags": ["SOURCE_MISMATCH"], "factual": [0, 0, 0, 0, 0], "process": {"outcome": "not-eligible", "values": [0, 0, 0, 0, 0, 0, 0, 0]}, "links": "terminal-event"}
+    },
+    {"id": "malformed-traversal", "scenario": "T8.1 traversal", "construction": "task-local-stored-zip-writer", "source": "crates/workspace/tests/rprov_import.rs::outer_rejects_bad_paths_aliases_links_special_entries_and_nested_archives", "expected": {"verify": "package-invalid", "source": "unavailable", "replay": "unavailable", "package_detail": "unsafe outer LMS ZIP path", "final_state": {"unavailable": "traversal rejected before replay"}, "flags": ["PACKAGE_INVALID"], "factual": null, "process": null, "links": "decoder"}},
+    {"id": "malformed-link", "scenario": "T8.1 archive link rejected by the Unix-mode feature check", "construction": "task-local-stored-zip-writer", "source": "crates/workspace/tests/rprov_import.rs::outer_rejects_bad_paths_aliases_links_special_entries_and_nested_archives", "expected": {"verify": "package-invalid", "source": "unavailable", "replay": "unavailable", "package_detail": "unsupported outer LMS ZIP feature", "final_state": {"unavailable": "archive link rejected before replay"}, "flags": ["PACKAGE_INVALID"], "factual": null, "process": null, "links": "decoder"}},
+    {"id": "malformed-duplicate", "scenario": "T8.1 duplicate entry", "construction": "task-local-stored-zip-writer", "source": "crates/workspace/tests/rprov_import.rs::rejects_missing_duplicate_reordered_uninventoried_and_bad_digest_records", "expected": {"verify": "package-invalid", "source": "unavailable", "replay": "unavailable", "package_detail": "unsafe outer LMS ZIP path", "final_state": {"unavailable": "duplicate entry rejected before replay"}, "flags": ["PACKAGE_INVALID"], "factual": null, "process": null, "links": "decoder"}},
+    {"id": "malformed-over-budget", "scenario": "T8.1 aggregate entry/payload budget", "construction": "task-local-rprov-header-mutation", "source": "crates/workspace/tests/rprov_import.rs::red_rejects_oversized_record_claim_before_path_or_payload_read", "expected": {"verify": "package-invalid", "source": "unavailable", "replay": "unavailable", "package_detail": "invalid .rprov structure: .rprov archive entry count is 4097; maximum is 4096", "final_state": {"unavailable": "claimed budget rejected before replay"}, "flags": ["PACKAGE_INVALID"], "factual": null, "process": null, "links": "decoder"}},
+    {"id": "malformed-nested-archive", "scenario": "T8.1 nested archive", "construction": "task-local-stored-zip-writer", "source": "crates/workspace/tests/rprov_import.rs::outer_rejects_bad_paths_aliases_links_special_entries_and_nested_archives", "expected": {"verify": "package-invalid", "source": "unavailable", "replay": "unavailable", "package_detail": "unsupported outer LMS ZIP feature", "final_state": {"unavailable": "nested archive rejected before replay"}, "flags": ["PACKAGE_INVALID"], "factual": null, "process": null, "links": "decoder"}},
+    {"id": "malformed-host-path-link", "scenario": "T8.1 host-path link rejected by the same Unix-mode feature check as malformed-link", "construction": "task-local-stored-zip-writer", "source": "crates/workspace/tests/rprov_import.rs::outer_rejects_bad_paths_aliases_links_special_entries_and_nested_archives", "expected": {"verify": "package-invalid", "source": "unavailable", "replay": "unavailable", "package_detail": "unsupported outer LMS ZIP feature", "final_state": {"unavailable": "host-path link rejected before replay"}, "flags": ["PACKAGE_INVALID"], "factual": null, "process": null, "links": "decoder"}},
+    {
+      "id": "revisions-three",
+      "scenario": "three immutable linked attempts replay from latest ZIP alone",
+      "construction": "production-session-revisions",
+      "source": "src/session/finalization.rs::start_revision",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"main.rs": "DCBA"}, "flags": [], "factual": [0, 0, 0, 0, 0], "process": {"outcome": "not-eligible", "attempts": 3}, "links": "parent-final-child-start"}
+    },
+    {"id": "revision-missing-link", "scenario": "missing revision link", "construction": "three-revision-manifest-mutation", "source": "tests/verify_cli.rs::verify_rejects_manifest_ancestry_and_aggregate_tampering", "expected": {"verify": "package-invalid", "source": "unavailable", "replay": "unavailable", "package_detail": "invalid .rprov structure in segments.parent", "final_state": {"unavailable": "missing ancestry rejected before replay"}, "flags": ["PACKAGE_INVALID"], "factual": null, "process": null, "links": "manifest"}},
+    {"id": "revision-tampered-link", "scenario": "tampered parent terminal/final link", "construction": "three-revision-manifest-mutation", "source": "tests/verify_cli.rs::verify_rejects_manifest_ancestry_and_aggregate_tampering", "expected": {"verify": "package-invalid", "source": "unavailable", "replay": "unavailable", "package_detail": "invalid .rprov structure in segments.parent", "final_state": {"unavailable": "tampered ancestry rejected before replay"}, "flags": ["PACKAGE_INVALID"], "factual": null, "process": null, "links": "manifest"}},
+    {"id": "revision-reordered", "scenario": "reordered revision links", "construction": "three-revision-manifest-mutation", "source": "crates/workspace/tests/rprov_import.rs::rejects_missing_duplicate_reordered_uninventoried_and_bad_digest_records", "expected": {"verify": "package-invalid", "source": "unavailable", "replay": "unavailable", "package_detail": "invalid .rprov structure in latest_session_id", "final_state": {"unavailable": "reordered ancestry rejected before replay"}, "flags": ["PACKAGE_INVALID"], "factual": null, "process": null, "links": "manifest"}},
+    {"id": "revision-duplicate", "scenario": "duplicate revision segment", "construction": "three-revision-manifest-mutation", "source": "crates/workspace/tests/rprov_import.rs::rejects_missing_duplicate_reordered_uninventoried_and_bad_digest_records", "expected": {"verify": "package-invalid", "source": "unavailable", "replay": "unavailable", "package_detail": "invalid .rprov structure in latest_session_id", "final_state": {"unavailable": "duplicate ancestry rejected before replay"}, "flags": ["PACKAGE_INVALID"], "factual": null, "process": null, "links": "manifest"}},
+    {"id": "revision-cyclic", "scenario": "cyclic revision link", "construction": "three-revision-manifest-mutation", "source": "tests/golden_sessions.rs::three_revision_latest_bundle_is_self_contained_and_rejects_bad_ancestry", "expected": {"verify": "package-invalid", "source": "unavailable", "replay": "unavailable", "package_detail": "invalid .rprov structure in segments.parent", "final_state": {"unavailable": "cyclic ancestry rejected before replay"}, "flags": ["PACKAGE_INVALID"], "factual": null, "process": null, "links": "manifest"}},
+    {"id": "revision-child-start-mismatch", "scenario": "parent-final/child-start mismatch", "construction": "three-revision-manifest-mutation", "source": "tests/verify_cli.rs::verify_rejects_manifest_ancestry_and_aggregate_tampering", "expected": {"verify": "package-invalid", "source": "unavailable", "replay": "unavailable", "package_detail": "invalid .rprov structure in segments.initial_tree_hash", "final_state": {"unavailable": "child start mismatch rejected before replay"}, "flags": ["PACKAGE_INVALID"], "factual": null, "process": null, "links": "manifest"}},
+    {"id": "revision-host-path-link", "scenario": "revision host-path link rejected by the same Unix-mode feature check as malformed-link", "construction": "task-local-stored-zip-writer", "source": "crates/workspace/tests/rprov_import.rs::outer_rejects_bad_paths_aliases_links_special_entries_and_nested_archives", "expected": {"verify": "package-invalid", "source": "unavailable", "replay": "unavailable", "package_detail": "unsupported outer LMS ZIP feature", "final_state": {"unavailable": "host-path history link rejected before replay"}, "flags": ["PACKAGE_INVALID"], "factual": null, "process": null, "links": "decoder"}},
+    {"id": "revision-nested-old-zip", "scenario": "nested old ZIP dependency", "construction": "task-local-stored-zip-writer", "source": "crates/workspace/tests/rprov_import.rs::outer_rejects_bad_paths_aliases_links_special_entries_and_nested_archives", "expected": {"verify": "package-invalid", "source": "unavailable", "replay": "unavailable", "package_detail": "unsupported outer LMS ZIP feature", "final_state": {"unavailable": "nested old ZIP rejected before replay"}, "flags": ["PACKAGE_INVALID"], "factual": null, "process": null, "links": "decoder"}},
+    {"id": "revision-aggregate-over-budget", "scenario": "aggregate history over event budget", "construction": "three-revision-manifest-mutation", "source": "tests/golden_sessions.rs::three_revision_latest_bundle_is_self_contained_and_rejects_bad_ancestry", "expected": {"verify": "package-invalid", "source": "unavailable", "replay": "unavailable", "package_detail": "invalid .rprov structure in aggregate_event_count", "final_state": {"unavailable": "aggregate event budget rejected before replay"}, "flags": ["PACKAGE_INVALID"], "factual": null, "process": null, "links": "manifest"}},
+    {
+      "id": "receipt-retry",
+      "scenario": "receipt-bound retry is byte-identical without old ZIP dependency",
+      "construction": "production-finalization-retry",
+      "source": "tests/crash_injection.rs::archive_temporary_is_never_installed_and_retry_is_byte_stable",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"main.rs": "BA"}, "flags": [], "factual": [0, 0, 0, 0, 0], "process": {"outcome": "not-eligible", "values": [1, 1, 0, 0, 1, 1, 0, 0]}, "links": "terminal-event"}
+    },
+    {
+      "id": "receipt-interruption",
+      "scenario": "interrupted finalization recovers exact immutable receipt",
+      "construction": "post-recovery-production-control-plus-t8.4-probe-reference",
+      "source": "tests/crash_injection.rs::finalization_boundaries_recover_only_the_exact_immutable_capture",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"main.rs": "BA", "scope": "post-recovery control; exact interruption capture is asserted by T8.4 probes"}, "flags": [], "factual": [0, 0, 0, 0, 0], "process": {"outcome": "not-eligible", "values": [1, 1, 0, 0, 1, 1, 0, 0]}, "links": "terminal-event"}
+    },
+    {
+      "id": "cleanup-preservation",
+      "scenario": "ordinary cleanup preserves linked ancestry",
+      "construction": "production-retention-cli",
+      "source": "tests/retention_cli.rs::cleanup_is_dry_run_first_and_provenance_destruction_names_descendants",
+      "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"main.rs": "DCBA"}, "flags": [], "factual": [0, 0, 0, 0, 0], "process": {"outcome": "not-eligible", "attempts": 3}, "links": "parent-final-child-start"}
+    },
+    {"id": "process-exact-boundaries", "scenario": "inclusive I/N/I-J/A-I/R-I/F-O/B-I boundaries", "construction": "accepted-test-reference-plus-identical-clean-consumer-control", "source": "src/process_indicators.rs::exact_sample_and_observation_boundaries_are_inclusive", "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"main.rs": "A", "scope": "identical no-edit consumer control"}, "flags": [], "factual": null, "process": {"reference": "src/process_indicators.rs::exact_sample_and_observation_boundaries_are_inclusive"}, "links": "edit-and-command"}},
+    {"id": "process-scalar-and-origin-counting", "scenario": "Unicode/CRLF scalar counting, replacements, EOF, genesis and excluded origins", "construction": "accepted-test-reference-plus-identical-clean-consumer-control", "source": "src/process_indicators.rs::streamed_edit_counts_use_unicode_scalars_crlf_eof_and_forward_origins", "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"main.rs": "A", "scope": "identical no-edit consumer control"}, "flags": [], "factual": null, "process": {"reference": "src/process_indicators.rs::streamed_edit_counts_use_unicode_scalars_crlf_eof_and_forward_origins"}, "links": "edit"}},
+    {"id": "process-unavailable-shapes", "scenario": "undo, lifecycle, multi-range, restart gap and linked-attempt boundaries", "construction": "accepted-test-reference-plus-identical-clean-consumer-control", "source": "src/process_indicators.rs::every_disallowed_edit_shape_has_a_specific_unavailable_result", "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"main.rs": "A", "scope": "identical no-edit consumer control"}, "flags": [], "factual": null, "process": {"reference": "src/process_indicators.rs::every_disallowed_edit_shape_has_a_specific_unavailable_result"}, "links": "edit"}},
+    {"id": "process-zero-and-single-signals", "scenario": "zero denominators, low build count, few errors, E alone, and C or P alone never suggest", "construction": "accepted-test-reference-plus-identical-clean-consumer-control", "source": "src/process_indicators.rs::zero_denominators_low_build_count_and_single_signals_never_suggest", "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"main.rs": "A", "scope": "identical no-edit consumer control"}, "flags": [], "factual": null, "process": {"reference": "src/process_indicators.rs::zero_denominators_low_build_count_and_single_signals_never_suggest"}, "links": "edit-and-command"}},
+    {"id": "process-command-known", "scenario": "complete known nonzero exits and compiler errors", "construction": "accepted-test-reference-plus-identical-clean-consumer-control", "source": "src/process_indicators.rs::complete_pairing_distinguishes_known_nonzero_and_compiler_errors", "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"main.rs": "A", "scope": "identical no-edit consumer control"}, "flags": [], "factual": null, "process": {"reference": "src/process_indicators.rs::complete_pairing_distinguishes_known_nonzero_and_compiler_errors"}, "links": "command"}},
+    {"id": "process-command-unknown", "scenario": "launch, timeout, cancel, missing, malformed and truncated evidence suppress the rule", "construction": "accepted-test-reference-plus-identical-clean-consumer-control", "source": "tests/integrated_production.rs::command_evidence_completeness_drives_exact_neutral_consumer_facts", "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"main.rs": "A", "scope": "identical no-edit consumer control"}, "flags": [], "factual": null, "process": {"reference": "tests/integrated_production.rs::command_evidence_completeness_drives_exact_neutral_consumer_facts"}, "links": "command"}},
+    {"id": "process-origin-mix", "scenario": "paste/completion/format-heavy origin mix makes keyboard rule ineligible, not suspicious", "construction": "accepted-test-reference-plus-identical-clean-consumer-control", "source": "src/process_indicators.rs::internal_reuse_contributes_context_but_never_an_observation", "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"main.rs": "A", "scope": "identical no-edit consumer control"}, "flags": [], "factual": null, "process": {"reference": "src/process_indicators.rs::internal_reuse_contributes_context_but_never_an_observation"}, "links": "edit-and-command"}},
+    {"id": "process-deduplicated-suggestion", "scenario": "eligible E plus C and P emits one neutral deduplicated suggestion with exact links", "construction": "accepted-test-reference-plus-identical-clean-consumer-control", "source": "src/process_indicators.rs::suggestion_is_deduplicated_and_uses_exact_neutral_wording", "expected": {"verify": "ok", "source": "ok", "replay": "available", "final_state": {"main.rs": "A", "scope": "identical no-edit consumer control"}, "flags": [], "factual": null, "process": {"reference": "src/process_indicators.rs::suggestion_is_deduplicated_and_uses_exact_neutral_wording"}, "links": "edit-and-command"}}
+  ]
+}

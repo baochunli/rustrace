@@ -1,0 +1,2 @@
+# Seeds for minimized exact-replay failures are persisted and replayed here.
+cc 2d011440041edaa31659a095e89cb8967fbbecf9da4ca7209174c5f82afa5e0a # shrinks to ScenarioSeed { initial: 0, actions: [] }

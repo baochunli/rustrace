@@ -1,0 +1,57 @@
+[workspace]
+members = [
+    "crates/editor",
+    "crates/journal",
+    "crates/model",
+    "crates/replay",
+    "crates/workspace",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/baochunli/rustrace"
+rust-version = "1.98.1"
+version = "0.1.0"
+
+[package]
+name = "rustrace"
+default-run = "rustrace"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+blake3 = "=1.8.7"
+crc32fast = "=1.5.1"
+crossterm = "=0.29.0"
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
+rustrace-editor = { path = "crates/editor" }
+rustrace-journal = { path = "crates/journal" }
+rustrace-model = { path = "crates/model" }
+rustrace-replay = { path = "crates/replay" }
+rustrace-workspace = { path = "crates/workspace" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+tree-sitter = "=0.27.0"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-toml-ng = "=0.7.0"
+toml = "=0.8.23"
+unicode-segmentation = "=1.13.3"
+unicode-width = "=0.2.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.189"
+
+[dev-dependencies]
+proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
+rusqlite = { version = "=0.40.1", features = ["bundled"] }
+
+[features]
+process-probes = [
+    "rustrace-journal/process-probes",
+    "rustrace-workspace/process-probes",
+]
