@@ -101,7 +101,15 @@ The complete version 1 event vocabulary is:
   versions, before/after workspace links, resource limits, output bytes, and
   outcome. The environment summary records only which fixed environment names
   are retained and never their values. Console routing is also recorded when
-  present. See
+  present. Console Test filters and output-option spellings are part of the
+  recorded argument vector. `--no-capture` and its `--nocapture` alias disable
+  the Rust test harness's capture, not Rustrace's recording; `--show-output`
+  exposes successful-test output after tests finish. Rustrace records output
+  emitted by the process, not prints kept inside the harness. Stdout and stderr
+  share an 8 MiB per-command cap within a 64 MiB session budget, or lower
+  deployment budgets and the remaining session allowance. These flags do not
+  change output limits, deadlines, or cancellation. The live console's 256 KiB
+  tail is separate from recorded output. See
   [`crates/model/src/command.rs`](../crates/model/src/command.rs).
 - Test-case comparison: `test_case_compared` records the command ID, case name, expected BLAKE3 digest, optional actual BLAKE3 digest, and typed outcome. The
   outcome is pass, mismatch with a one-based line and expected/actual line-byte
@@ -205,6 +213,16 @@ typing-biometric profile. Ordinary editor transactions still have event-level
 monotonic times for ordering and within-attempt replay.
 It also does not record registry traffic, network destinations, Cargo
 credentials, or fetched dependency cache contents.
+
+Course policy permits an external debugger on artifacts built by Rustrace;
+there is no integrated debugger. Keep source edits inside Rustrace, finish the
+Rustrace build before debugging its artifact, and avoid concurrent rebuilding.
+Stop the debugger and its running program before rebuilding or submitting.
+External debugger commands and output are not recorded. Program execution
+under the debugger can still write files; permission to debug does not imply
+a read-only run or recorded execution history. The
+[student debugger workflow](student-guide.md#use-an-external-debugger) explains
+which workspace artifacts to use.
 
 Disk changes to assignment files can be noticed when the TUI reconciles its
 workspace. Rustrace records the observed file facts and bounded recovery
