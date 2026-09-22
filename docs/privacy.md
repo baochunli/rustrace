@@ -33,7 +33,8 @@ record the command/output evidence and the exact accepted `Cargo.toml` and
 and the Update dependencies action.
 
 The data is used for grading only. There is no research use of the recorded data.
-Only the course's TAs and the instructor may review the data. All recorded data is permanently deleted after the term's grades are released.
+Only the course's TAs and the instructor may review the data.
+All recorded data is permanently deleted after the term's grades are released.
 
 Rustrace has no server and does not upload a bundle. The student prepares a
 local bundle and manually uploads it through Quercus. The access and
