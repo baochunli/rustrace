@@ -1,6 +1,7 @@
 use rustrace::cargo_policy::{
-    CargoAction, ResolvedTools, parse_console_command, prepare, prepare_console,
+    CargoAction, ConsoleCommand, ResolvedTools, parse_console_command, prepare, prepare_console,
 };
+use rustrace_model::WorkspacePath;
 use std::{path::PathBuf, process::Command};
 
 #[test]
@@ -166,6 +167,88 @@ fn console_literal_grammar_rejects_shell_syntax_flags_and_malformed_routes() {
         "cargo update --precise 1.0.0",
     ] {
         assert!(parse_console_command(input).is_err(), "accepted {input:?}");
+    }
+}
+
+#[test]
+fn console_test_grammar_preserves_every_bounded_filter_and_output_form() {
+    let longest_filter = "a".repeat(256);
+    let padded = format!(
+        "{}cargo  test{}",
+        " ".repeat(2048),
+        " ".repeat(4096 - 2048 - "cargo  test".len())
+    );
+    let cases = [
+        "cargo test legal_moves".to_owned(),
+        "cargo test tests::legal_moves".to_owned(),
+        "cargo test tests::".to_owned(),
+        "cargo test 1".to_owned(),
+        "cargo test legal-moves".to_owned(),
+        "cargo test -- --nocapture".to_owned(),
+        "cargo test -- --no-capture".to_owned(),
+        "cargo test -- --show-output".to_owned(),
+        "cargo test tests::legal_moves -- --nocapture".to_owned(),
+        "cargo test tests::legal_moves -- --no-capture".to_owned(),
+        "cargo test tests::legal_moves -- --show-output".to_owned(),
+        format!("cargo test {longest_filter}"),
+        padded,
+    ];
+
+    for input in cases {
+        let expected = input.split_ascii_whitespace().collect::<Vec<_>>();
+        let parsed = parse_console_command(&input)
+            .unwrap_or_else(|error| panic!("rejected {input:?}: {error}"));
+        assert_eq!(parsed.action, CargoAction::Test, "{input:?}");
+        assert_eq!(parsed.argv, argv(&expected), "{input:?}");
+        assert_eq!(parsed.stdin, None, "{input:?}");
+        assert_eq!(parsed.stdout, None, "{input:?}");
+    }
+}
+
+#[test]
+fn console_test_grammar_rejects_every_escape_and_byte_overflow() {
+    let oversized_filter = format!("cargo test {}", "a".repeat(257));
+    let oversized_line = format!("cargo test{}", " ".repeat(4097 - "cargo test".len()));
+    let mut cases = vec![
+        "cargo test one two".to_owned(),
+        "cargo test --".to_owned(),
+        "cargo test legal_moves --".to_owned(),
+        "cargo test --nocapture".to_owned(),
+        "cargo test -legal_moves".to_owned(),
+        "cargo test -- --nocapture legal_moves".to_owned(),
+        "cargo test -- legal_moves".to_owned(),
+        "cargo test -- --nocapture --show-output".to_owned(),
+        "cargo test -- --nocapture --nocapture".to_owned(),
+        "cargo test -- -- --show-output".to_owned(),
+        "cargo test -- --nocapture=true".to_owned(),
+        "cargo test -- --exact".to_owned(),
+        "cargo test -- --ignored".to_owned(),
+        "cargo test -- --test-threads=1".to_owned(),
+        "cargo test --locked".to_owned(),
+        "cargo test --release".to_owned(),
+        "cargo test --package example".to_owned(),
+        "cargo test --manifest-path other/Cargo.toml".to_owned(),
+        "cargo test --message-format=json".to_owned(),
+        "cargo test -- --locked".to_owned(),
+        "cargo test legal_moves > out".to_owned(),
+        "cargo test legal_moves < in".to_owned(),
+        "cargo test legal_moves>out".to_owned(),
+        "cargo test 'legal_moves'".to_owned(),
+        "cargo test legal*".to_owned(),
+        "cargo test $(name)".to_owned(),
+        "cargo test legal_moves; cargo run".to_owned(),
+        "cargo test tests/legal_moves".to_owned(),
+        "cargo test tests.legal_moves".to_owned(),
+        "cargo test légal_moves".to_owned(),
+        "cargo test\tlegal_moves".to_owned(),
+    ];
+    cases.extend([oversized_filter, oversized_line]);
+
+    for input in cases {
+        assert!(
+            parse_console_command(&input).is_err(),
+            "accepted invalid Test command {input:?}"
+        );
     }
 }
 
@@ -349,13 +432,134 @@ fn every_console_action_uses_natural_argv() {
 }
 
 #[test]
+fn console_test_forms_prepare_the_exact_literal_tail_after_controller_locking() {
+    for input in [
+        "cargo test legal_moves",
+        "cargo test tests::legal_moves",
+        "cargo test -- --nocapture",
+        "cargo test -- --no-capture",
+        "cargo test -- --show-output",
+        "cargo test tests::legal_moves -- --nocapture",
+        "cargo test tests::legal_moves -- --no-capture",
+        "cargo test tests::legal_moves -- --show-output",
+    ] {
+        let request = parse_console_command(input).unwrap();
+        let prepared = prepare_console(&request, &tools(), &PathBuf::from("/workspace")).unwrap();
+        let mut expected = argv(&["run", "pinned", "/trusted/cargo", "test", "--locked"]);
+        expected.extend(request.argv[2..].iter().cloned());
+        assert_eq!(prepared.command.get_program(), "/trusted/rustup", "{input}");
+        assert_eq!(
+            prepared.command.get_args().collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(std::ffi::OsStr::new)
+                .collect::<Vec<_>>(),
+            "{input}"
+        );
+    }
+
+    let longest_filter = "a".repeat(256);
+    let request = ConsoleCommand {
+        action: CargoAction::Test,
+        argv: vec!["cargo".into(), "test".into(), longest_filter.clone()],
+        stdin: None,
+        stdout: None,
+    };
+    let prepared = prepare_console(&request, &tools(), &PathBuf::from("/workspace")).unwrap();
+    assert_eq!(
+        prepared.command.get_args().collect::<Vec<_>>(),
+        [
+            "run",
+            "pinned",
+            "/trusted/cargo",
+            "test",
+            "--locked",
+            longest_filter.as_str(),
+        ]
+        .into_iter()
+        .map(std::ffi::OsStr::new)
+        .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn direct_console_test_requests_cannot_bypass_grammar_action_or_routes() {
+    let invalid = [
+        (
+            CargoAction::Test,
+            vec!["cargo", "test", "one", "two"],
+            None,
+            None,
+        ),
+        (
+            CargoAction::Check,
+            vec!["cargo", "test", "legal_moves"],
+            None,
+            None,
+        ),
+        (CargoAction::Test, vec!["cargo", "test", ""], None, None),
+        (
+            CargoAction::Test,
+            vec!["cargo", "test", "légal_moves"],
+            None,
+            None,
+        ),
+        (
+            CargoAction::Test,
+            vec!["cargo", "test", "legal_moves"],
+            Some(WorkspacePath::new("input.bin").unwrap()),
+            None,
+        ),
+        (
+            CargoAction::Test,
+            vec!["cargo", "test", "legal_moves"],
+            None,
+            Some(WorkspacePath::new("output.bin").unwrap()),
+        ),
+    ];
+    for (action, arguments, stdin, stdout) in invalid {
+        let request = ConsoleCommand {
+            action,
+            argv: argv(&arguments),
+            stdin,
+            stdout,
+        };
+        assert!(
+            prepare_console(&request, &tools(), &PathBuf::from("/workspace")).is_err(),
+            "accepted direct request {request:?}"
+        );
+    }
+
+    for filter in ["-leading".to_owned(), "a".repeat(257)] {
+        let request = ConsoleCommand {
+            action: CargoAction::Test,
+            argv: vec!["cargo".into(), "test".into(), filter],
+            stdin: None,
+            stdout: None,
+        };
+        assert!(prepare_console(&request, &tools(), &PathBuf::from("/workspace")).is_err());
+    }
+
+    assert!(
+        prepare(
+            CargoAction::Test,
+            &argv(&["cargo", "test", "legal_moves"]),
+            &tools(),
+            &PathBuf::from("/workspace")
+        )
+        .is_err(),
+        "console Test arguments must not broaden instructor commands"
+    );
+}
+
+#[test]
 fn rejection_names_the_complete_student_allowlist_without_internal_ids() {
     let message = parse_console_command("cargo publish")
         .unwrap_err()
         .to_string();
     assert_eq!(
         message,
-        "unsupported Cargo command; allowed: cargo build, cargo check, cargo test, cargo run, cargo clippy, cargo doc, cargo add NAME, cargo add NAME@VERSION, cargo remove NAME, cargo update"
+        "unsupported Cargo command; allowed: cargo build, cargo check, cargo test [FILTER] [-- OUTPUT_OPTION] (OUTPUT_OPTION: --nocapture, --no-capture, or --show-output), cargo run, cargo clippy, cargo doc, cargo add NAME, cargo add NAME@VERSION, cargo remove NAME, cargo update"
     );
     assert!(!message.contains("T10.10"));
     assert!(!message.contains("T4.3"));
