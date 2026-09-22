@@ -1,5 +1,9 @@
 # How does a maintainer release a new update to Rustrace?
 
+For the bounded console Test options, complete the
+[reader-first rollout checklist](releases/test-debug-options.md) before making
+the student update available, including through release-tag publication.
+
 Assume that the latest release is v0.1.0, and a fix should be released as v0.1.1. The release workflow (.github/workflows/release.yml) automatically publishes when you push a v* tag.
 
 1. Change version = "0.1.0" to version = "0.1.1" under [workspace.package] in Cargo.toml, then refresh the lockfile and validate:

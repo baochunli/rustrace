@@ -5,8 +5,8 @@ You write code inside it, run Cargo inside it, and at the end it prepares one
 ZIP file that you upload to the course LMS yourself. Rustrace has no server: it
 never uploads anything, and it cannot tell whether your LMS upload succeeded.
 
-This guide covers the pilot release. Every command, flag, and output shape
-below was checked against a binary built from the release source.
+This guide covers the pilot workflow, including the bounded console Test
+options described below.
 
 ## Recommended terminals
 
@@ -737,7 +737,7 @@ It is not a shell. Type one of these lines and press Enter:
 ```text
 cargo build
 cargo check
-cargo test
+cargo test [FILTER] [-- OUTPUT_OPTION]
 cargo clippy
 cargo doc
 cargo add NAME
@@ -751,12 +751,63 @@ cargo run > output.txt
 cargo run --release < input.txt > output.txt
 ```
 
+For `cargo test`, brackets mark optional groups; do not type the brackets.
+`OUTPUT_OPTION` is exactly one of `--nocapture`, `--no-capture`, or
+`--show-output`. These are the allowed forms:
+
+```text
+cargo test
+cargo test FILTER
+cargo test -- --nocapture
+cargo test -- --no-capture
+cargo test -- --show-output
+cargo test FILTER -- --nocapture
+cargo test FILTER -- --no-capture
+cargo test FILTER -- --show-output
+```
+
+Replace `FILTER` with one literal token of 1–256 ASCII bytes from
+`[A-Za-z0-9_:-]`, without a leading `-`. For example, `legal_moves`,
+`tests::legal_moves`, and `tests::` are valid. A filter matches a substring of
+the full Rust test name, including its module path. Even a full-looking name
+can match several tests; exact matching with `--exact` is not supported here.
+A valid filter can match zero tests, so check the reported test count: a
+successful command alone does not mean any tests ran.
+
+The filter must precede the literal `--` separator. An output option needs
+that separator and must be last. Multiple filters, multiple output options,
+a trailing `--` alone, and other Cargo or test-harness flags are rejected.
+For example, `cargo test --nocapture`, `cargo test one two`,
+`cargo test -- --exact`, and `cargo test --release` are not allowed.
+
+By default, Rust's test harness captures test prints and shows them for failing
+tests. `--no-capture` lets tests print while running; parallel tests can
+interleave their output. `--nocapture` is the deprecated alias for the same
+behavior and remains accepted. `--show-output` keeps harness capture enabled
+and shows successful-test output after all tests finish, grouped by test. See
+the official [test-harness output options](https://doc.rust-lang.org/rustc/tests/index.html#output-options).
+These options do not disable Rustrace recording: output emitted by the process
+is still recorded under the same limits described below. Prints retained only
+inside the test harness are not available to Rustrace.
+
+These options apply only to typed console Test commands. Bare `cargo test` and
+the menu Test action keep their existing behavior and assignment policy.
+Rust unit tests run by `cargo test` are separate from the packaged input/output
+cases in the F4 picker, which runs your program with `cargo run`.
+
+Use the course-provided Rustrace update for these forms. Staff must update
+grader, verifier, and replay installations before distributing that student
+update: older readers reject recordings containing the new Test arguments.
+Existing `.rta` packages need no changes, and updated readers still accept
+older recordings.
+
 Redirections are allowed only for `cargo run`. Their paths are relative to a
 directory named `test-cases` that sits next to your workspace directory, and
 each may appear once. Quotes, pipes, wildcards, and other shell characters are
-rejected, and a line is limited to 4096 bytes. If the output file already
-exists, the console asks before overwriting: Y or Enter overwrites, N or Esc
-cancels and leaves the file alone.
+rejected. A line is limited to 4096 bytes, including surrounding spaces.
+Leading, trailing, and repeated ASCII spaces are allowed; tabs and newlines
+are rejected. If the output file already exists, the console asks before
+overwriting: Y or Enter overwrites, N or Esc cancels and leaves the file alone.
 
 When `cargo run` starts without an input redirect, the prompt line becomes the
 program's standard input. Type a line and press Enter to send it.
@@ -771,7 +822,11 @@ Cargo status lines render flush-left; diagnostic blocks are dedented by their
 minimum indentation to keep source gutters and carets aligned. Other lines keep
 their indentation, and all recorded bytes remain unchanged. The mode bar reads only
 `esc close  ↵ run/send` in both modifier modes. The console shows the last part
-of the output; the full output is recorded up to 8 MiB per command. Esc returns
+of the output (at most 256 KiB). Recorded stdout and stderr share an 8 MiB
+per-command cap and a 64 MiB session budget; deployments may set lower budgets,
+and a command can use only the remaining session allowance. Reaching the output
+limit stops the command. The existing deadline (at most five minutes) and Esc
+cancellation also apply to filtered tests and every output option. Esc returns
 to the workspace view.
 
 F4 or the Test cases menu entry opens a modal test-case picker. It lists complete
@@ -828,6 +883,39 @@ happens outside Rustrace.
 Pasting into the console or test-case picker is blocked and recorded the same
 way as in the editor. The record shows only what happened inside Rustrace; it
 cannot show how files you produced elsewhere were made.
+
+## Use an external debugger
+
+Course policy permits a separate debugger on artifacts built by Rustrace.
+Rustrace has no integrated debugger. Keep all source edits inside Rustrace.
+
+Opening an `.rta` extracts the assignment into a workspace such as
+`assignment.work`; the package itself is not an executable. Save your source,
+then use `cargo build` in the F9 console to build an assignment's ordinary
+binary. Wait for the build to finish successfully. With the usual native debug
+configuration, the binary is `assignment.work/target/debug/NAME`, where `NAME`
+is the assignment's binary target name; use the actual artifact path if the
+assignment's Cargo configuration changes that layout. See the official
+[`cargo build` documentation](https://doc.rust-lang.org/cargo/commands/cargo-build.html).
+
+`cargo check` does not produce an executable. `cargo test` builds distinct test
+harness executables, usually under `target/debug/deps`; do not assume it also
+leaves the ordinary program binary you want to debug. To debug a unit test,
+use the test executable identified in the completed Rustrace test run's Cargo
+output. See the official [`cargo check`](https://doc.rust-lang.org/cargo/commands/cargo-check.html)
+and [`cargo test`](https://doc.rust-lang.org/cargo/commands/cargo-test.html) documentation.
+
+Wait for any active Rustrace command to finish before opening the existing
+artifact in your separate debugger. Disable any automatic build step in the
+debugger, and do not run Rustrace build, check, test, or run commands while
+debugging. Stop the debugger and its running program before saving source,
+rebuilding, or submitting: saving can start a Check. Make source changes in
+Rustrace and finish the next build before starting another debugging session.
+
+Rustrace does not record external debugger commands or output. Running the
+program under a debugger can still write files. Rustrace may later observe
+assignment-file changes and record the file evidence, but it cannot reconstruct
+the external debugging session. See [what is not recorded](privacy.md#what-is-not-recorded).
 
 ## Run rustrace submit
 

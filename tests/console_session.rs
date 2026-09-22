@@ -72,6 +72,28 @@ fn production_console_recording_failure_parent() {
 }
 
 #[test]
+fn production_console_test_options_parent() {
+    if std::env::var_os("RUSTRACE_CONSOLE_FIXTURE").is_some() {
+        return;
+    }
+    let (parent, root) = console_fixture("test-options");
+    fs::write(
+        root.join("target/runner-fixture.json"),
+        br#"{"mode":"console_io","mutate_source":false,"echo":false}"#,
+    )
+    .unwrap();
+    let output = run_console_child(&root, "production_console_test_options_child");
+    assert!(
+        output.status.success(),
+        "fixture retained {}; stdout={}; stderr={}",
+        parent.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
 fn production_test_case_session_parent() {
     if std::env::var_os("RUSTRACE_CONSOLE_FIXTURE").is_some() {
         return;
@@ -324,6 +346,96 @@ fn install_tools(root: &Path) {
         fs::write(&path, script).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
+}
+
+#[test]
+fn production_console_test_options_child() {
+    let Some(root) = std::env::var_os("RUSTRACE_CONSOLE_FIXTURE") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let launcher = root.join("target/bin/rustup");
+    let root = fs::canonicalize(root).unwrap();
+    let mut session = ProductionSession::start(&root, MANIFEST).unwrap();
+    let id = session.session_id().clone();
+
+    assert_eq!(
+        session
+            .start_console_command("cargo test tests::legal_moves -- --show-output")
+            .unwrap(),
+        ConsoleStart::Started
+    );
+    assert!(
+        !session.console_accepts_stdin(),
+        "console Test stdin must be closed"
+    );
+    wait(&mut session);
+    assert!(!session.command_active());
+    let outcome = session.command_outcome().cloned().unwrap();
+    assert!(
+        matches!(outcome, CommandOutcome::Exited { .. }),
+        "fake Cargo must reach process completion: {outcome:?}"
+    );
+    assert!(
+        !session.console_output().is_empty(),
+        "completed fake Cargo must expose captured output"
+    );
+    session.quit().unwrap();
+
+    let pinned = rustrace_workspace::hash::PinnedWorkspaceRoot::open(&root).unwrap();
+    let owner = pinned
+        .open_state_directory()
+        .unwrap()
+        .open_journal_file(&id)
+        .unwrap();
+    let mut journal =
+        rustrace_journal::Journal::open_read_only_no_follow(owner.display_path()).unwrap();
+    let events = journal.read_events(&id, 1, 1000).unwrap();
+    let start = events
+        .iter()
+        .find_map(|event| match &event.event {
+            Event::ControlledCommandStarted(start) => Some(start),
+            _ => None,
+        })
+        .expect("recorded console Test start");
+    assert_eq!(start.action, ControlledAction::Test);
+    assert_eq!(
+        start.argv,
+        [
+            launcher.to_string_lossy().into_owned(),
+            "run".to_owned(),
+            "fixture".to_owned(),
+            root.join("target/bin/v1/cargo")
+                .to_string_lossy()
+                .into_owned(),
+            "test".to_owned(),
+            "--locked".to_owned(),
+            "tests::legal_moves".to_owned(),
+            "--".to_owned(),
+            "--show-output".to_owned(),
+        ]
+    );
+    let route = start.console.as_ref().expect("console route");
+    assert_eq!(route.stdin, ConsoleStdinRoute::Closed);
+    assert_eq!(route.stdout, ConsoleStdoutRoute::Console);
+
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        Event::ControlledCommandOutput(output)
+            if output.command_id == start.command_id && !output.bytes_hex.is_empty()
+    )));
+    let finish = events
+        .iter()
+        .find_map(|event| match &event.event {
+            Event::ControlledCommandFinished(finish) if finish.command_id == start.command_id => {
+                Some(finish)
+            }
+            _ => None,
+        })
+        .expect("recorded console Test finish");
+    assert_eq!(finish.outcome, outcome);
+    assert_eq!(finish.stdout.mode, CommandCaptureMode::Captured);
+    assert_eq!(finish.stderr.mode, CommandCaptureMode::Captured);
 }
 
 #[test]

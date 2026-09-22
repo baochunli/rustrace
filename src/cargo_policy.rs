@@ -1,6 +1,9 @@
 //! T4.3 preparation only. Execution/barriers/evidence belong to T4.2.
 //! It validates allowed commands and prepares bounded arguments and environments.
-use rustrace_model::{WorkspacePath, is_valid_crates_io_dependency_spec, is_valid_crates_io_name};
+use rustrace_model::{
+    WorkspacePath, is_valid_console_test_tail, is_valid_crates_io_dependency_spec,
+    is_valid_crates_io_name,
+};
 use std::{
     fmt,
     path::{Component, Path, PathBuf},
@@ -95,7 +98,7 @@ pub fn parse_console_command(_input: &str) -> Result<ConsoleCommand, Preparation
     let action = match tokens.as_slice() {
         ["cargo", "build"] => CargoAction::Build,
         ["cargo", "check"] => CargoAction::Check,
-        ["cargo", "test"] => CargoAction::Test,
+        ["cargo", "test", tail @ ..] if is_valid_console_test_tail(tail) => CargoAction::Test,
         ["cargo", "clippy"] => CargoAction::Clippy,
         ["cargo", "doc"] => CargoAction::Doc,
         ["cargo", "add", dependency] if is_valid_crates_io_dependency_spec(dependency) => {
@@ -212,7 +215,7 @@ impl fmt::Display for PreparationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::UnsupportedCommand => {
-                "unsupported Cargo command; allowed: cargo build, cargo check, cargo test, cargo run, cargo clippy, cargo doc, cargo add NAME, cargo add NAME@VERSION, cargo remove NAME, cargo update"
+                "unsupported Cargo command; allowed: cargo build, cargo check, cargo test [FILTER] [-- OUTPUT_OPTION] (OUTPUT_OPTION: --nocapture, --no-capture, or --show-output), cargo run, cargo clippy, cargo doc, cargo add NAME, cargo add NAME@VERSION, cargo remove NAME, cargo update"
             }
             Self::InvalidToolSelection => {
                 "expected an explicitly resolved installed toolchain name"
@@ -259,7 +262,8 @@ pub fn prepare_console(
     let valid = match request.action {
         CargoAction::Build => request.argv.as_slice() == ["cargo", "build"],
         CargoAction::Check => request.argv.as_slice() == ["cargo", "check"],
-        CargoAction::Test => request.argv.as_slice() == ["cargo", "test"],
+        CargoAction::Test => matches!(request.argv.as_slice(), [cargo, test, tail @ ..]
+            if cargo == "cargo" && test == "test" && is_valid_console_test_tail(tail)),
         CargoAction::Clippy => request.argv.as_slice() == ["cargo", "clippy"],
         CargoAction::Run => request.argv.as_slice() == ["cargo", "run"] || release,
         CargoAction::Format => false,
@@ -364,6 +368,9 @@ fn prepare_inner(
             command.arg("--message-format=json");
         }
         command.arg("--locked");
+        if action == CargoAction::Test && !structured_output {
+            command.args(literal_tail);
+        }
     }
     if deny_warnings {
         command.args(["--", "-D", "warnings"]);
