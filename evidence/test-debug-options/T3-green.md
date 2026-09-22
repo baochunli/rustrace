@@ -49,3 +49,45 @@ env TMPDIR="$PWD/.t3-tmp" CARGO_TARGET_DIR="$PWD/.t3-target" cargo check --works
 Exit 0. No schema, `.rta`, version, dependency, configuration, or test changes
 were made. Task-owned build and temporary artifacts remain retained for
 integration validation.
+
+## Follow-up after the merged-tree failure
+
+The merged-tree integration run later reported `console_session` as 7 passed /
+1 failed, but its raw output and retained fixture were unavailable, including
+the failing test name. The original implementer resumed from corrected base
+`1dd8546` and could not reproduce the failure.
+
+One fresh task-owned run passed all 8 tests:
+
+```text
+env TMPDIR="$PWD/.t3-tmp" CARGO_TARGET_DIR="$PWD/.t3-target" cargo test --test console_session -- --nocapture
+```
+
+The exact affected integration command then passed both targets:
+
+```text
+env TMPDIR="$PWD/.t3-tmp" CARGO_TARGET_DIR="$PWD/.t3-target" cargo test --no-fail-fast --test cargo_policy --test console_session
+```
+
+Result: `cargo_policy` 15 passed and `console_session` 8 passed.
+
+A bounded repetition ran the console-session target 10 more times with default
+test parallelism:
+
+```text
+for attempt in {1..10}; do
+  env TMPDIR="$PWD/.t3-tmp" CARGO_TARGET_DIR="$PWD/.t3-target" cargo test -q --test console_session || exit $?
+done
+```
+
+All 10 runs passed, for 80 passed / 0 failed. Combined with the fresh and exact
+integration reruns, the target passed 12 consecutive times. The feature parent
+and all pre-existing control parents passed in every run, so the missing
+original failure cannot be classified as feature-specific or pre-existing.
+No production or test change was justified.
+
+Raw follow-up logs remain retained at:
+
+- `.t3-tmp/console-session-followup-1.log`
+- `.t3-tmp/integration-command-followup.log`
+- `.t3-tmp/console-session-repeat-10.log`
