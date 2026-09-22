@@ -69,3 +69,12 @@ Policy wording/rendering and all tests remain unchanged; only the required
 source-line layout is restored. The original checkout's uncommitted version
 bump is outside this fix. The user requested direct integration into latest
 main without a PR; root validates the integrated privacy suite before push.
+
+## Main integration validation
+
+After updating local main from the merged PR (`baab602`) and integrating the
+reviewed fix at `0bb0638`, `cargo nextest run --test privacy_cli` passed all
+6 tests (0 skipped), including the originally failing documentation test.
+The user's uncommitted 0.1.2 Cargo.toml/Cargo.lock changes were preserved
+byte-for-byte and were not staged or committed. Whitespace validation passed.
+This records the affected target, not a rerun of the entire nextest suite.
