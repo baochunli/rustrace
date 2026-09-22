@@ -225,6 +225,174 @@ fn every_console_action_accepts_natural_argv() {
 }
 
 #[test]
+fn console_test_evidence_accepts_and_round_trips_every_canonical_tail() {
+    for tail in [
+        "--locked legal_moves",
+        "--locked tests::legal_moves",
+        "--locked tests::",
+        "--locked 1",
+        "--locked legal-moves",
+        "--locked -- --nocapture",
+        "--locked -- --no-capture",
+        "--locked -- --show-output",
+        "--locked tests::legal_moves -- --nocapture",
+        "--locked tests::legal_moves -- --no-capture",
+        "--locked tests::legal_moves -- --show-output",
+    ] {
+        let tail = tail.split_ascii_whitespace().collect::<Vec<_>>();
+        let original = cargo_start("test", "test", &tail, true);
+        let original_value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        let decoded = decode_envelope(&original, DecodePolicy::RejectUnsupported)
+            .unwrap_or_else(|error| panic!("rejected console Test tail {tail:?}: {error}"));
+        let DecodeOutcome::Decoded(decoded) = decoded else {
+            panic!("skipped console Test tail {tail:?}")
+        };
+        let encoded: serde_json::Value =
+            serde_json::from_slice(&encode_envelope(&decoded).unwrap()).unwrap();
+        assert_eq!(
+            encoded["event"]["payload"]["argv"], original_value["event"]["payload"]["argv"],
+            "changed console Test spelling for {tail:?}"
+        );
+    }
+
+    let longest_filter = "a".repeat(256);
+    let tail = ["--locked", longest_filter.as_str()];
+    assert!(
+        decode_envelope(
+            &cargo_start("test", "test", &tail, true),
+            DecodePolicy::RejectUnsupported
+        )
+        .is_ok(),
+        "rejected 256-byte console Test filter"
+    );
+}
+
+#[test]
+fn console_test_evidence_preserves_historical_argv_forms() {
+    for tail in [
+        &["--frozen"][..],
+        &["--message-format=json", "--locked"][..],
+        &["--locked"][..],
+    ] {
+        let original = cargo_start("test", "test", tail, true);
+        let DecodeOutcome::Decoded(decoded) =
+            decode_envelope(&original, DecodePolicy::RejectUnsupported)
+                .unwrap_or_else(|error| panic!("rejected historical Test tail {tail:?}: {error}"))
+        else {
+            panic!("skipped historical Test tail {tail:?}")
+        };
+        let encoded: serde_json::Value =
+            serde_json::from_slice(&encode_envelope(&decoded).unwrap()).unwrap();
+        let original: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        assert_eq!(
+            encoded["event"]["payload"]["argv"],
+            original["event"]["payload"]["argv"]
+        );
+    }
+}
+
+#[test]
+fn console_test_evidence_rejects_malformed_tails_and_filter_overflow() {
+    for tail in [
+        "--locked one two",
+        "--locked --",
+        "--locked legal_moves --",
+        "--locked --nocapture",
+        "--locked -legal_moves",
+        "--locked -- --nocapture legal_moves",
+        "--locked -- legal_moves",
+        "--locked -- --nocapture --show-output",
+        "--locked -- --nocapture --nocapture",
+        "--locked -- -- --show-output",
+        "--locked -- --nocapture=true",
+        "--locked -- --exact",
+        "--locked -- --ignored",
+        "--locked -- --test-threads=1",
+        "--locked tests/legal_moves",
+        "--locked tests.legal_moves",
+        "--locked légal_moves",
+        "--frozen -- --show-output",
+        "--message-format=json --locked -- --show-output",
+    ] {
+        let tail = tail.split_ascii_whitespace().collect::<Vec<_>>();
+        assert!(
+            decode_envelope(
+                &cargo_start("test", "test", &tail, true),
+                DecodePolicy::RejectUnsupported
+            )
+            .is_err(),
+            "accepted malformed console Test tail {tail:?}"
+        );
+    }
+
+    let oversized_filter = "a".repeat(257);
+    assert!(
+        decode_envelope(
+            &cargo_start(
+                "test",
+                "test",
+                &["--locked", oversized_filter.as_str()],
+                true
+            ),
+            DecodePolicy::RejectUnsupported
+        )
+        .is_err(),
+        "accepted 257-byte console Test filter"
+    );
+}
+
+#[test]
+fn console_test_options_require_the_closed_console_route_and_test_action() {
+    let canonical = cargo_start(
+        "test",
+        "test",
+        &["--locked", "legal_moves", "--", "--show-output"],
+        true,
+    );
+    for route in [
+        json!({"stdin":{"kind":"submitted"},"stdout":{"kind":"console"}}),
+        json!({"stdin":{"kind":"file","path":"input.bin"},"stdout":{"kind":"console"}}),
+        json!({"stdin":{"kind":"closed"},"stdout":{"kind":"file","path":"output.bin"}}),
+    ] {
+        let mut value: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+        value["event"]["payload"]["console"] = route;
+        assert!(
+            decode_envelope(
+                &serde_json::to_vec(&value).unwrap(),
+                DecodePolicy::RejectUnsupported
+            )
+            .is_err(),
+            "accepted invalid console Test route"
+        );
+    }
+
+    for action in ["build", "check", "run", "clippy", "doc"] {
+        for tail in ["--locked legal_moves", "--locked -- --show-output"] {
+            let tail = tail.split_ascii_whitespace().collect::<Vec<_>>();
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&cargo_start(action, action, &tail, true)).unwrap();
+            if action == "clippy" {
+                value["event"]["payload"]["tools"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({
+                        "component":"clippy", "executable":"/trusted/cargo",
+                        "version":"clippy fixture"
+                    }));
+            }
+            assert!(
+                decode_envelope(
+                    &serde_json::to_vec(&value).unwrap(),
+                    DecodePolicy::RejectUnsupported
+                )
+                .is_err(),
+                "accepted console Test tail {tail:?} on {action}"
+            );
+        }
+    }
+}
+
+#[test]
 fn historical_controlled_events_reencode_without_new_default_fields() {
     let original = envelope(json!({"type":"controlled_command_finished","payload":{
         "command_id":"command-2",
