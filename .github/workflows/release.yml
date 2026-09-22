@@ -58,7 +58,7 @@ jobs:
           ./scripts/release.sh
           ./scripts/verify-release.sh "dist/$RELEASE_TARGET"
       - name: Upload build proof to Actions only
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rustrace-${{ matrix.target }}
           path: dist/
@@ -78,7 +78,7 @@ jobs:
       - name: Use temporary config
         run: printf 'XDG_CONFIG_HOME=%s/rustrace-xdg\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Download verified build metadata
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v7
         with:
           pattern: rustrace-*
           path: dist/
@@ -88,7 +88,7 @@ jobs:
           ./scripts/manifest.sh "$RELEASE_TAG" dist/aarch64-apple-darwin dist/x86_64-unknown-linux-gnu > dist/latest.json
           ./scripts/manifest.sh --verify dist/latest.json "$RELEASE_TAG" dist/aarch64-apple-darwin dist/x86_64-unknown-linux-gnu
       - name: Upload manifest to Actions
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: source-release-manifest
           path: dist/latest.json
