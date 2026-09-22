@@ -59,3 +59,13 @@ their corresponding `.exit` files, the whitespace log, and the commit message.
 These local resources are left in place and excluded from the commit.
 Only `docs/privacy.md` and this evidence file are committed. No push or merge
 is performed; integration and subsequent validation belong to the root task.
+
+## Independent acceptance
+
+Reviewer `rp-f1-review` (GPT-5.6 Sol, xhigh reasoning, through Herdr) reviewed
+`3627d15400cb8ba39b76d1ff86ddec37ca904853` against
+`baab60261e2be5b5b854d5af9850ff8cc42e4775`: PASS, no findings at any priority.
+Policy wording/rendering and all tests remain unchanged; only the required
+source-line layout is restored. The original checkout's uncommitted version
+bump is outside this fix. The user requested direct integration into latest
+main without a PR; root validates the integrated privacy suite before push.
