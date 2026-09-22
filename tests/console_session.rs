@@ -353,7 +353,9 @@ fn production_console_test_options_child() {
     let Some(root) = std::env::var_os("RUSTRACE_CONSOLE_FIXTURE") else {
         return;
     };
-    let root = fs::canonicalize(PathBuf::from(root)).unwrap();
+    let root = PathBuf::from(root);
+    let launcher = root.join("target/bin/rustup");
+    let root = fs::canonicalize(root).unwrap();
     let mut session = ProductionSession::start(&root, MANIFEST).unwrap();
     let id = session.session_id().clone();
 
@@ -400,9 +402,7 @@ fn production_console_test_options_child() {
     assert_eq!(
         start.argv,
         [
-            root.join("target/bin/rustup")
-                .to_string_lossy()
-                .into_owned(),
+            launcher.to_string_lossy().into_owned(),
             "run".to_owned(),
             "fixture".to_owned(),
             root.join("target/bin/v1/cargo")
