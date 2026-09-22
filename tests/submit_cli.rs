@@ -94,6 +94,59 @@ fn submit_cli_builds_importable_bundle_at_explicit_output_without_opening_the_tu
 }
 
 #[test]
+fn submit_cli_revision_corrects_student_id_without_changing_parent() {
+    let test_home = test_home::TestHome::new(false);
+    let fixture = Fixture::new("submit-cli-correct-id");
+    let parent = ProductionSession::start(&fixture.workspace, MANIFEST)
+        .unwrap()
+        .finalize("YOUR_UTORID")
+        .unwrap();
+    let child = fixture.base.join("revision");
+    fs::create_dir(&child).unwrap();
+    for (path, bytes) in parent.final_workspace() {
+        fs::write(child.join(path.as_str()), bytes).unwrap();
+    }
+    ProductionSession::start_revision(&fixture.workspace, &child, MANIFEST)
+        .unwrap()
+        .quit()
+        .unwrap();
+
+    let output = test_home
+        .command(env!("CARGO_BIN_EXE_rustrace"))
+        .arg("submit")
+        .arg(&child)
+        .args(["--student-id", "correct-id"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let destination = fixture.base.join("correct-id-assignment.zip");
+    let imported = import_rprov(Cursor::new(fs::read(&destination).unwrap())).unwrap();
+    assert_eq!(imported.manifest().student_id, "correct-id");
+    assert_eq!(
+        imported.manifest().package_state,
+        RprovPackageState::CleanFinalized
+    );
+    assert_eq!(imported.manifest().segments.len(), 2);
+    assert_eq!(
+        imported.manifest().segments[0],
+        parent.manifest().segments[0]
+    );
+    let report = verify_path(&destination, None);
+    assert!(report.issues.is_empty(), "{:?}", report.issues);
+    let rustrace::session::FinalizationStatus::Finalized(unchanged) =
+        ProductionSession::recover_finalization(&fixture.workspace).unwrap()
+    else {
+        panic!("parent must remain finalized")
+    };
+    assert_eq!(unchanged.manifest(), parent.manifest());
+}
+
+#[test]
 fn submit_cli_refuses_a_student_id_that_differs_from_the_receipt() {
     let test_home = test_home::TestHome::new(false);
     let fixture = Fixture::new("submit-cli-student-mismatch");

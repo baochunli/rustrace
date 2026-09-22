@@ -851,8 +851,8 @@ local artifact only; this does not mean a successful LMS hand-in
 ```
 
 `submit` never overwrites a ZIP. The default name depends only on your ID and
-the assignment, so every attempt of one assignment in the same folder resolves
-to the same default file, and a linked revision in that folder cannot use it
+the assignment, so attempts using the same student ID and assignment in the
+same folder resolve to the same default file. A linked revision using that ID cannot use it
 once you have already submitted. If the default file still exists, `submit`
 stops with `bundle destination already exists and was not replaced` and exit
 code 1, and writes nothing. Running `submit` again for the same attempt adds
@@ -891,14 +891,15 @@ belong to the child attempt.
 
 ## Prepare the revised ZIP
 
-Finalize and package the child with the same student ID, and give the new ZIP
+Finalize and package the child with your student ID, and give the new ZIP
 its own name with `--output`:
 
 ```console
 rustrace submit assignment-v2.work --student-id YOUR_ID --output YOUR_ID-ASSIGNMENT-v2.zip
 ```
 
-The `--output` flag is required here in practice. Without it, the child would
+When reusing the same student ID, the `--output` flag is required here in
+practice. Without it, the child would
 use the same default filename as the parent's ZIP, `submit` would stop with
 `bundle destination already exists and was not replaced` and exit code 1, and
 no revised ZIP would be written. Any name you choose is fine; the revised ZIP
@@ -907,6 +908,32 @@ affect grading.
 
 Upload the new ZIP to the LMS and confirm the hand-in there. Revise again from
 the child for a third attempt, and so on, giving each attempt's ZIP a new name.
+
+## Correct a student ID after finalizing
+
+If you submitted a placeholder or mistyped ID, create a new linked attempt
+from the finalized workspace, then submit it with your actual ID. No source
+edits are necessary. For example, replace `actual_utorid` below with your UTORid:
+
+```console
+rustrace revise lab1.work lab1-corrected.work lab1.rta
+rustrace submit lab1-corrected.work --student-id actual_utorid --output actual_utorid-lab1-corrected.zip
+rustrace verify actual_utorid-lab1-corrected.zip
+```
+
+The new ZIP records the corrected ID and includes the complete recorded history.
+The original workspace, receipt, and ZIP retain their original ID. You cannot
+change the ID by resubmitting an already finalized workspace or by renaming its
+ZIP; renaming changes only the filename. Upload the corrected ZIP to the LMS.
+
+Older versions reject this operation with `revision student identifier differs
+from its parent receipt`. Install a version containing the student-ID correction
+fix first. If you already encountered that error, keep the failed revision and
+create a fresh revision from the original finalized workspace using a new,
+nonexistent directory, as above. The failed revision is in incomplete recovery
+state; retrying it or using `--allow-incomplete` does not produce a clean corrected
+submission. If you made source edits in that failed revision, preserve them and
+reapply them in the new attempt before submitting.
 
 ## Keep required local history
 

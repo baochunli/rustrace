@@ -906,9 +906,8 @@ impl ProductionSession {
             (None, None)
         };
         if let Some(parent) = &parent {
-            if parent.manifest.student_id != student_id {
-                return Err("revision student identifier differs from its parent receipt".into());
-            }
+            // Student IDs belong to each submission, not its recorded event history.
+            // A linked revision may correct the ID without changing the parent receipt.
             require_assignment_match(&parent.manifest, &self.metadata, &authority.owner)?;
             let child_initial = checkpoints
                 .first()
@@ -2811,8 +2810,7 @@ fn recovery_ancestry_matches(
     ancestry: &RecoveryAncestry,
 ) -> bool {
     let receipt = &ancestry.receipt;
-    receipt.manifest.student_id == persisted.student_id
-        && Some(receipt.manifest.original_starter_tree_hash) == persisted.original_starter_tree_hash
+    Some(receipt.manifest.original_starter_tree_hash) == persisted.original_starter_tree_hash
         && receipt.manifest.test_case_suite_hash == persisted.test_case_suite_hash
         && Some(&receipt.manifest.initial_workspace) == persisted.initial_workspace.as_ref()
         && receipt.manifest.assignment_manifest == persisted.assignment_manifest
@@ -2835,9 +2833,6 @@ fn build_recovery_manifest(
     let (mut segments, mut inventory, mut payloads, parent_link, ordinal, mut gaps) =
         if let Some(ancestry) = ancestry {
             let receipt = ancestry.receipt;
-            if receipt.manifest.student_id != persisted.student_id {
-                return Err("revision student identifier differs from its parent receipt".into());
-            }
             if receipt.manifest.assignment_manifest != persisted.assignment_manifest
                 || receipt.manifest.original_starter_tree_hash != original_starter_tree_hash
                 || receipt.manifest.test_case_suite_hash != persisted.test_case_suite_hash

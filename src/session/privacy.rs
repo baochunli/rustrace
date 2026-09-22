@@ -1158,7 +1158,7 @@ fn write_summary(summary: &PrivacySummary, output: &mut impl Write) -> Result<()
         safe_line(
             &mut text,
             format_args!(
-                "Student ID comes from finalized ancestry; this attempt must use the same value when finalized."
+                "Student ID shown comes from finalized ancestry; submit --student-id selects the ID for this attempt and may correct it."
             ),
         );
     }

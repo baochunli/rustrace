@@ -832,7 +832,7 @@ fn review3_missing_parent_evidence_retains_parent_segments_and_exact_gaps() {
     second.execute(EditorCommand::Insert('C')).unwrap();
     fs::remove_file(first_receipt.payload_path(&missing.entry).unwrap()).unwrap();
 
-    assert!(second.finalize("student-1").is_err());
+    assert!(second.finalize("corrected-id").is_err());
     let FinalizationStatus::Incomplete(incomplete) =
         ProductionSession::recover_finalization(&child.0).unwrap()
     else {
@@ -849,6 +849,7 @@ fn review3_missing_parent_evidence_retains_parent_segments_and_exact_gaps() {
     else {
         panic!("missing parent evidence must remain visibly incomplete");
     };
+    assert_eq!(manifest.student_id, "corrected-id");
     assert_eq!(manifest.segments.len(), 2);
     assert!(!unavailable_assurances.contains(&RprovUnavailableAssurance::CompleteAncestry));
     assert!(unavailable_assurances.contains(&RprovUnavailableAssurance::ReferencedEvidence));
