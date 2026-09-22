@@ -269,6 +269,35 @@ pub fn is_valid_crates_io_name(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+/// The bounded literal arguments accepted after a manual `cargo test`.
+pub fn is_valid_console_test_tail<T: AsRef<str>>(tail: &[T]) -> bool {
+    fn is_valid_filter(value: &str) -> bool {
+        (1..=256).contains(&value.len())
+            && value.as_bytes()[0] != b'-'
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'-'))
+    }
+
+    fn is_valid_output_option(value: &str) -> bool {
+        matches!(value, "--nocapture" | "--no-capture" | "--show-output")
+    }
+
+    match tail {
+        [] => true,
+        [filter] => is_valid_filter(filter.as_ref()),
+        [separator, option] => {
+            separator.as_ref() == "--" && is_valid_output_option(option.as_ref())
+        }
+        [filter, separator, option] => {
+            is_valid_filter(filter.as_ref())
+                && separator.as_ref() == "--"
+                && is_valid_output_option(option.as_ref())
+        }
+        _ => false,
+    }
+}
+
 fn is_valid_semver(value: &str) -> bool {
     if value.is_empty() || value.len() > 128 || !value.is_ascii() {
         return false;
@@ -489,10 +518,13 @@ impl ControlledCommandStarted {
                 let old = tail == ["--frozen"];
                 let current = tail == ["--message-format=json", "--locked"];
                 let natural = tail == ["--locked"];
+                let console_test = self.action == ControlledAction::Test
+                    && matches!(tail, [locked, test_tail @ ..]
+                        if locked == "--locked" && is_valid_console_test_tail(test_tail));
                 require(
                     route.stdin == ConsoleStdinRoute::Closed
                         && route.stdout == ConsoleStdoutRoute::Console
-                        && (old || current || natural),
+                        && (old || current || natural || console_test),
                     "literal non-Run console route",
                 )?;
             }
