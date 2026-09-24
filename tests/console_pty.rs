@@ -59,3 +59,8 @@ fn menu_and_console_command_lifecycle_states_do_not_render_notice_toasts() {
 fn natural_doc_check_and_run_console_output_preserves_program_indentation() {
     run_fixture("natural-output");
 }
+
+#[test]
+fn terminal_hangup_reaps_the_console_command_and_the_session_resumes() {
+    run_fixture("hangup");
+}

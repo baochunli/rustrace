@@ -526,11 +526,25 @@ impl PinnedStateDirectory {
         self.verify()?;
         let writer = self.pin_file("writer.lock", true)?;
         flock(&writer.descriptor, FlockOperation::NonBlockingLockExclusive).map_err(|error| {
-            filesystem_error(
-                "acquire exclusive workspace writer ownership",
-                &self.display_path,
-                error,
-            )
+            let lock = self.display_path.join("writer.lock");
+            if error == rustix::io::Errno::WOULDBLOCK {
+                // Command processes inherit the lock, so it also stays held by a
+                // program that a killed session started.
+                filesystem_error(
+                    "acquire exclusive workspace writer ownership",
+                    &self.display_path,
+                    format!(
+                        "held by another open Rustrace session, or by a program a command started before Rustrace was killed; close that session or stop the program (`lsof {}` lists it), then retry",
+                        lock.display()
+                    ),
+                )
+            } else {
+                filesystem_error(
+                    "acquire exclusive workspace writer ownership",
+                    &self.display_path,
+                    error,
+                )
+            }
         })?;
         // Install cleanup immediately after successful acquisition, before any
         // fallible verification. Failed contenders never own an unlock guard.
@@ -984,6 +998,21 @@ impl fmt::Debug for PinnedJournalFile {
 }
 
 impl PinnedJournalFile {
+    /// A close-on-exec duplicate of the held writer-lock descriptor. A command
+    /// process that inherits it shares the lock, so the workspace stays locked
+    /// until every such process exits, even if the session process dies.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn duplicate_writer_lock(&self) -> std::io::Result<OwnedFd> {
+        self.writer.file.descriptor.try_clone()
+    }
+
+    /// End ownership without an explicit unlock: the lock lasts until the last
+    /// descriptor sharing it closes, so surviving command processes keep it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn keep_writer_lock_for_children(&mut self) {
+        self.writer.released.get_or_insert(Ok(()));
+    }
+
     /// End ownership only after every journal worker has drained and joined,
     /// and all owner-dependent persistence and verification have finished.
     /// A failed unlock is returned and leaves this authority unusable.

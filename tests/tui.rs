@@ -1632,6 +1632,7 @@ fn keybinds_overlay_inventory_is_complete_and_fully_rendered() {
         "Backspace / Delete     edit line",
         "Enter                  run command / send stdin",
         "PgUp / PgDn / wheel    scroll output",
+        "Ctrl-C                 stop running command",
         "Esc                    cancel command / close console",
         "TEST CASES",
         "Up / Down              select case",
@@ -1668,7 +1669,7 @@ fn keybinds_overlay_inventory_is_complete_and_fully_rendered() {
         KEYBIND_ROWS.as_slice(),
     ]
     .concat();
-    assert_eq!(reachable.len(), 72);
+    assert_eq!(reachable.len(), 73);
     let editor_rows = &KEYBIND_ROWS[..KEYBIND_ROWS
         .iter()
         .position(|row| *row == "FILES")

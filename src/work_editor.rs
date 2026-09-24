@@ -494,6 +494,13 @@ fn handle_console_key(
     let accepts_stdin = session.console_accepts_stdin();
     let editable = !session.command_active() || accepts_stdin;
     match key.code {
+        // Like a terminal, Ctrl-C stops the running program and keeps the console.
+        KeyCode::Char('c' | 'C')
+            if key.modifiers == KeyModifiers::CONTROL && session.console_command_active() =>
+        {
+            session.cancel_command();
+            *status = "console command cancellation requested".into();
+        }
         KeyCode::PageUp => {
             console_scroll.scroll_by(-console_scroll.page());
         }
@@ -556,6 +563,15 @@ fn handle_console_key(
         }
         _ => {}
     }
+}
+
+/// Esc or Ctrl-C cancels a running menu command or test-case run.
+fn is_cancel_key(event: &Event) -> bool {
+    matches!(event, Event::Key(key)
+        if key.kind != KeyEventKind::Release
+            && (key.code == KeyCode::Esc
+                || (key.modifiers == KeyModifiers::CONTROL
+                    && matches!(key.code, KeyCode::Char('c' | 'C')))))
 }
 
 fn keybinds_scroll_delta(event: &Event) -> Option<isize> {
@@ -626,6 +642,88 @@ impl UpdateMenu {
     }
 }
 
+static TERMINATION_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Read end of an empty non-blocking pipe whose write end stays open.
+static QUIET_STDIN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn request_termination(signal: libc::c_int) {
+    TERMINATION_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    // A hung-up tty reads EOF forever, and crossterm 0.29 retries such reads
+    // without returning. Swap stdin (crossterm's tty descriptor) for the empty
+    // pipe so reads would block, the event poll times out, and the editor loop
+    // sees the request. dup2 is async-signal-safe.
+    let quiet = QUIET_STDIN.load(std::sync::atomic::Ordering::Relaxed);
+    if signal == libc::SIGHUP && quiet >= 0 {
+        // SAFETY: both descriptors are valid for the life of the process.
+        unsafe {
+            libc::dup2(quiet, libc::STDIN_FILENO);
+        }
+    }
+}
+
+fn termination_requested() -> bool {
+    TERMINATION_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A closed terminal (SIGHUP) or a termination request must not kill Rustrace
+/// outright: the editor loop stops at its next wake (at most 100 ms) and the
+/// normal quit path cancels and reaps the running command's process group,
+/// records the outcome, and clears the command-activity marker. Handlers reset
+/// to the default action in spawned children at exec.
+fn install_termination_handlers() {
+    let mut pipe = [-1; 2];
+    // SAFETY: plain descriptor creation and flag updates on the new pipe.
+    unsafe {
+        if libc::pipe(pipe.as_mut_ptr()) == 0 {
+            for descriptor in pipe {
+                libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            libc::fcntl(pipe[0], libc::F_SETFL, libc::O_NONBLOCK);
+            QUIET_STDIN.store(pipe[0], std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    // macOS delivers a hangup's SIGHUP only to the session leader (usually the
+    // shell), and a shell may not forward it. Watch stdin for the hangup too.
+    let _ = std::thread::Builder::new()
+        .name("rustrace-hangup-watch".into())
+        .spawn(|| {
+            while !termination_requested() {
+                std::thread::sleep(Duration::from_millis(250));
+                // macOS reports POLLHUP only alongside a requested POLLIN;
+                // polling consumes no input.
+                let mut descriptor = libc::pollfd {
+                    fd: libc::STDIN_FILENO,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one valid pollfd and a zero timeout.
+                let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
+                if ready > 0 && descriptor.revents & (libc::POLLHUP | libc::POLLNVAL) != 0 {
+                    request_termination(libc::SIGHUP);
+                }
+            }
+        });
+    // A dying terminal can deliver SIGHUP twice (master close, then the
+    // session leader's exit), so SIGHUP stays caught through cleanup; a second
+    // SIGTERM or SIGINT takes the default action.
+    for (signal, flags) in [
+        (libc::SIGHUP, libc::SA_RESTART),
+        (libc::SIGTERM, libc::SA_RESTART | libc::SA_RESETHAND),
+        (libc::SIGINT, libc::SA_RESTART | libc::SA_RESETHAND),
+    ] {
+        // SAFETY: the handler only uses atomics and dup2 (async-signal-safe).
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = request_termination as *const () as usize;
+            action.sa_flags = flags;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_editor_loop<O>(
     session: &mut crate::session::ProductionSession,
@@ -683,6 +781,12 @@ where
     let mut toast_timer = ToastTimer::default();
     let mut save_triggered_check = false;
     'editor: loop {
+        if termination_requested() {
+            // Ratatui's drop restores the cursor and eprintln!s on failure,
+            // which panics once the terminal is gone.
+            std::mem::forget(terminal);
+            return Err("terminal closed or termination requested; stopping owned commands".into());
+        }
         let command_modal = find_panel.is_some()
             || path_prompt.is_some()
             || command_picker.is_some()
@@ -875,6 +979,8 @@ where
             ))),
         };
         let test_case_active = session.test_case_active();
+        let console_running = session.console_command_active();
+        let console_stdin = session.console_accepts_stdin();
         let test_case_console_output = (test_case_active || test_cases.has_visible_results())
             .then(|| session.console_output());
         let workspace = session.workspace_mut();
@@ -1015,6 +1121,18 @@ where
                 ModeBarKind::Complete,
                 "esc close  tab/↵ accept  ↑↓ select",
             ))
+        } else if console_running && focus == WorkspaceFocus::Console {
+            Some(ModeBarState::new(
+                ModeBarKind::Console,
+                if console_stdin {
+                    "ctrl-c stop  esc stop+close  ↵ send"
+                } else {
+                    "ctrl-c stop  esc stop+close"
+                },
+            ))
+        } else if command_active && !console_running {
+            // TEST CASES stays reserved for the open picker.
+            Some(ModeBarState::new(ModeBarKind::Running, "esc/ctrl-c cancel"))
         } else {
             None
         };
@@ -2000,6 +2118,35 @@ where
                     && has_exact_primary_modifier(key.modifiers, primary_modifier)
                     && matches!(key.code, KeyCode::Char('w' | 'W'))
         );
+        // Ctrl-C stops any running command wherever focus is; the console keeps
+        // its pane open, and a test-case queue stops with its active run.
+        if command_active
+            && !modal_keyboard_active
+            && matches!(&event, Event::Key(key)
+                if key.kind != KeyEventKind::Release
+                    && key.modifiers == KeyModifiers::CONTROL
+                    && matches!(key.code, KeyCode::Char('c' | 'C')))
+        {
+            if session.test_case_active() {
+                test_cases.cancel_queue();
+            }
+            session.cancel_command();
+            status = "command cancellation requested".into();
+            continue;
+        }
+        // With console focus, Esc also stops a running test case or menu command.
+        if focus == WorkspaceFocus::Console
+            && command_active
+            && !session.console_command_active()
+            && !modal_keyboard_active
+            && matches!(&event, Event::Key(key)
+                if key.kind != KeyEventKind::Release && key.code == KeyCode::Esc)
+        {
+            if session.test_case_active() {
+                test_cases.cancel_queue();
+            }
+            session.cancel_command();
+        }
         if focus == WorkspaceFocus::Console && !modal_keyboard_active && !global_delete_shortcut {
             if let Event::Key(key) = &event {
                 handle_console_key(
@@ -2029,9 +2176,7 @@ where
             ) {
                 status.replace(crate::session::SAVE_CHECK_BUSY_WARNING);
             }
-            if !session.console_command_active()
-                && matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release && key.code == KeyCode::Esc)
-            {
+            if !session.console_command_active() && is_cancel_key(&event) {
                 if session.test_case_active() {
                     test_cases.cancel_queue();
                 }
@@ -2922,6 +3067,7 @@ pub(crate) fn run_editor(
         },
     );
     let ghostty_key_bindings = crate::ghostty::startup_key_bindings();
+    install_termination_handlers();
     run_editor_with(
         session,
         assignment_title,
@@ -3323,13 +3469,13 @@ mod tests {
         command_completion_status, command_status_for_output, command_tick_status,
         completion_input_now_ms, console_body, diagnostic_navigation_status, diagnostic_output,
         diagnostic_output_scroll, diagnostic_output_text, dismiss_toast_on_key,
-        execute_editor_command, handle_console_key, journal_warning_message, keybinds_scroll_delta,
-        maximum_keybinds_scroll, non_test_command_owned_tick, open_files_context_menu,
-        paste_event_route, paste_rejection_for_event, persistent_error_message,
-        reduce_keybinds_scroll, retire_paste_warning, route_find_panel_event,
-        should_follow_cursor_for_frame, start_test_case_sequence, submitted_path, test_case_output,
-        test_case_picker_key_action, test_case_result_summary, test_case_view_switch_available,
-        toast_for_frame, toast_for_status,
+        execute_editor_command, handle_console_key, is_cancel_key, journal_warning_message,
+        keybinds_scroll_delta, maximum_keybinds_scroll, non_test_command_owned_tick,
+        open_files_context_menu, paste_event_route, paste_rejection_for_event,
+        persistent_error_message, reduce_keybinds_scroll, retire_paste_warning,
+        route_find_panel_event, should_follow_cursor_for_frame, start_test_case_sequence,
+        submitted_path, test_case_output, test_case_picker_key_action, test_case_result_summary,
+        test_case_view_switch_available, toast_for_frame, toast_for_status,
     };
     use crate::config::PrimaryModifier;
     use crate::console::{ConsoleLine, TestCaseDirectory};
@@ -5793,7 +5939,7 @@ format = ["cargo", "fmt"]
     }
 
     #[test]
-    fn escape_closes_console_and_removed_chords_are_inert() {
+    fn ctrl_c_stops_the_console_command_and_escape_also_closes_it() {
         let (_fixture, mut session) = ClipboardFixture::new("A");
         let (cancel, _) = session
             .install_stalled_console_preparing_for_test(std::time::Duration::ZERO)
@@ -5802,46 +5948,65 @@ format = ["cargo", "fmt"]
         let mut view = WorkView::Console;
         let mut focus = WorkspaceFocus::Console;
         let mut status: StatusMessage = "active console command".into();
-        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::SUPER] {
-            for code in ['c', 'C', 'd', 'D'] {
-                handle_console_key(
+        let mut console_key = |session: &mut crate::session::ProductionSession,
+                               key: KeyEvent,
+                               view: &mut WorkView,
+                               focus: &mut WorkspaceFocus,
+                               status: &mut StatusMessage| {
+            handle_console_key(
+                session,
+                &key,
+                &mut line,
+                &mut ConsoleScroll::default(),
+                view,
+                focus,
+                status,
+            );
+        };
+        // Cmd-C (copy) and the removed EOF chords stay inert.
+        for (modifiers, codes) in [
+            (KeyModifiers::SUPER, ['c', 'C', 'd', 'D']),
+            (KeyModifiers::CONTROL, ['d', 'D', 'd', 'D']),
+        ] {
+            for code in codes {
+                console_key(
                     &mut session,
-                    &KeyEvent::new(KeyCode::Char(code), modifiers),
-                    &mut line,
-                    &mut ConsoleScroll::default(),
+                    KeyEvent::new(KeyCode::Char(code), modifiers),
                     &mut view,
                     &mut focus,
                     &mut status,
                 );
-                assert!(session.command_active(), "{modifiers:?}-{code}");
                 assert!(session.console_command_active(), "{modifiers:?}-{code}");
                 assert_eq!(cancel.load(Ordering::Acquire), 0, "{modifiers:?}-{code}");
-                assert_eq!(view, WorkView::Console);
-                assert_eq!(focus, WorkspaceFocus::Console);
-                assert_eq!(line.text(), "");
                 assert_eq!(&*status, "active console command");
             }
         }
         let mut release = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         release.kind = KeyEventKind::Release;
-        handle_console_key(
+        console_key(&mut session, release, &mut view, &mut focus, &mut status);
+        assert_eq!(cancel.load(Ordering::Acquire), 0);
+        assert_eq!(view, WorkView::Console);
+
+        // Like a terminal, Ctrl-C stops the program and keeps the console open.
+        console_key(
             &mut session,
-            &release,
-            &mut line,
-            &mut ConsoleScroll::default(),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
             &mut view,
             &mut focus,
             &mut status,
         );
-        assert!(session.console_command_active());
-        assert_eq!(cancel.load(Ordering::Acquire), 0);
+        assert_eq!(
+            cancel.load(Ordering::Acquire),
+            1,
+            "Ctrl-C uses the cancel path"
+        );
         assert_eq!(view, WorkView::Console);
         assert_eq!(focus, WorkspaceFocus::Console);
-        handle_console_key(
+        assert_eq!(&*status, "console command cancellation requested");
+
+        console_key(
             &mut session,
-            &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            &mut line,
-            &mut ConsoleScroll::default(),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
             &mut view,
             &mut focus,
             &mut status,
@@ -5854,6 +6019,24 @@ format = ["cargo", "fmt"]
         assert_eq!(view, WorkView::Workspace);
         assert_eq!(focus, WorkspaceFocus::Editor);
         assert!(status.is_empty());
+    }
+
+    #[test]
+    fn escape_and_ctrl_c_are_the_running_command_cancel_keys() {
+        for (code, modifiers, cancels) in [
+            (KeyCode::Esc, KeyModifiers::NONE, true),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL, true),
+            (KeyCode::Char('C'), KeyModifiers::CONTROL, true),
+            (KeyCode::Char('c'), KeyModifiers::SUPER, false),
+            (KeyCode::Char('c'), KeyModifiers::NONE, false),
+            (KeyCode::Char('d'), KeyModifiers::CONTROL, false),
+        ] {
+            let event = Event::Key(KeyEvent::new(code, modifiers));
+            assert_eq!(is_cancel_key(&event), cancels, "{code:?} {modifiers:?}");
+        }
+        let mut release = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        assert!(!is_cancel_key(&Event::Key(release)));
     }
 
     #[test]

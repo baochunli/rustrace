@@ -360,12 +360,19 @@ fn production_command_fixture_child() {
         .unwrap();
         assert_eq!(marker["active"], true);
         drop(session);
-        // Cancellation can still be in flight. Restart cannot infer cleanup.
+        // Cancellation can still be in flight. Restart cannot infer cleanup:
+        // either the resolver still shares the writer lock, or the marker's
+        // owner (this process) is alive.
         let error =
             ProductionSession::resume(&root, MANIFEST, rustrace::session::ResumeChoice::Resume)
                 .err()
-                .expect("unfinished preparation must block normal resume");
-        assert!(error.to_string().contains("unfinished command"), "{error}");
+                .expect("unfinished preparation must block normal resume")
+                .to_string();
+        assert!(
+            error.contains("unfinished command")
+                || error.contains("a program a command started before Rustrace was killed"),
+            "{error}"
+        );
         return;
     }
     assert!(session.command_active());

@@ -36,6 +36,51 @@ struct CommandActivity {
     sequence: u64,
     event_hash: Hash,
     active: bool,
+    // The Rustrace process that owns the command; absent in older markers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_pid: Option<u32>,
+}
+
+/// Resume holds the writer lock. Every command and resolver process inherits
+/// that lock, and a session that ends with a command unfinished never unlocks
+/// it explicitly, so once the owning Rustrace process is gone an active marker
+/// means every command process has exited too. Returns whether such a stale
+/// marker must be cleared.
+pub(super) fn stale_command_marker(
+    owner: &PinnedJournalFile,
+    metadata: &SessionMetadata,
+) -> Result<bool> {
+    match require_inactive_marker(owner, metadata) {
+        Ok(()) => Ok(false),
+        Err(_)
+            if read_marker(owner)?.is_some_and(|marker| {
+                marker.version == 1
+                    && marker.session_id == metadata.session_id
+                    && marker.active
+                    // The writer lock we hold proves any other owner exited;
+                    // only this same process can still own the command.
+                    && marker.owner_pid != Some(std::process::id())
+            }) =>
+        {
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn read_marker(owner: &PinnedJournalFile) -> Result<Option<CommandActivity>> {
+    let path = owner
+        .display_path()
+        .parent()
+        .ok_or("state directory missing")?
+        .join("command-activity.json");
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+        Ok(_) => Ok(Some(serde_json::from_slice(
+            &owner.read_artifact("command-activity.json", METADATA_LIMIT)?,
+        )?)),
+    }
 }
 
 pub(super) fn require_inactive_marker(
@@ -190,6 +235,9 @@ pub(super) struct CommandState {
     test_case_expected: Option<std::result::Result<Vec<u8>, String>>,
     completed_test_case: Option<TestCaseComparison>,
 }
+
+/// Per-case limit for packaged test-case runs, including the `cargo run` build.
+pub(crate) const TEST_CASE_DEADLINE: Duration = Duration::from_secs(10);
 
 impl Default for CommandState {
     fn default() -> Self {
@@ -518,7 +566,14 @@ impl ProductionSession {
             .as_ref()
             .ok_or("the active command does not accept console stdin")?;
         match sender.try_send(StdinMessage::Line(line.to_owned())) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                // Echo like a terminal, in the display projection only; the
+                // typed line is never recorded as evidence.
+                if let Some(live) = &self.command.console_live {
+                    live.push(format!("{line}\n").as_bytes());
+                }
+                Ok(true)
+            }
             Err(TrySendError::Full(_)) => Ok(false),
             Err(TrySendError::Disconnected(_)) => {
                 self.command.console_stdin = None;
@@ -684,12 +739,24 @@ impl ProductionSession {
         let root = self.workspace.root().to_path_buf();
         let cancel = Arc::new(AtomicU8::new(0));
         let signal = cancel.clone();
+        let writer_lock = self.effects.0.borrow().owner.duplicate_writer_lock()?;
         self.effects.0.borrow_mut().command_active = true;
         self.record_command_activity(true)?;
         process_probe("command-preparation");
         let worker = std::thread::Builder::new()
             .name("rustrace-command-resolve".into())
-            .spawn(move || resolve(root, toolchain, action, argv, output_limit, signal, console))
+            .spawn(move || {
+                resolve(
+                    root,
+                    toolchain,
+                    action,
+                    argv,
+                    output_limit,
+                    signal,
+                    console,
+                    writer_lock,
+                )
+            })
             .inspect_err(|_| {
                 self.effects.0.borrow_mut().poison =
                     Some("command worker did not start; preserve activity evidence".into());
@@ -709,7 +776,7 @@ impl ProductionSession {
         Ok(())
     }
 
-    fn record_command_activity(&self, active: bool) -> Result<()> {
+    pub(super) fn record_command_activity(&self, active: bool) -> Result<()> {
         let mut a = self.effects.0.borrow_mut();
         let result = (|| {
             let marker = CommandActivity {
@@ -718,6 +785,7 @@ impl ProductionSession {
                 sequence: a.sequence,
                 event_hash: a.hash,
                 active,
+                owner_pid: Some(std::process::id()),
             };
             a.owner.publish_artifact(
                 "command-activity.json",
@@ -1528,6 +1596,15 @@ impl ProductionSession {
     }
 
     fn launch_ready(&mut self, mut ready: Ready) -> Result<()> {
+        // A test case that hangs fails quickly so Run all moves on.
+        let deadline = if self.command.test_case.is_some() {
+            self.command.deadline.min(TEST_CASE_DEADLINE)
+        } else {
+            self.command.deadline
+        };
+        // Duplicate before journaling anything, so a descriptor error leaves
+        // no started command without a worker.
+        let writer_lock = self.effects.0.borrow().owner.duplicate_writer_lock()?;
         self.verify_command_context()?;
         self.save_all_with_hook(|_| {})?;
         self.command_checkpoint()?;
@@ -1598,7 +1675,7 @@ impl ProductionSession {
                 .and_then(ReplayEngine::command_tree_link)
                 .ok_or("missing pre-tree")?
                 .clone(),
-            deadline_millis: self.command.deadline.as_millis() as u64,
+            deadline_millis: deadline.as_millis() as u64,
             output_limit: ready.output_limit,
             console: console.as_ref().map(|console| console.route.clone()),
         };
@@ -1629,7 +1706,7 @@ impl ProductionSession {
             )?;
         }
         let limits = ProcessLimits {
-            deadline: self.command.deadline,
+            deadline,
             output_bytes: ready.output_limit as usize,
         };
         let cancel = self.command.cancel.clone();
@@ -1637,24 +1714,35 @@ impl ProductionSession {
             Some(console) => (Some(console.process), console.sender, Some(console.live)),
             None => (None, None, None),
         };
+        // The child holds the workspace writer lock with us; if Rustrace dies,
+        // the lock stays held until the last command process exits, and resume
+        // treats a free lock as proof that none survived.
+        command_process::inherit_descriptor(
+            &mut ready.prepared.command,
+            std::os::fd::AsRawFd::as_raw_fd(&writer_lock),
+        );
         let panic_cleanup = ProcessCleanupHandoff::new();
         let worker_cleanup = panic_cleanup.clone();
         let worker = std::thread::Builder::new()
             .name("rustrace-command".into())
-            .spawn(move || match process_io {
-                Some(process_io) => command_process::execute_with_io_and_handoff(
-                    ready.prepared.command,
-                    limits,
-                    cancel,
-                    process_io,
-                    worker_cleanup,
-                ),
-                None => command_process::execute_with_handoff(
-                    ready.prepared.command,
-                    limits,
-                    cancel,
-                    worker_cleanup,
-                ),
+            .spawn(move || {
+                // The worker owns the duplicate, so it stays open through the spawn.
+                let _writer_lock = writer_lock;
+                match process_io {
+                    Some(process_io) => command_process::execute_with_io_and_handoff(
+                        ready.prepared.command,
+                        limits,
+                        cancel,
+                        process_io,
+                        worker_cleanup,
+                    ),
+                    None => command_process::execute_with_handoff(
+                        ready.prepared.command,
+                        limits,
+                        cancel,
+                        worker_cleanup,
+                    ),
+                }
             })?;
         self.runtime_toolchain = Some(ready.report);
         self.command.console_stdin = sender;
@@ -2277,6 +2365,56 @@ impl ProductionSession {
         Ok(())
     }
 
+    /// Finish a command whose Rustrace process was killed. The caller proved
+    /// that its processes exited; output after the last journaled chunk is
+    /// lost, so a stream with journaled bytes is truncated, one without is
+    /// unavailable, and the outcome is `quit`.
+    pub(super) fn finish_interrupted_command(&mut self) -> Result<()> {
+        let lost = |bytes: u64| {
+            if bytes == 0 {
+                CaptureCompleteness::Unavailable
+            } else {
+                CaptureCompleteness::Truncated
+            }
+        };
+        let finish = {
+            let a = self.effects.0.borrow();
+            let (start, millis, bytes) = a
+                .replay
+                .as_ref()
+                .and_then(ReplayEngine::pending_controlled_command)
+                .ok_or("no interrupted command to finish")?;
+            ControlledCommandFinished {
+                command_id: start.command_id.clone(),
+                after: start.before.clone(),
+                started_millis: millis,
+                finished_millis: a.offset.max(millis),
+                outcome: CommandOutcome::Terminated {
+                    reason: CommandTermination::Quit,
+                    signal: None,
+                },
+                stdout: CommandCapture {
+                    bytes: bytes[0],
+                    completeness: lost(bytes[0]),
+                    mode: if start.console.as_ref().is_some_and(|route| {
+                        matches!(route.stdout, ConsoleStdoutRoute::File { .. })
+                    }) {
+                        CommandCaptureMode::Redirected
+                    } else {
+                        CommandCaptureMode::Captured
+                    },
+                },
+                stderr: CommandCapture {
+                    bytes: bytes[1],
+                    completeness: lost(bytes[1]),
+                    mode: CommandCaptureMode::Captured,
+                },
+            }
+        };
+        self.effects.0.borrow_mut().command_active = true;
+        self.finish_command(finish, None)
+    }
+
     fn clear_command_ownership(&mut self) -> Result<()> {
         self.command.console_stdin = None;
         self.record_command_activity(false)?;
@@ -2427,6 +2565,7 @@ fn environment_name(name: &str) -> Result<RetainedEnvironmentName> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve(
     root: PathBuf,
     pin: String,
@@ -2435,6 +2574,7 @@ fn resolve(
     output_limit: u64,
     cancel: Arc<AtomicU8>,
     console: Option<ConsoleLaunch>,
+    writer_lock: std::os::fd::OwnedFd,
 ) -> Resolution {
     use std::cell::Cell;
     let cleanup_uncertain = Cell::new(false);
@@ -2447,10 +2587,15 @@ fn resolve(
         &rustup,
         Some(action),
         64 * 1024,
-        &|command| {
+        &|mut command| {
             let deadline = until
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_secs(3));
+            // Probes share the writer lock like the command itself.
+            command_process::inherit_descriptor(
+                &mut command,
+                std::os::fd::AsRawFd::as_raw_fd(&writer_lock),
+            );
             let result = command_process::execute(
                 command,
                 ProcessLimits {

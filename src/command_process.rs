@@ -54,6 +54,23 @@ pub(crate) struct ProcessIo {
     pub live: Option<LiveOutput>,
 }
 
+/// Leave `descriptor` open across exec in the child only; the parent's copy
+/// stays close-on-exec.
+#[cfg(unix)]
+pub(crate) fn inherit_descriptor(command: &mut std::process::Command, descriptor: i32) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: fcntl is async-signal-safe and changes only the child's table.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(descriptor, libc::F_SETFD, 0) == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct LiveOutput {
     inner: Arc<Mutex<LiveBuffer>>,
@@ -89,7 +106,7 @@ impl LiveOutput {
         }
     }
 
-    fn push(&self, bytes: &[u8]) {
+    pub(crate) fn push(&self, bytes: &[u8]) {
         let mut buffer = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         let discard = buffer
             .bytes
