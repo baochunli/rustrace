@@ -452,6 +452,38 @@ impl PinnedStateDirectory {
         }
     }
 
+    /// Rename a regular artifact without replacing another one.
+    fn rename_artifact(
+        &self,
+        from: &str,
+        to: &str,
+        verify_owner: impl Fn() -> Result<(), WorkspaceHashError>,
+    ) -> Result<(), WorkspaceHashError> {
+        verify_owner()?;
+        validate_artifact_name(from)?;
+        validate_artifact_name(to)?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use rustix::fs::{RenameFlags, renameat_with};
+            self.pin_file(from, false)?.verify(self)?;
+            renameat_with(
+                &self.directory,
+                from,
+                &self.directory,
+                to,
+                RenameFlags::NOREPLACE,
+            )
+            .map_err(|e| filesystem_error("rename artifact", &self.display_path, e))?;
+            fsync(&self.directory)
+                .map_err(|e| filesystem_error("sync artifact directory", &self.display_path, e))?;
+            verify_owner()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Err(WorkspaceHashError::UnsupportedPlatform)
+        }
+    }
+
     /// Read a bounded regular artifact through the retained state-directory handle.
     pub fn read_artifact(&self, name: &str, maximum: usize) -> Result<Vec<u8>, WorkspaceHashError> {
         self.verify()?;
@@ -1107,6 +1139,13 @@ impl PinnedJournalFile {
     ) -> Result<(), WorkspaceHashError> {
         self.state_directory
             .publish_artifact(name, bytes, replace, || self.verify())
+    }
+
+    /// Rename a regular artifact, never replacing another, while retaining
+    /// cooperative ownership.
+    pub fn rename_artifact(&self, from: &str, to: &str) -> Result<(), WorkspaceHashError> {
+        self.state_directory
+            .rename_artifact(from, to, || self.verify())
     }
 
     pub fn available_storage_bytes(&self) -> Result<u64, WorkspaceHashError> {

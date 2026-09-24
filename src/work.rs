@@ -200,7 +200,7 @@ pub fn run_work(args: &[String], output: &mut impl Write) -> Result<()> {
             })?;
         writeln!(
             output,
-            "Original preserved at {}; linked recovery workspace: {}",
+            "Original preserved at {}; linked recovery workspace: {} (it starts from the starter code; resuming the original takes it back while this copy records no work)",
             display::label_fmt(format_args!("{}", root.display()), 4096),
             display::label_fmt(format_args!("{}", fresh.display()), 4096)
         )?;
@@ -218,7 +218,7 @@ pub fn run_work(args: &[String], output: &mut impl Write) -> Result<()> {
             } else {
                 ResumeChoice::Resume
             },
-        ).map_err(|error| format!("startup/session cannot resume: {error}; original preserved. Use --inspect or --abandon for linked fresh work"))?
+        ).map_err(|error| format!("startup/session cannot resume: {error}; original preserved. Your code and recorded history are intact: fix the cause above and run the same command again. --inspect shows the preserved views; --abandon is a last resort that starts a linked workspace from the starter code"))?
     } else {
         ProductionSession::start_from_assignment(&root, &extracted)?
     };

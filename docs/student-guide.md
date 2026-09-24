@@ -1073,11 +1073,16 @@ receipt details and local export records.
 `rustrace work assignment.rta --workspace assignment.work --inspect` prints,
 without changing anything, the last saved contents of each file, the last
 recorded logical contents including unsaved edits, and what is on disk now.
-`--resume` continues the attempt; if it cannot validate the history it stops
-and points you to `--inspect` or `--abandon`. `--abandon` leaves the original
-workspace untouched, extracts a fresh starter into a sibling directory named
-like `assignment.work.recovery-<number>-<number>`, and starts a new session
-linked to the preserved original. Startup that fails because a required tool is
+`--resume` continues the attempt; if it cannot validate the history it stops,
+says why, and keeps your code and history intact. `--abandon` is a last resort:
+it leaves the original workspace untouched, extracts a fresh starter (not your
+current files) into a sibling directory named like
+`assignment.work.recovery-<number>-<number>`, and starts a new session linked
+to the preserved original. If you abandon by mistake, resuming the original
+takes it back as long as the recovery copy has recorded no work (no edits,
+saves, file changes, or commands); the unused copy is then closed. Once the
+copy has recorded work, the original stays closed and resume names the copy
+to continue in. Startup that fails because a required tool is
 missing also preserves everything; fix the tool and run the same work command
 again. `--resume` remains an explicit equivalent.
 
