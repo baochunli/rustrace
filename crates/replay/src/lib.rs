@@ -239,9 +239,20 @@ struct CopiedSnapshot {
 
 impl ReplayEngine {
     /// Interrupted controlled commands remain incomplete, never a clean exit.
-    /// Production resume must preserve/inspect rather than invent process death.
+    /// Production resume finishes one only after proving its processes exited.
     pub fn controlled_command_pending(&self) -> bool {
         self.controlled.active.is_some()
+    }
+
+    /// The pending command's start, start time, and journaled
+    /// `[stdout, stderr]` byte counts.
+    pub fn pending_controlled_command(
+        &self,
+    ) -> Option<(&rustrace_model::ControlledCommandStarted, u64, [u64; 2])> {
+        self.controlled
+            .active
+            .as_ref()
+            .map(|active| (&active.started, active.millis, active.bytes))
     }
 
     /// Bounded captured stdout from the immediately preceding command finish.

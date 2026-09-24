@@ -812,11 +812,14 @@ are rejected. If the output file already exists, the console asks before
 overwriting: Y or Enter overwrites, N or Esc cancels and leaves the file alone.
 
 When `cargo run` starts without an input redirect, the prompt line becomes the
-program's standard input. Type a line and press Enter to send it.
-Esc cancels a running console command and closes the console, including when
-the program is waiting for input. There is no separate EOF shortcut; stdin
-closes through the cancellation or command-exit path. The lines you type are
-not recorded as evidence, although your program's output, which may echo them, is captured
+program's standard input. Type a line and press Enter to send it; the console
+shows the line after your program's prompt, like a terminal does. Ctrl-C stops
+a running console command and keeps the console open; Esc stops it and closes
+the console. Both work while the program is waiting for input or stuck in a
+loop, and the mode bar reads `ctrl-c stop  esc stop+close  ↵ send` while a
+program runs. There is no separate EOF shortcut; stdin closes through the
+cancellation or command-exit path. The lines you type are not recorded as
+evidence, although your program's output, which may echo them, is captured
 like any other output. Console commands print Cargo's normal output flush-left
 and program output verbatim. No console action requests Cargo JSON. The console
 recognises Cargo status and diagnostic lines in its combined stdout/stderr view.
@@ -837,7 +840,7 @@ while a command runs. Recorded stdout and stderr share an 8 MiB per-command cap
 and a 64 MiB session budget; deployments may set lower budgets,
 and a command can use only the remaining session allowance. Reaching the output
 limit stops the command. The existing deadline (at most five minutes) and Esc
-cancellation also apply to filtered tests and every output option. Esc returns
+or Ctrl-C cancellation also apply to filtered tests and every output option. Esc returns
 to the workspace view.
 
 F4 or the Test cases menu entry opens a modal test-case picker. It lists complete
@@ -854,11 +857,15 @@ finishes. The output pane shows the controlled command and then one test-case
 result line, retaining each result line as a Run all queue advances. A later
 non-test command takes ownership of the output pane. Run all runs every listed
 case serially in that order through the single runner; it never starts cases in
-parallel. During a run, Esc cancels the active run and the rest of the queue;
-F1, F7, and F9 wait until that sequence finishes. If the picker was opened over
+parallel. Each case may run for at most 10 seconds, including the `cargo run`
+build, so a program that hangs fails that case with a deadline ERROR and Run
+all moves on. During a run the mode bar reads `esc/ctrl-c cancel`: Esc or
+Ctrl-C cancels the active run and the rest of the queue; F1, F7, and F9 wait
+until that sequence finishes. Menu commands show the same hint while they run. If the picker was opened over
 the Console view, closing its final reopened modal restores that view. A
 selected case uses the same prepared, policy-checked, limited, and recorded
-Cargo action as typing `cargo run < NAME.in` in the console. Every completed
+Cargo action as typing `cargo run < NAME.in` in the console, apart from its
+shorter deadline. Every completed
 picker run records one `test_case_compared` event immediately after its
 controlled command finishes. That event retains the command ID, case name,
 expected BLAKE3 digest, optional actual BLAKE3 digest, and typed result.
@@ -1073,6 +1080,15 @@ like `assignment.work.recovery-<number>-<number>`, and starts a new session
 linked to the preserved original. Startup that fails because a required tool is
 missing also preserves everything; fix the tool and run the same work command
 again. `--resume` remains an explicit equivalent.
+
+If the terminal window closes, or Rustrace is asked to stop, while a command
+runs, Rustrace stops that command and its programs, records the stop, and
+exits; resume as usual. If Rustrace itself is killed outright (for example
+with `kill -9` or a crash), your program can keep running. Every command's
+programs hold the workspace lock, so resume then stops with a message naming
+`.rustrace/writer.lock`: stop the leftover program (`lsof` on that path lists
+it, or quit it in Activity Monitor) and resume again. Rustrace then records the
+interrupted command as stopped, without the output it lost, and continues.
 
 If finalization itself was interrupted, `submit` refuses to build a normal
 bundle and tells you to rerun with `--allow-incomplete`. That produces a ZIP

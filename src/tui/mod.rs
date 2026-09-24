@@ -344,7 +344,7 @@ pub const OBVIOUS_EDITOR_KEYBIND_ROWS: [&str; 7] = [
     "Tab / Shift-Tab        indent / outdent",
 ];
 
-pub const KEYBIND_ROWS: [&str; 65] = [
+pub const KEYBIND_ROWS: [&str; 66] = [
     "EDITOR",
     "{line-navigation}",
     "{document-navigation}",
@@ -402,6 +402,7 @@ pub const KEYBIND_ROWS: [&str; 65] = [
     "Backspace / Delete     edit line",
     "Enter                  run command / send stdin",
     "PgUp / PgDn / wheel    scroll output",
+    "Ctrl-C                 stop running command",
     "Esc                    cancel command / close console",
     "TEST CASES",
     "Up / Down              select case",
@@ -723,6 +724,7 @@ pub enum ModeBarKind {
     Complete,
     Console,
     TestCases,
+    Running,
     Keybinds,
     Error,
 }
@@ -735,6 +737,7 @@ impl ModeBarKind {
             Self::Complete => " COMPLETE ",
             Self::Console => " CONSOLE ",
             Self::TestCases => " TEST CASES ",
+            Self::Running => " RUNNING ",
             Self::Keybinds => " KEYBINDS ",
             Self::Error => " ERROR ",
         }

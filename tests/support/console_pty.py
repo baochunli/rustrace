@@ -170,6 +170,7 @@ assert challenge in {
     "workspace-confirmations",
     "delete-confirmations",
     "lifecycle-notices",
+    "hangup",
 }
 root = pathlib.Path(tempfile.mkdtemp(prefix="rustrace-console-pty-")).resolve()
 if challenge == "lifecycle-notices":
@@ -308,7 +309,13 @@ if challenge not in {"workspace-confirmations", "delete-confirmations", "natural
 
     reaper_thread = threading.Thread(target=reap_reaper, daemon=True)
     reaper_thread.start()
-result = subprocess.run(sys.argv[3:])
+if challenge == "hangup":
+    # Like a shell that does not forward SIGHUP: only this session leader is
+    # signalled when the terminal closes, so Rustrace must see the hangup itself.
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    result = subprocess.run(sys.argv[3:], preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_DFL))
+else:
+    result = subprocess.run(sys.argv[3:])
 if reaper_thread is not None:
     reaper_thread.join(timeout=3)
     assert not reaper_thread.is_alive(), "owned process-group helper was not reaped"
@@ -555,13 +562,13 @@ try:
             lambda: invocation_path.exists()
             and descendant_path.exists()
             and " CONSOLE " in rendered_screen()
-            and "esc close  ↵ run/send" in rendered_screen()
+            and "ctrl-c stop  esc stop+close  ↵ send" in rendered_screen()
             and "stdin>" in rendered_screen(),
             "console running state and mode bar",
         )
         assert_no_toast()
 
-        send(b"\x03\x04\x1b[99;9u\x1b[100;9u")
+        send(b"\x04\x1b[99;9u\x1b[100;9u")  # Ctrl-D, Cmd-C and Cmd-D are inert.
         time.sleep(.15)
         while read_once(.01):
             pass
@@ -984,7 +991,7 @@ try:
     time.sleep(.1)
     while read_once(.01):
         pass
-    send(b"\x03\x04\x1b[99;9u\x1b[100;9u")  # Removed chords are inert.
+    send(b"\x04\x1b[99;9u\x1b[100;9u")  # Ctrl-D, Cmd-C and Cmd-D are inert.
     wait_for(lambda: (work / "target/console-line.json").exists(), "submitted console line")
     assert json.loads((work / ".rustrace/command-activity.json").read_bytes())["active"]
     wait_screen("console-stderr:\\xfe")
@@ -1038,6 +1045,64 @@ try:
     send(b"\x1b[20~")
     wait_screen("│console")
     assert b"\x1b[?1049l" not in transcript
+
+    if challenge == "hangup":
+        # The terminal emulator dies mid-command: Rustrace gets SIGHUP and must
+        # reap the program and clear its activity marker before exiting.
+        rustrace_pids = [
+            int(pid)
+            for pid in subprocess.run(
+                ["pgrep", "-f", f"^{binary} work {package}"],
+                capture_output=True,
+                text=True,
+            ).stdout.split()
+        ]
+        assert rustrace_pids, "running Rustrace process"
+        # A terminal emulator holds only the master side.
+        os.close(slave)
+        os.close(master)
+        deadline = time.monotonic() + 15
+        while any(map(process_exists, rustrace_pids)) and time.monotonic() < deadline:
+            time.sleep(.05)
+        survivors = [pid for pid in rustrace_pids if process_exists(pid)]
+        if survivors:
+            state = subprocess.run(["ps", "-o", "pid,ppid,stat,etime,command", "-p",
+                                    ",".join(map(str, survivors))],
+                                   capture_output=True, text=True).stdout
+            if shutil.which("sample"):
+                subprocess.run(["sample", str(survivors[0]), "1", "-file",
+                                str(root / "survivor-sample.txt")], capture_output=True)
+            raise AssertionError(f"Rustrace survived SIGHUP:\n{state}\nsample: {root}/survivor-sample.txt")
+        assert not process_exists(leader["pid"]), "program outlived the hangup"
+        assert not process_exists(descendant["pid"]), "descendant outlived the hangup"
+        assert not json.loads((work / ".rustrace/command-activity.json").read_bytes())["active"]
+
+        # A new terminal resumes the session and quits normally.
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+        transcript.clear()
+        proc = subprocess.Popen(
+            [binary, "work", str(package), "--resume"],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            preexec_fn=own_terminal,
+            cwd=root,
+            env={
+                **os.environ,
+                "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+                "TERM": "xterm-256color",
+            },
+        )
+        wait_screen("F1 keybinds")
+        send(b"\x11")
+        deadline = time.monotonic() + 15
+        while proc.poll() is None and time.monotonic() < deadline:
+            read_once(.01)
+        assert proc.returncode == 0, repr(bytes(transcript[-4000:]))
+        success = True
+        print("80x24 console hangup reaped the command and resumed")
+        raise SystemExit(0)
 
     captures_before_quit = set(
         (work / ".rustrace").glob("command-*-capture.json")

@@ -1094,7 +1094,7 @@ impl ProductionSession {
                 Err(error) => return Err(error.into()),
             }
         }
-        command::require_inactive_marker(&owner, &metadata)?;
+        let stale_command = command::stale_command_marker(&owner, &metadata)?;
         owner.secure_reserve(SessionBudgets::default().reserve_bytes, false)?;
         if owner.read_artifact("manifest.toml", METADATA_LIMIT)? != manifest_bytes {
             return Err("persisted assignment manifest mismatch".into());
@@ -1134,9 +1134,12 @@ impl ProductionSession {
                 "terminal session is preserved; start a linked attempt with `rustrace revise PARENT_WORKSPACE NEW_WORKSPACE assignment.rta`".into(),
             );
         }
-        if replay.controlled_command_pending() {
+        // A stale activity marker proves, through the inherited writer lock we
+        // now hold, that every process of the interrupted command has exited.
+        if replay.controlled_command_pending() && !stale_command {
             return Err("unfinished command evidence; inspect and use linked recovery; child death is not established by restart".into());
         }
+        let interrupted_command = replay.controlled_command_pending();
         let logical = replay.workspace_state().files().clone();
         let disk = read_pinned_workspace(&pinned)?;
         let policy = AllowedPathSet::from_manifest(&manifest)?;
@@ -1262,6 +1265,12 @@ impl ProductionSession {
                 logical,
                 disk,
             });
+        }
+        if interrupted_command {
+            session.finish_interrupted_command()?;
+        } else if stale_command {
+            // Killed while preparing tools: no command started.
+            session.record_command_activity(false)?;
         }
         let last_sequence = session.effects.0.borrow().sequence;
         session
@@ -2743,6 +2752,13 @@ fn require_test_case_suite_identity(
 impl Drop for ProductionSession {
     fn drop(&mut self) {
         self.cancel_command_for_quit();
+        // An unfinished command may leave processes behind: never unlock
+        // explicitly, so they keep the workspace locked until they exit.
+        if let Ok(mut authority) = self.effects.0.try_borrow_mut()
+            && authority.command_active
+        {
+            authority.owner.keep_writer_lock_for_children();
+        }
     }
 }
 fn make_effects(

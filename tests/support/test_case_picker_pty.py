@@ -301,10 +301,11 @@ try:
     wait_for(
         lambda: cancel_ready.exists()
         and order_path.read_text().splitlines() == ["01-pass", "02-fail", "01-pass"]
-        and "OK" in rendered_screen(),
-        "cancellable Run all output",
+        and "OK" in rendered_screen()
+        and "esc/ctrl-c cancel" in rendered_screen(),
+        "cancellable Run all output and its cancel hint",
     )
-    send(b"\x1b")
+    send(b"\x03")  # Ctrl-C cancels a running test case like Esc.
     wait_for(
         lambda: " TEST CASES " in rendered_screen()
         and "ERROR" in rendered_screen()

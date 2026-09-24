@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use rustrace::{
-    session::{ConsoleStart, ProductionSession, TestCaseOutcome},
+    session::{ConsoleStart, ProductionSession, ResumeChoice, TestCaseOutcome},
     tui::EditorCommand,
 };
 use rustrace_model::{
@@ -108,6 +108,144 @@ fn production_test_case_session_parent() {
         String::from_utf8_lossy(&output.stderr)
     );
     fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn production_interrupted_command_resume_parent() {
+    if std::env::var_os("RUSTRACE_CONSOLE_FIXTURE").is_some() {
+        return;
+    }
+    let (parent, root) = console_fixture("interrupted");
+    fs::write(
+        root.join("target/runner-fixture.json"),
+        br#"{"mode":"console_hang"}"#,
+    )
+    .unwrap();
+    let run = |test: &str| {
+        let output = run_console_child(&root, test);
+        assert!(
+            output.status.success(),
+            "{test}: fixture retained {}; stdout={}; stderr={}",
+            parent.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    // Rustrace dies without cleanup while the program hangs.
+    run("production_interrupted_command_start_child");
+    let pid = fs::read_to_string(root.join("target/hung-pid")).unwrap();
+    let alive = || {
+        Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(alive(), "the hung program outlives its session");
+    // It inherited the writer lock, so resume names it instead of guessing.
+    run("production_interrupted_command_blocked_child");
+    assert!(
+        Command::new("kill")
+            .args(["-9", pid.trim()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let until = Instant::now() + Duration::from_secs(10);
+    while alive() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!alive());
+    // Once it exited, resume records the command as quit and continues.
+    run("production_interrupted_command_resume_child");
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn production_interrupted_command_start_child() {
+    let Some(root) = std::env::var_os("RUSTRACE_CONSOLE_FIXTURE") else {
+        return;
+    };
+    let root = fs::canonicalize(PathBuf::from(root)).unwrap();
+    let mut session = ProductionSession::start(&root, MANIFEST).unwrap();
+    assert_eq!(
+        session.start_console_command("cargo run").unwrap(),
+        ConsoleStart::Started
+    );
+    let until = Instant::now() + Duration::from_secs(15);
+    while !root.join("target/hung-pid").exists() && Instant::now() < until {
+        session.poll_command().unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(root.join("target/hung-pid").exists());
+    // Like SIGKILL: no destructor cancels or reaps the command.
+    std::process::exit(0);
+}
+
+#[test]
+fn production_interrupted_command_blocked_child() {
+    let Some(root) = std::env::var_os("RUSTRACE_CONSOLE_FIXTURE") else {
+        return;
+    };
+    let root = fs::canonicalize(PathBuf::from(root)).unwrap();
+    let error = ProductionSession::resume(&root, MANIFEST, ResumeChoice::Resume)
+        .err()
+        .expect("a live command process blocks resume")
+        .to_string();
+    assert!(
+        error.contains("a program a command started before Rustrace was killed"),
+        "{error}"
+    );
+    assert!(error.contains("writer.lock"), "{error}");
+}
+
+#[test]
+fn production_interrupted_command_resume_child() {
+    let Some(root) = std::env::var_os("RUSTRACE_CONSOLE_FIXTURE") else {
+        return;
+    };
+    let root = fs::canonicalize(PathBuf::from(root)).unwrap();
+    let session = ProductionSession::resume(&root, MANIFEST, ResumeChoice::Resume).unwrap();
+    let id = session.session_id().clone();
+    assert!(!session.command_active());
+    let activity: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join(".rustrace/command-activity.json")).unwrap())
+            .unwrap();
+    assert_eq!(activity["active"], false);
+    session.quit().unwrap();
+
+    let pinned = rustrace_workspace::hash::PinnedWorkspaceRoot::open(&root).unwrap();
+    let owner = pinned
+        .open_state_directory()
+        .unwrap()
+        .open_journal_file(&id)
+        .unwrap();
+    let mut journal =
+        rustrace_journal::Journal::open_read_only_no_follow(owner.display_path()).unwrap();
+    let events = journal.read_events(&id, 1, 1000).unwrap();
+    let finished = events
+        .iter()
+        .position(|event| matches!(event.event, Event::ControlledCommandFinished(_)))
+        .expect("the interrupted command is finished on resume");
+    let Event::ControlledCommandFinished(finish) = &events[finished].event else {
+        unreachable!()
+    };
+    assert_eq!(
+        finish.outcome,
+        CommandOutcome::Terminated {
+            reason: rustrace_model::CommandTermination::Quit,
+            signal: None,
+        }
+    );
+    assert_eq!(finish.stdout.completeness, CaptureCompleteness::Unavailable);
+    assert_eq!(finish.stderr.completeness, CaptureCompleteness::Unavailable);
+    assert!(
+        events[finished..]
+            .iter()
+            .any(|event| matches!(event.event, Event::SessionResumed(_))),
+        "the finish precedes the resume"
+    );
 }
 
 fn console_fixture(name: &str) -> (PathBuf, PathBuf) {
@@ -245,7 +383,10 @@ fn production_test_case_session_child() {
     assert_eq!(typed.environment, manual.environment);
     assert_eq!(typed.selected_toolchain, manual.selected_toolchain);
     assert_eq!(typed.tools, manual.tools);
-    assert_eq!(typed.deadline_millis, manual.deadline_millis);
+    // The first start is the picker run, which gets the short per-case
+    // deadline; the typed `cargo run < input.in` keeps 5 minutes.
+    assert_eq!(typed.deadline_millis, 10_000);
+    assert_eq!(manual.deadline_millis, 300_000);
     assert_eq!(typed.output_limit, manual.output_limit);
     assert_eq!(typed.console, manual.console);
     let route = typed.console.as_ref().unwrap();
@@ -538,7 +679,12 @@ fn production_console_session_child() {
         session.command_outcome(),
         Some(&CommandOutcome::Exited { code: 0 })
     );
-    assert!(session.console_output().starts_with(b"console-complete"));
+    // Submitted lines are echoed in the live display only (never recorded).
+    assert!(
+        session
+            .console_output()
+            .starts_with("stdin-secret 🦀\n\nconsole-complete".as_bytes())
+    );
     assert!(session.console_output().ends_with(b"console-stderr"));
     assert_eq!(fs::read(root.join("main.rs")).unwrap(), b"A");
     wait_for_lsp(&mut session, "LSP ready");
@@ -716,7 +862,11 @@ fn production_console_recording_failure_child() {
     assert!(session.execute(EditorCommand::Insert('X')).is_err());
     assert!(session.start_console_command("cargo check").is_err());
     assert!(session.unpublished_command_capture().is_none());
-    assert!(session.console_output().starts_with(b"console-complete"));
+    assert!(
+        session
+            .console_output()
+            .starts_with(b"PRIVATE_FAILED_CONSOLE_STDIN\nconsole-complete")
+    );
     assert!(session.console_output().ends_with(b"console-stderr"));
     let activity: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join(".rustrace/command-activity.json")).unwrap())

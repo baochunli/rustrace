@@ -115,6 +115,11 @@ else:
     if console and mode == "console_exit_early":
         os.write(1, b"console-exited-before-stdin")
         sys.exit(config.get("exit", 0))
+    elif console and mode == "console_hang":
+        # A student program stuck in a loop: it outlives a killed session.
+        (target / "hung-pid").write_text(str(os.getpid()))
+        while True:
+            time.sleep(60)
     elif console and mode == "console_io":
         value = b""
         while True:
