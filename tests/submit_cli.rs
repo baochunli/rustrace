@@ -235,7 +235,9 @@ fn submit_cli_refuses_damaged_session_with_preservation_guidance() {
     assert!(!destination.exists());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
-        stdout.contains("original preserved") && stdout.contains("Use --inspect or --abandon"),
+        stdout.contains("original preserved")
+            && stdout.contains("--inspect shows the preserved views")
+            && stdout.contains("--abandon is a last resort"),
         "{stdout}"
     );
 }
