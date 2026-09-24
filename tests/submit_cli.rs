@@ -237,7 +237,7 @@ fn submit_cli_refuses_damaged_session_with_preservation_guidance() {
     assert!(
         stdout.contains("original preserved")
             && stdout.contains("--inspect shows the preserved views")
-            && stdout.contains("--abandon is a last resort"),
+            && stdout.contains("start a new workspace with"),
         "{stdout}"
     );
 }

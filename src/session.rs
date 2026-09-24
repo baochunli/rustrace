@@ -76,7 +76,6 @@ pub const SAVE_CHECK_BUSY_WARNING: &str =
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResumeChoice {
     Resume,
-    RestoreLogical,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -961,7 +960,7 @@ impl ProductionSession {
         let pinned = PinnedWorkspaceRoot::open(root)?;
         if root.join(".rustrace").try_exists()? {
             return Err(
-                "existing session or incomplete startup is preserved: use --inspect or --abandon; never restart initialization in this directory"
+                "existing session or incomplete startup is preserved: use --inspect, or start a new workspace with --workspace; never restart initialization in this directory"
                     .into(),
             );
         }
@@ -1189,7 +1188,7 @@ impl ProductionSession {
         } else {
             false
         };
-        let _ = choice; // Legacy RestoreLogical is an alias; P2 resume is automatic.
+        let _ = choice; // Resume is automatic; the choice is kept for callers.
         drop(journal);
         owner.verify()?;
         let journal = Journal::open_retained_no_follow(owner.display_path())?;
@@ -1320,6 +1319,8 @@ impl ProductionSession {
 
     /// Preserve an unusable original in place and start explicitly linked work.
     /// The caller prepares the new bounded starter directory by validated extraction.
+    /// The CLI no longer offers this (`--abandon` was removed); it remains to
+    /// build workspaces abandoned by older versions, which resume reclaims.
     pub fn abandon_into(root: &Path, fresh_root: &Path, manifest_bytes: &[u8]) -> Result<Self> {
         Self::abandon_with(root, manifest_bytes, None, || Ok(fresh_root.to_path_buf()))
     }

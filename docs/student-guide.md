@@ -71,7 +71,7 @@ blocked.
 | `rustrace doctor --write-ghostty-keys` | Write the marker-protected Ghostty key snippet |
 | `rustrace environment` | Older, narrower tool probe (rustup, rustc, Cargo, rust-analyzer, rustfmt, Clippy) |
 | `rustrace work assignment.rta [--workspace DIR]` | Start or reopen an assignment |
-| `rustrace work ... --resume` / `--inspect` / `--abandon` / `--restore-logical` | Explicit recovery controls |
+| `rustrace work ... --resume` / `--inspect` | Explicit recovery controls |
 | `rustrace status WORKSPACE` | Show whether an attempt is unfinished, finalized, or needs recovery |
 | `rustrace privacy WORKSPACE` | Show exactly what the workspace would contribute to a bundle |
 | `rustrace submit WORKSPACE --student-id ID [--allow-incomplete] [--output PATH]` | Finalize locally and write the ZIP |
@@ -458,9 +458,7 @@ contents and records what it observed; your work is not lost, but the outside
 change is not adopted.
 
 Explicit recovery controls remain available: `--resume` selects the same path
-as automatic resume, `--inspect` shows the preserved views, `--abandon` starts a
-linked fresh workspace, and `--restore-logical` is an older alias for
-`--resume`. You cannot resume a finalized attempt; Rustrace tells you to use
+as automatic resume and `--inspect` shows the preserved views. You cannot resume a finalized attempt; Rustrace tells you to use
 `rustrace revise` instead. If the package you pass does not match the one that
 created the workspace, startup stops and nothing changes.
 
@@ -1074,15 +1072,16 @@ receipt details and local export records.
 without changing anything, the last saved contents of each file, the last
 recorded logical contents including unsaved edits, and what is on disk now.
 `--resume` continues the attempt; if it cannot validate the history it stops,
-says why, and keeps your code and history intact. `--abandon` is a last resort:
-it leaves the original workspace untouched, extracts a fresh starter (not your
-current files) into a sibling directory named like
-`assignment.work.recovery-<number>-<number>`, and starts a new session linked
-to the preserved original. If you abandon by mistake, resuming the original
-takes it back as long as the recovery copy has recorded no work (no edits,
-saves, file changes, or commands); the unused copy is then closed. Once the
-copy has recorded work, the original stays closed and resume names the copy
-to continue in. Startup that fails because a required tool is
+says why, and keeps your code and history intact. In the rare case that a
+workspace can never be resumed (for example its history is damaged), Rustrace
+leaves it untouched and tells you to start a new workspace with
+`rustrace work assignment.rta --workspace NEW.work` and to tell your course
+staff. Older Rustrace versions offered `--abandon`, which started a linked
+copy from the starter code; resuming an original abandoned that way takes it
+back as long as that copy has recorded no work (no edits, saves, file changes,
+or commands), and the unused copy is then closed. Once the copy has recorded
+work, the original stays closed and resume names the copy to continue in.
+Startup that fails because a required tool is
 missing also preserves everything; fix the tool and run the same work command
 again. `--resume` remains an explicit equivalent.
 

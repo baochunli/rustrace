@@ -632,8 +632,7 @@ fn inspection_retains_all_three_views_and_validates_evidence_on_restart() {
     assert_eq!(inspect.saved[&path], b"A");
     assert_eq!(inspect.logical[&path], b"BA");
     assert_eq!(inspect.disk[&path], b"C");
-    let resumed =
-        ProductionSession::resume(&dir.0, manifest(), ResumeChoice::RestoreLogical).unwrap();
+    let resumed = ProductionSession::resume(&dir.0, manifest(), ResumeChoice::Resume).unwrap();
     let evidence = resumed.evidence_paths()[0].clone();
     let exact = rustrace::session::read_recovery_evidence(&fs::read(&evidence).unwrap()).unwrap();
     assert_eq!(exact.saved[&path], b"A");
@@ -1134,12 +1133,8 @@ fn process_interruption_preserves_exact_prefix_at_each_production_boundary() {
             b"BA".as_slice()
         };
         assert_eq!(inspection.saved[&path], expected_saved, "{stage}");
-        let choice = if stage == "disk" {
-            ResumeChoice::RestoreLogical
-        } else {
-            ResumeChoice::Resume
-        };
-        let mut resumed = ProductionSession::resume(&dir.0, manifest(), choice).unwrap();
+        let mut resumed =
+            ProductionSession::resume(&dir.0, manifest(), ResumeChoice::Resume).unwrap();
         resumed.execute(EditorCommand::Insert('!')).unwrap();
         resumed.save_all().unwrap();
         resumed.quit().unwrap();
