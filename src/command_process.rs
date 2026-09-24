@@ -57,20 +57,35 @@ pub(crate) struct ProcessIo {
 #[derive(Clone)]
 pub(crate) struct LiveOutput {
     inner: Arc<Mutex<LiveBuffer>>,
+    id: u64,
 }
 
 struct LiveBuffer {
     bytes: VecDeque<u8>,
     limit: usize,
+    // Bytes ever pushed; the retained tail starts at `pushed - bytes.len()`.
+    pushed: u64,
+}
+
+/// A live-output snapshot with a stable position: `id` names the command's
+/// buffer and `start` is the absolute offset of `bytes[0]` within its output.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LiveSnapshot {
+    pub id: u64,
+    pub start: u64,
+    pub bytes: Vec<u8>,
 }
 
 impl LiveOutput {
     pub(crate) fn new(limit: usize) -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
             inner: Arc::new(Mutex::new(LiveBuffer {
                 bytes: VecDeque::with_capacity(limit.min(MAX_LIVE_OUTPUT_BYTES)),
                 limit: limit.clamp(1, MAX_LIVE_OUTPUT_BYTES),
+                pushed: 0,
             })),
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -85,6 +100,20 @@ impl LiveOutput {
         buffer.bytes.drain(..discard);
         let keep_from = bytes.len().saturating_sub(buffer.limit);
         buffer.bytes.extend(&bytes[keep_from..]);
+        buffer.pushed = buffer
+            .pushed
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+    }
+
+    pub(crate) fn positioned_snapshot(&self) -> LiveSnapshot {
+        let buffer = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        LiveSnapshot {
+            id: self.id,
+            start: buffer
+                .pushed
+                .saturating_sub(u64::try_from(buffer.bytes.len()).unwrap_or(u64::MAX)),
+            bytes: buffer.bytes.iter().copied().collect(),
+        }
     }
 
     pub(crate) fn snapshot(&self) -> Vec<u8> {

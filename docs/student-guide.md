@@ -558,10 +558,12 @@ first.
 Mouse capture is always on; there is no toggle or startup flag. Click to place
 the caret, drag or Shift-click to extend a selection, and double-click a word
 to select it. The wheel scrolls three lines in the pane under the pointer, and
-the editor scrollbar supports track clicks and thumb dragging. Left-drag the
-horizontal divider to resize the lower pane. The editor keeps at least eight
-rows and the lower pane at least four; the chosen height is shared by the output
-and console panes until Rustrace restarts, when the default height returns.
+the editor scrollbar supports track clicks and thumb dragging. While a command
+runs, the wheel still scrolls the output and console panes. Left-drag the
+horizontal divider to resize the lower pane, also while a command runs. The
+editor keeps at least eight rows and the lower pane at least four; the chosen
+height is shared by the output and console panes until Rustrace restarts, when
+the default height returns.
 Left-drag the sidebar's vertical edge to resize it from 18 through 36 columns;
 the editor, tabs, scrollbar, output, and console reflow immediately. Its chosen
 width also resets when Rustrace restarts. The active divider uses the accent
@@ -821,9 +823,18 @@ recognises Cargo status and diagnostic lines in its combined stdout/stderr view.
 Cargo status lines render flush-left; diagnostic blocks are dedented by their
 minimum indentation to keep source gutters and carets aligned. Other lines keep
 their indentation, and all recorded bytes remain unchanged. The mode bar reads only
-`esc close  ↵ run/send` in both modifier modes. The console shows the last part
-of the output (at most 256 KiB). Recorded stdout and stderr share an 8 MiB
-per-command cap and a 64 MiB session budget; deployments may set lower budgets,
+`esc close  ↵ run/send` in both modifier modes. The console follows the newest
+output and wraps long lines at the pane width. PgUp and PgDn, or the mouse
+wheel, scroll back through older output, including while a command runs; the
+console header then shows how many lines lie below, and scrolling back to the
+bottom follows new output again. Each new command starts at its newest line.
+The view stays on the same output line while new output arrives or the pane is
+resized. Scrollback holds the last 128 KiB of the live output; older lines are
+replaced by `[older console output omitted]`, and a line longer than 4 KiB
+shows its newest part after `[line start omitted]`. The console takes about
+two fifths of the terminal height by default, and its divider can be dragged
+while a command runs. Recorded stdout and stderr share an 8 MiB per-command cap
+and a 64 MiB session budget; deployments may set lower budgets,
 and a command can use only the remaining session allowance. Reaching the output
 limit stops the command. The existing deadline (at most five minutes) and Esc
 cancellation also apply to filtered tests and every output option. Esc returns

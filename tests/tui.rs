@@ -1631,6 +1631,7 @@ fn keybinds_overlay_inventory_is_complete_and_fully_rendered() {
         "Home / End             line start / end",
         "Backspace / Delete     edit line",
         "Enter                  run command / send stdin",
+        "PgUp / PgDn / wheel    scroll output",
         "Esc                    cancel command / close console",
         "TEST CASES",
         "Up / Down              select case",
@@ -1667,7 +1668,7 @@ fn keybinds_overlay_inventory_is_complete_and_fully_rendered() {
         KEYBIND_ROWS.as_slice(),
     ]
     .concat();
-    assert_eq!(reachable.len(), 71);
+    assert_eq!(reachable.len(), 72);
     let editor_rows = &KEYBIND_ROWS[..KEYBIND_ROWS
         .iter()
         .position(|row| *row == "FILES")
@@ -4016,6 +4017,217 @@ fn console_at_four_rows_keeps_its_header_and_stdin_row() {
     assert_eq!(layout.bottom.height, 4);
     assert!(rows[0].starts_with("console"), "{rows:?}");
     assert!(rows[3].starts_with("stdin> ▏"), "{rows:?}");
+}
+
+fn console_state(output: &[u8], scroll: Option<usize>) -> MainViewState {
+    view_state(RecordingState::Active, JournalHealth::Healthy)
+        .with_console_body_view(
+            "Embedded Cargo console",
+            output.to_vec(),
+            b"stdin> ".to_vec(),
+            Some(7),
+            true,
+        )
+        .with_console_scroll(scroll)
+}
+
+#[test]
+fn console_wraps_long_lines_and_scrolls_back_through_older_output() {
+    let mut output = String::new();
+    for index in 0..40 {
+        output.push_str(&format!("line-{index:02}\n"));
+    }
+    output.push_str(&format!("long-{}-END\n", "x".repeat(150)));
+    let area = Rect::new(0, 0, 120, 40);
+    let layout = full_shell_layout(area, BottomPane::Console, true, None);
+    assert_eq!(layout.bottom.height, 16);
+
+    let rows = text_in_rect(
+        &render(120, 40, &console_state(output.as_bytes(), None)),
+        layout.bottom,
+    );
+    assert!(rows[0].starts_with("console "), "{rows:?}");
+    assert!(!rows[0].contains("more lines"), "{rows:?}");
+    // 94 columns: the 160-column line wraps onto two rows above the prompt.
+    assert!(rows[13].starts_with("long-xxx"), "{rows:?}");
+    assert!(rows[14].trim_end().ends_with("-END"), "{rows:?}");
+    assert!(rows[15].starts_with("stdin> "), "{rows:?}");
+    assert!(rows[1].starts_with("line-28"), "{rows:?}");
+
+    let rows = text_in_rect(
+        &render(120, 40, &console_state(output.as_bytes(), Some(0))),
+        layout.bottom,
+    );
+    // Rows 14 onward hold 26 short lines and the wrapped long line.
+    assert!(
+        rows[0].trim_end().ends_with("↓ 27 more lines · PgDn"),
+        "{rows:?}"
+    );
+    assert!(rows[1].starts_with("line-00"), "{rows:?}");
+    assert!(rows[14].starts_with("line-13"), "{rows:?}");
+
+    // A stale scroll position past the end still shows the newest rows.
+    let rows = text_in_rect(
+        &render(120, 40, &console_state(output.as_bytes(), Some(999))),
+        layout.bottom,
+    );
+    assert!(rows[14].trim_end().ends_with("-END"), "{rows:?}");
+}
+
+#[test]
+fn console_scrollback_marks_output_older_than_its_bound() {
+    let mut output = Vec::new();
+    for index in 0..8_000 {
+        output.extend_from_slice(format!("ROLLING-{index:05}-safe-output-line\n").as_bytes());
+    }
+    let layout = full_shell_layout(Rect::new(0, 0, 120, 40), BottomPane::Console, true, None);
+    let rows = text_in_rect(
+        &render(120, 40, &console_state(&output, Some(0))),
+        layout.bottom,
+    );
+    assert!(
+        rows[1].starts_with("[older console output omitted]"),
+        "{rows:?}"
+    );
+    assert!(rows[2].starts_with("ROLLING-"), "{rows:?}");
+    assert!(!rows[2].starts_with("ROLLING-00000"), "{rows:?}");
+    let rows = text_in_rect(
+        &render(120, 40, &console_state(&output, None)),
+        layout.bottom,
+    );
+    assert!(rows[14].starts_with("ROLLING-07999"), "{rows:?}");
+}
+
+#[test]
+fn console_shows_the_newest_bytes_of_a_line_without_newlines() {
+    let layout = full_shell_layout(Rect::new(0, 0, 120, 40), BottomPane::Console, true, None);
+    for length in [20 * 1024, 200 * 1024] {
+        let mut output = b"x".repeat(length);
+        output.extend_from_slice(b"NEWEST");
+        let rows = text_in_rect(
+            &render(120, 40, &console_state(&output, None)),
+            layout.bottom,
+        );
+        assert!(
+            rows[14].trim_end().ends_with("xNEWEST"),
+            "{length}: {rows:?}"
+        );
+        let rows = text_in_rect(
+            &render(120, 40, &console_state(&output, Some(0))),
+            layout.bottom,
+        );
+        let first = if length > 128 * 1024 {
+            assert!(
+                rows[1].starts_with("[older console output omitted]"),
+                "{rows:?}"
+            );
+            2
+        } else {
+            1
+        };
+        assert!(
+            rows[first].starts_with("[line start omitted] xxx"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[0].trim_end().ends_with("↓ 1 more line · PgDn"),
+            "{rows:?}"
+        );
+    }
+}
+
+#[test]
+fn running_command_keeps_the_console_wheel_and_divider_live() {
+    let state = console_state(b"older\nnewer\n", None);
+    let hits = render_hits("alpha", &state, &Viewport::default());
+    let prompt = ShellState {
+        modal: ShellModal::Prompt,
+    };
+    let mut reducer = MouseState::default();
+    assert_eq!(
+        reduce_and_map(
+            &mut reducer,
+            mouse(
+                MouseEventKind::ScrollUp,
+                hits.console.x + 1,
+                hits.console.y + 1
+            ),
+            1,
+            &hits,
+            prompt,
+        ),
+        Some(ShellInput::ScrollConsole(-3))
+    );
+    assert_eq!(
+        reduce_and_map(
+            &mut reducer,
+            mouse(
+                MouseEventKind::ScrollDown,
+                hits.console.x + 1,
+                hits.console.y + 1
+            ),
+            2,
+            &hits,
+            ShellState::default(),
+        ),
+        Some(ShellInput::ScrollConsole(3))
+    );
+    assert_eq!(
+        reduce_and_map(
+            &mut reducer,
+            mouse(
+                MouseEventKind::ScrollUp,
+                hits.editor.rect.x + 1,
+                hits.editor.rect.y
+            ),
+            3,
+            &hits,
+            prompt,
+        ),
+        None,
+        "a running command must not scroll the editor"
+    );
+
+    let layout = full_shell_layout(Rect::new(0, 0, 80, 24), BottomPane::Console, true, None);
+    let divider = |kind| mouse(kind, hits.pane_split.x + 1, hits.pane_split.y);
+    let mut resize = PaneResizeState::default();
+    assert!(
+        resize
+            .reduce(
+                &divider(MouseEventKind::Down(MouseButton::Left)),
+                &hits,
+                prompt,
+                layout
+            )
+            .consumed
+    );
+    let drag = resize.reduce(
+        &mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            hits.pane_split.x + 1,
+            3,
+        ),
+        &hits,
+        prompt,
+        layout,
+    );
+    assert!(drag.changed);
+    assert!(resize.bottom_height().unwrap() > layout.bottom.height);
+
+    let mut resize = PaneResizeState::default();
+    let confirmation = ShellState {
+        modal: ShellModal::Confirmation,
+    };
+    assert!(
+        !resize
+            .reduce(
+                &divider(MouseEventKind::Down(MouseButton::Left)),
+                &hits,
+                confirmation,
+                layout
+            )
+            .consumed
+    );
 }
 
 #[test]

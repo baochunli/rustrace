@@ -139,7 +139,8 @@ impl PaneResizeState {
         shell: ShellState,
         layout: ShellLayout,
     ) -> PaneResizeOutcome {
-        if shell.modal != ShellModal::None {
+        // A running command keeps the divider live so its output can get room.
+        if !matches!(shell.modal, ShellModal::None | ShellModal::Prompt) {
             self.dragging = None;
             return PaneResizeOutcome::default();
         }
@@ -237,6 +238,7 @@ pub enum ShellInput {
     ScrollEditorPage(isize),
     SetEditorScroll(u16),
     ScrollOutput(isize),
+    ScrollConsole(isize),
     ScrollOverlay(isize),
     AcceptCompletion(usize),
     ScrollCompletion(isize),
@@ -322,6 +324,16 @@ impl MouseState {
     }
 }
 
+fn bottom_wheel(delta: isize, hits: &HitMap, position: Position) -> Option<ShellInput> {
+    if contains(hits.console, position) {
+        Some(ShellInput::ScrollConsole(delta))
+    } else if contains(hits.output, position) {
+        Some(ShellInput::ScrollOutput(delta))
+    } else {
+        None
+    }
+}
+
 pub fn mouse_input_for_event(
     event: &MouseEvent,
     hits: &HitMap,
@@ -331,7 +343,8 @@ pub fn mouse_input_for_event(
     let position = Position::new(event.column, event.row);
     let wheel = wheel_delta(event.kind);
     match shell.modal {
-        ShellModal::Prompt => return None,
+        // A running command still lets the wheel read its output.
+        ShellModal::Prompt => return wheel.and_then(|delta| bottom_wheel(delta, hits, position)),
         ShellModal::FindPanel => {
             if !left_down(event) {
                 return None;
@@ -493,10 +506,7 @@ pub fn mouse_input_for_event(
         if contains(hits.editor.rect, position) || contains(hits.editor_scrollbar_track, position) {
             return Some(ShellInput::ScrollEditor(delta));
         }
-        if contains(hits.output, position) {
-            return Some(ShellInput::ScrollOutput(delta));
-        }
-        return None;
+        return bottom_wheel(delta, hits, position);
     }
 
     match event.kind {

@@ -769,7 +769,7 @@ try:
         send(b"\x1b[20~")
         wait_screen(" CONSOLE ")
         send(
-            b"\x1b[<0;30;15M"
+            b"\x1b[<0;30;14M"
             b"\x1b[<32;30;18M"
             b"\x1b[<0;30;18m"
         )
@@ -989,7 +989,18 @@ try:
     assert json.loads((work / ".rustrace/command-activity.json").read_bytes())["active"]
     wait_screen("console-stderr:\\xfe")
     if challenge == "baseline":
-        wait_screen("[older console output omitted]")
+        # The console follows the newest output; PgUp reads older rows while
+        # the command runs, and PgDn resumes following.
+        send(b"\x1b[5~")
+        wait_screen("console-ready")
+        wait_screen("↓ ")
+        wait_screen(" more line")
+        send(b"\x1b[6~")
+        wait_for(
+            lambda: "↓" not in rendered_screen()
+            and "console-stderr:\\xfe" in rendered_screen(),
+            "console follows newest output again",
+        )
     else:
         wait_screen("unsafe:\\xff\\u{0}\\u{1b}]52;c;fixture\\u{7}")
     assert (work / "target/console-stdin.bin").read_bytes() == submitted + b"\n"

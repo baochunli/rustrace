@@ -12,7 +12,6 @@ const EDITOR_MIN_HEIGHT: u16 = 8;
 const OUTPUT_MIN_HEIGHT: u16 = 4;
 const OUTPUT_MAX_HEIGHT: u16 = 7;
 const CONSOLE_MIN_HEIGHT: u16 = 8;
-const CONSOLE_MAX_HEIGHT: u16 = 12;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BottomPane {
@@ -105,7 +104,8 @@ pub fn shell_layout_with_sizes(
 
     let desired_bottom = resized_bottom_height.unwrap_or_else(|| match bottom {
         BottomPane::Output => (area.height / 4).clamp(OUTPUT_MIN_HEIGHT, OUTPUT_MAX_HEIGHT),
-        BottomPane::Console => (area.height / 3).clamp(CONSOLE_MIN_HEIGHT, CONSOLE_MAX_HEIGHT),
+        // The console grows with the terminal; the editor minimum still caps it below.
+        BottomPane::Console => (area.height * 2 / 5).max(CONSOLE_MIN_HEIGHT),
     });
     let available = surface_bottom.saturating_sub(tab_bar.bottom());
     let maximum_bottom = available.saturating_sub(EDITOR_MIN_HEIGHT + 1);
@@ -410,10 +410,16 @@ mod tests {
         let output = full(area, BottomPane::Output, true);
         let console = full(area, BottomPane::Console, true);
         assert_eq!(output.bottom.height, 7);
-        assert_eq!(console.bottom.height, 12);
+        assert_eq!(console.bottom.height, 16);
         assert_eq!(console.mode_bar, Rect::new(26, 39, 94, 1));
         assert_eq!(console.gap.height, 1);
         assert_eq!(console.editor.bottom(), console.gap.y);
+        // The console grows with the terminal and never squeezes the editor minimum.
+        let tall = full(Rect::new(0, 0, 200, 80), BottomPane::Console, true);
+        assert_eq!(tall.bottom.height, 32);
+        let short = full(Rect::new(0, 0, 80, 24), BottomPane::Console, true);
+        assert_eq!(short.bottom.height, 9);
+        assert!(short.editor.height >= EDITOR_MIN_HEIGHT);
     }
 
     #[test]

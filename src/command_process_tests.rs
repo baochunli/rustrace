@@ -110,6 +110,10 @@ fn live_console_projection_discards_oldest_bytes_at_its_fixed_bound() {
     live.push(b"12345");
     live.push(b"67890");
     assert_eq!(live.snapshot(), b"34567890");
+    let positioned = live.positioned_snapshot();
+    assert_eq!(positioned.start, 2);
+    assert_eq!(positioned.bytes, b"34567890");
+    assert_ne!(positioned.id, LiveOutput::new(8).positioned_snapshot().id);
 }
 
 #[cfg(unix)]

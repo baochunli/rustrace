@@ -541,6 +541,14 @@ impl ProductionSession {
         }
     }
 
+    pub(crate) fn console_snapshot(&self) -> command_process::LiveSnapshot {
+        self.command
+            .console_live
+            .as_ref()
+            .map(LiveOutput::positioned_snapshot)
+            .unwrap_or_default()
+    }
+
     pub fn console_output(&self) -> Vec<u8> {
         self.command
             .console_live

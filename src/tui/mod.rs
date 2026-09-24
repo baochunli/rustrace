@@ -9,6 +9,7 @@ pub mod theme;
 mod workspace;
 
 use std::path::Path;
+use std::rc::Rc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::buffer::Buffer;
@@ -17,6 +18,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
 use rustrace_model::OutputStream;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::display;
 pub use crate::editor::{DiagnosticLineMarker, DiagnosticMarkerKind};
@@ -342,7 +344,7 @@ pub const OBVIOUS_EDITOR_KEYBIND_ROWS: [&str; 7] = [
     "Tab / Shift-Tab        indent / outdent",
 ];
 
-pub const KEYBIND_ROWS: [&str; 64] = [
+pub const KEYBIND_ROWS: [&str; 65] = [
     "EDITOR",
     "{line-navigation}",
     "{document-navigation}",
@@ -399,6 +401,7 @@ pub const KEYBIND_ROWS: [&str; 64] = [
     "Home / End             line start / end",
     "Backspace / Delete     edit line",
     "Enter                  run command / send stdin",
+    "PgUp / PgDn / wheel    scroll output",
     "Esc                    cancel command / close console",
     "TEST CASES",
     "Up / Down              select case",
@@ -890,6 +893,10 @@ struct ConsoleViewState {
     output: Vec<u8>,
     prompt: Vec<u8>,
     cursor: Option<usize>,
+    // First visible output row; None follows the newest output.
+    scroll: Option<usize>,
+    // Rows the caller already wrapped for this output and pane width.
+    rows: Option<Rc<ConsoleRows>>,
 }
 
 impl MainViewState {
@@ -1122,6 +1129,20 @@ impl MainViewState {
         self
     }
 
+    pub fn with_console_scroll(mut self, scroll: Option<usize>) -> Self {
+        if let Some(console) = &mut self.console {
+            console.scroll = scroll;
+        }
+        self
+    }
+
+    pub(crate) fn with_console_rows(mut self, rows: Rc<ConsoleRows>) -> Self {
+        if let Some(console) = &mut self.console {
+            console.rows = Some(rows);
+        }
+        self
+    }
+
     pub fn with_console_body_view(
         mut self,
         _title: impl Into<String>,
@@ -1134,6 +1155,8 @@ impl MainViewState {
             output,
             prompt,
             cursor: cursor.filter(|_| focused),
+            scroll: None,
+            rows: None,
         });
         if focused {
             self.editor_focused = false;
@@ -1889,13 +1912,20 @@ where
             area.width,
             area.height.saturating_sub(1),
         );
-        render_console_body(
-            &console.output,
-            &console.prompt,
-            console.cursor,
-            inner,
-            buffer,
-        );
+        let below = render_console_body(console, inner, buffer);
+        if below > 0 {
+            let header = Rect::new(area.x, area.y, area.width, 1);
+            put_right_text(
+                buffer,
+                header,
+                area.y,
+                &format!(
+                    "↓ {below} more {} · PgDn",
+                    if below == 1 { "line" } else { "lines" }
+                ),
+                Style::default().fg(self.palette.accent),
+            );
+        }
     }
 
     fn render_mode_bar(&self, area: Rect, mode: &ModeBarState, buffer: &mut Buffer) {
@@ -3054,31 +3084,42 @@ pub(crate) fn maximum_output_scroll(output: &[OutputRow], visible_rows: usize) -
         .saturating_sub(visible_rows)
 }
 
-fn render_console_body(
-    output: &[u8],
-    prompt: &[u8],
-    cursor: Option<usize>,
-    area: Rect,
-    buffer: &mut Buffer,
-) {
+/// The console's output rows inside the console pane: below the header row
+/// and above the prompt row.
+pub(crate) fn console_output_area(console: Rect) -> Rect {
+    Rect::new(
+        console.x,
+        console.y.saturating_add(1),
+        console.width,
+        console.height.saturating_sub(2),
+    )
+}
+
+// Returns the number of source lines not fully shown below the window.
+fn render_console_body(console: &ConsoleViewState, area: Rect, buffer: &mut Buffer) -> usize {
     if area.is_empty() {
-        return;
+        return 0;
     }
+    let prompt = console.prompt.as_slice();
     let prompt_area = Rect::new(area.x, area.bottom() - 1, area.width, 1);
     let output_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
-    let output = console_output_tail(output, usize::from(output_area.height));
-    let rendered = display::output(
-        &output,
-        display::Limits {
-            lines: usize::from(output_area.height),
-            ..display::Limits::default()
-        },
-    );
-    let mut text = rendered.text;
-    dedent_cargo_console_blocks(&mut text.lines);
-    Paragraph::new(text).render(output_area, buffer);
+    let rows = console
+        .rows
+        .clone()
+        .filter(|rows| rows.width == output_area.width)
+        .unwrap_or_else(|| Rc::new(ConsoleRows::new(&console.output, 0, output_area.width)));
+    let visible = usize::from(output_area.height);
+    let last_top = rows.len().saturating_sub(visible);
+    let top = console.scroll.map_or(last_top, |top| top.min(last_top));
+    let end = rows.len().min(top + visible);
+    let below = if end < rows.len() {
+        rows.lines_below(end)
+    } else {
+        0
+    };
+    Paragraph::new(rows.rows[top..end].to_vec()).render(output_area, buffer);
 
-    let cursor = cursor.filter(|cursor| *cursor <= prompt.len());
+    let cursor = console.cursor.filter(|cursor| *cursor <= prompt.len());
     let cursor_column = cursor.map(|cursor| {
         display::output(
             &prompt[..cursor],
@@ -3110,6 +3151,205 @@ fn render_console_body(
     Paragraph::new(rendered.text)
         .scroll((0, horizontal))
         .render(prompt_area, buffer);
+    below
+}
+
+// Scrollback is bounded below the live capture so a rolling command keeps a
+// stable top marker and each rebuild decodes a fixed amount of text.
+const CONSOLE_SCROLLBACK_BYTES: usize = 128 * 1024;
+const CONSOLE_OMITTED: &str = "[older console output omitted]";
+// A longer line shows its newest bytes, so a newline-free stream stays live.
+const CONSOLE_LINE_TAIL_BYTES: usize = 4 * 1024;
+const CONSOLE_LINE_OMITTED: &str = "[line start omitted] ";
+
+/// Console output wrapped at the pane width, with each source line's absolute
+/// output offset so a scroll position survives new output and width changes.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct ConsoleRows {
+    width: u16,
+    rows: Vec<Line<'static>>,
+    // (absolute offset of a source line, its first row), in output order.
+    lines: Vec<(u64, usize)>,
+}
+
+/// A scroll position: a source line's absolute offset and a row within it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ConsoleAnchor {
+    line: u64,
+    row: usize,
+}
+
+impl ConsoleRows {
+    /// `start` is the absolute output offset of `output[0]`.
+    pub(crate) fn new(output: &[u8], start: u64, width: u16) -> Self {
+        let mut result = Self {
+            width,
+            ..Self::default()
+        };
+        if width == 0 {
+            return result;
+        }
+        let mut offset = 0;
+        let mut lines = Vec::new();
+        let mut starts = Vec::new();
+        if output.len() > CONSOLE_SCROLLBACK_BYTES {
+            let cut = output.len() - CONSOLE_SCROLLBACK_BYTES;
+            offset = output[cut..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(cut, |index| cut + index + 1);
+            lines.push(Line::from(CONSOLE_OMITTED));
+            starts.push(None);
+        }
+        let rest = &output[offset..];
+        let rest = rest.strip_suffix(b"\n").unwrap_or(rest);
+        if !rest.is_empty() {
+            for line in rest.split(|byte| *byte == b'\n') {
+                starts.push(Some(
+                    start.saturating_add(u64::try_from(offset).unwrap_or(u64::MAX)),
+                ));
+                offset += line.len() + 1;
+                lines.push(console_line(line));
+            }
+        }
+        dedent_cargo_console_blocks(&mut lines);
+        for (line, start) in lines.into_iter().zip(starts) {
+            if let Some(start) = start {
+                result.lines.push((start, result.rows.len()));
+            }
+            result
+                .rows
+                .extend(wrap_console_line(line, usize::from(width)));
+        }
+        result
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub(crate) fn anchor(&self, top: usize) -> ConsoleAnchor {
+        let index = self.lines.partition_point(|(_, first)| *first <= top);
+        index
+            .checked_sub(1)
+            .map_or_else(ConsoleAnchor::default, |index| {
+                let (line, first) = self.lines[index];
+                ConsoleAnchor {
+                    line,
+                    row: top - first,
+                }
+            })
+    }
+
+    /// The anchor's row; a line that left the scrollback resolves to the top.
+    pub(crate) fn resolve(&self, anchor: ConsoleAnchor) -> usize {
+        match self
+            .lines
+            .binary_search_by_key(&anchor.line, |(line, _)| *line)
+        {
+            Ok(index) => {
+                let first = self.lines[index].1;
+                let end = self
+                    .lines
+                    .get(index + 1)
+                    .map_or(self.rows.len(), |(_, next)| *next);
+                first + anchor.row.min(end.saturating_sub(first + 1))
+            }
+            Err(_) => 0,
+        }
+    }
+
+    /// Keeps a pin whose line is still in the scrollback; otherwise pins the
+    /// oldest remaining line, so the window never parks on the omitted marker.
+    pub(crate) fn retain(&self, anchor: ConsoleAnchor) -> ConsoleAnchor {
+        if self
+            .lines
+            .binary_search_by_key(&anchor.line, |(line, _)| *line)
+            .is_ok()
+        {
+            return anchor;
+        }
+        self.lines
+            .first()
+            .map_or(anchor, |(line, _)| ConsoleAnchor {
+                line: *line,
+                row: 0,
+            })
+    }
+
+    // Source lines with a row at or after `row`.
+    fn lines_below(&self, row: usize) -> usize {
+        let starting_after = self.lines.partition_point(|(_, first)| *first < row);
+        let previous_end = self
+            .lines
+            .get(starting_after)
+            .map_or(self.rows.len(), |(_, first)| *first);
+        let continued = starting_after > 0 && previous_end > row;
+        self.lines.len() - starting_after + usize::from(continued)
+    }
+}
+
+fn console_line(line: &[u8]) -> Line<'static> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let (prefix, line) = if line.len() > CONSOLE_LINE_TAIL_BYTES {
+        let mut cut = line.len() - CONSOLE_LINE_TAIL_BYTES;
+        // Begin on a UTF-8 lead byte: skip at most three continuation bytes.
+        for _ in 0..3 {
+            if line.get(cut).is_some_and(|byte| byte & 0xc0 == 0x80) {
+                cut += 1;
+            }
+        }
+        (Some(CONSOLE_LINE_OMITTED), &line[cut..])
+    } else {
+        (None, line)
+    };
+    let mut rendered = display::output(
+        line,
+        display::Limits {
+            lines: 1,
+            ..display::Limits::default()
+        },
+    )
+    .text
+    .lines
+    .into_iter()
+    .next()
+    .unwrap_or_default();
+    if let Some(prefix) = prefix {
+        rendered.spans.insert(0, Span::raw(prefix));
+    }
+    rendered
+}
+
+fn wrap_console_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if line.width() <= width {
+        return vec![line];
+    }
+    let style = line.style;
+    let mut rows = Vec::new();
+    let mut row = Line::default().style(style);
+    let mut column = 0;
+    for span in line.spans {
+        let mut content = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = display_width(grapheme);
+            if column > 0 && column + grapheme_width > width {
+                if !content.is_empty() {
+                    row.spans
+                        .push(Span::styled(std::mem::take(&mut content), span.style));
+                }
+                rows.push(std::mem::replace(&mut row, Line::default().style(style)));
+                column = 0;
+            }
+            content.push_str(grapheme);
+            column += grapheme_width;
+        }
+        if !content.is_empty() {
+            row.spans.push(Span::styled(content, span.style));
+        }
+    }
+    rows.push(row);
+    rows
 }
 
 // Status lines are standalone blocks. Diagnostic blocks end before a status
@@ -3227,47 +3467,6 @@ fn is_cargo_console_line(line: &str) -> bool {
         gutter.trim().bytes().all(|byte| byte.is_ascii_digit())
             && (gutter.is_empty() || gutter.ends_with(' '))
     })
-}
-
-fn console_output_tail(bytes: &[u8], maximum_rows: usize) -> Vec<u8> {
-    const MAX_TAIL_INPUT_BYTES: usize = display::MAX_OUTPUT_BYTES / 8;
-    const OMITTED: &[u8] = b"[older console output omitted]\n";
-
-    if maximum_rows == 0 {
-        return Vec::new();
-    }
-    let start = bytes
-        .len()
-        .saturating_sub(MAX_TAIL_INPUT_BYTES)
-        .max(tail_line_start(bytes, maximum_rows));
-    if start == 0 {
-        return bytes.to_vec();
-    }
-    let content_rows = maximum_rows.saturating_sub(1);
-    let start = bytes
-        .len()
-        .saturating_sub(MAX_TAIL_INPUT_BYTES)
-        .max(tail_line_start(bytes, content_rows));
-    let mut tail = Vec::with_capacity(OMITTED.len() + bytes.len().saturating_sub(start));
-    tail.extend_from_slice(OMITTED);
-    tail.extend_from_slice(&bytes[start..]);
-    tail
-}
-
-fn tail_line_start(bytes: &[u8], maximum_rows: usize) -> usize {
-    if maximum_rows == 0 {
-        return bytes.len();
-    }
-    let mut newlines = 0;
-    for (index, byte) in bytes.iter().enumerate().rev() {
-        if *byte == b'\n' {
-            newlines += 1;
-            if newlines == maximum_rows {
-                return index + 1;
-            }
-        }
-    }
-    0
 }
 
 impl<S> Widget for MainView<'_, S>

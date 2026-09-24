@@ -1,8 +1,10 @@
 use crate::cargo_policy::CargoAction;
+use crate::command_process::LiveSnapshot;
 use crate::console::{ConsoleLine, TestCaseDirectory};
 use crate::diagnostics::DiagnosticNavigation;
 use crate::session::ConsoleStart;
 use crate::tui::*;
+use crate::tui::{ConsoleAnchor, ConsoleRows};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{Terminal, TerminalOptions, Viewport as TerminalViewport, backend::CrosstermBackend};
 use rustrace_model::{
@@ -424,10 +426,64 @@ fn observe_completion_trigger(
     }
 }
 
+/// Console scrollback position. `pin` anchors the first visible row to a
+/// source line of the current command's output while the student reads older
+/// output; `None` follows the newest output. `rows` caches the wrapped output
+/// for the pane width so each frame decodes it at most once.
+#[derive(Debug, Default)]
+struct ConsoleScroll {
+    pin: Option<ConsoleAnchor>,
+    rows: Rc<ConsoleRows>,
+    // (live buffer id, absolute start, length, width) of the cached rows.
+    key: (u64, u64, usize, u16),
+    visible: usize,
+}
+
+impl ConsoleScroll {
+    fn measure(&mut self, snapshot: &LiveSnapshot, width: u16, visible: usize) {
+        let key = (snapshot.id, snapshot.start, snapshot.bytes.len(), width);
+        // Each new command's output starts at its newest line.
+        if key.0 != self.key.0 {
+            self.pin = None;
+        }
+        if key != self.key {
+            self.rows = Rc::new(ConsoleRows::new(&snapshot.bytes, snapshot.start, width));
+            self.key = key;
+            self.pin = self.pin.map(|pin| self.rows.retain(pin));
+        }
+        self.visible = visible;
+        if self.top().is_some_and(|top| top >= self.last_top()) {
+            self.pin = None;
+        }
+    }
+
+    fn top(&self) -> Option<usize> {
+        self.pin.map(|pin| self.rows.resolve(pin))
+    }
+
+    fn last_top(&self) -> usize {
+        self.rows.len().saturating_sub(self.visible)
+    }
+
+    fn scroll_by(&mut self, delta: isize) -> bool {
+        let previous = self.top();
+        let top = previous
+            .unwrap_or_else(|| self.last_top())
+            .saturating_add_signed(delta);
+        self.pin = (top < self.last_top()).then(|| self.rows.anchor(top));
+        self.top() != previous
+    }
+
+    fn page(&self) -> isize {
+        isize::try_from(self.visible.saturating_sub(1).max(1)).unwrap_or(isize::MAX)
+    }
+}
+
 fn handle_console_key(
     session: &mut crate::session::ProductionSession,
     key: &crossterm::event::KeyEvent,
     console_line: &mut ConsoleLine,
+    console_scroll: &mut ConsoleScroll,
     view: &mut WorkView,
     focus: &mut WorkspaceFocus,
     status: &mut StatusMessage,
@@ -438,6 +494,12 @@ fn handle_console_key(
     let accepts_stdin = session.console_accepts_stdin();
     let editable = !session.command_active() || accepts_stdin;
     match key.code {
+        KeyCode::PageUp => {
+            console_scroll.scroll_by(-console_scroll.page());
+        }
+        KeyCode::PageDown => {
+            console_scroll.scroll_by(console_scroll.page());
+        }
         KeyCode::Esc => {
             if session.console_command_active() {
                 session.cancel_command();
@@ -606,6 +668,7 @@ where
     let mut follow_cursor = true;
     let mut resize_follow_cursor = false;
     let mut output_scroll = 0;
+    let mut console_scroll = ConsoleScroll::default();
     let mut mouse_state = MouseState::default();
     let mut pane_resize = PaneResizeState::default();
     let mouse_clock = Instant::now();
@@ -771,6 +834,11 @@ where
             MainLayout::Full(panes) => panes.bottom.height.saturating_sub(1) as usize,
             MainLayout::TooSmall(_) => 0,
         };
+        let console_output = (view == WorkView::Console).then(|| session.console_snapshot());
+        if let (Some(snapshot), MainLayout::Full(panes)) = (&console_output, layout) {
+            let area = crate::tui::console_output_area(panes.bottom);
+            console_scroll.measure(snapshot, area.width, usize::from(area.height));
+        }
         let mut diagnostic_rows = if diagnostics_visible {
             session.diagnostic_display_rows(output_rows.saturating_add(1))
         } else {
@@ -797,7 +865,9 @@ where
         let body = match view {
             WorkView::Workspace => None,
             WorkView::Console => Some(WorkBody::Console(console_body(
-                &session.console_output(),
+                console_output
+                    .as_ref()
+                    .map_or(&[][..], |snapshot| snapshot.bytes.as_slice()),
                 &console_line,
                 session.console_command_active(),
                 session.console_accepts_stdin(),
@@ -1029,13 +1099,16 @@ where
         }
         match body {
             Some(WorkBody::Console(body)) => {
-                state = state.with_console_body_view(
-                    "Embedded Cargo console",
-                    body.output,
-                    body.prompt,
-                    body.cursor,
-                    focus == WorkspaceFocus::Console,
-                );
+                state = state
+                    .with_console_body_view(
+                        "Embedded Cargo console",
+                        body.output,
+                        body.prompt,
+                        body.cursor,
+                        focus == WorkspaceFocus::Console,
+                    )
+                    .with_console_scroll(console_scroll.top())
+                    .with_console_rows(Rc::clone(&console_scroll.rows));
             }
             None => {}
         }
@@ -1323,6 +1396,9 @@ where
                     if changed {
                         follow_cursor = false;
                     }
+                }
+                Some(ShellInput::ScrollConsole(delta)) => {
+                    draw_gate.request_change(console_scroll.scroll_by(delta));
                 }
                 Some(ShellInput::ScrollOutput(delta)) => {
                     let previous = output_scroll;
@@ -1930,6 +2006,7 @@ where
                     session,
                     key,
                     &mut console_line,
+                    &mut console_scroll,
                     &mut view,
                     &mut focus,
                     &mut status,
@@ -3238,9 +3315,9 @@ fn diagnostic_output_text(rows: &[crate::tui::OutputRow]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        EXPLICIT_SAVE_SUCCESS, FindPanel, FindPanelAction, FindPanelField, PasteEventRoute,
-        PathOperation, PathPrompt, PathPromptAction, StatusMessage, TestCasePicker,
-        TestCasePickerKeyAction, ToastTimer, WorkView, activate_command_menu_entry,
+        ConsoleScroll, EXPLICIT_SAVE_SUCCESS, FindPanel, FindPanelAction, FindPanelField,
+        LiveSnapshot, PasteEventRoute, PathOperation, PathPrompt, PathPromptAction, StatusMessage,
+        TestCasePicker, TestCasePickerKeyAction, ToastTimer, WorkView, activate_command_menu_entry,
         activate_editor_context_menu_entry, activate_files_context_menu_entry,
         apply_path_prompt_action, apply_workspace_outcome, begin_path_prompt,
         command_completion_status, command_status_for_output, command_tick_status,
@@ -5731,6 +5808,7 @@ format = ["cargo", "fmt"]
                     &mut session,
                     &KeyEvent::new(KeyCode::Char(code), modifiers),
                     &mut line,
+                    &mut ConsoleScroll::default(),
                     &mut view,
                     &mut focus,
                     &mut status,
@@ -5750,6 +5828,7 @@ format = ["cargo", "fmt"]
             &mut session,
             &release,
             &mut line,
+            &mut ConsoleScroll::default(),
             &mut view,
             &mut focus,
             &mut status,
@@ -5762,6 +5841,7 @@ format = ["cargo", "fmt"]
             &mut session,
             &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
             &mut line,
+            &mut ConsoleScroll::default(),
             &mut view,
             &mut focus,
             &mut status,
@@ -5854,6 +5934,61 @@ format = ["cargo", "fmt"]
                 assert!(rows.iter().any(|row| row.starts_with(expected)), "{rows:?}");
             }
         }
+    }
+
+    fn numbered_output(id: u64, lines: std::ops::Range<usize>) -> LiveSnapshot {
+        // Each "line-NNN\n" is nine bytes, so line N starts at offset 9 * N.
+        LiveSnapshot {
+            id,
+            start: u64::try_from(lines.start * 9).unwrap(),
+            bytes: lines
+                .flat_map(|index| format!("line-{index:03}\n").into_bytes())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn console_scroll_pins_a_source_line_and_resumes_following_at_the_bottom() {
+        let mut scroll = ConsoleScroll::default();
+        scroll.measure(&numbered_output(1, 0..100), 80, 10);
+        assert_eq!(scroll.top(), None);
+        assert_eq!(scroll.page(), 9);
+        assert!(scroll.scroll_by(-5));
+        assert_eq!(scroll.top(), Some(85));
+
+        // New output arrives and the oldest lines leave the live buffer: the
+        // pinned line stays at the top of the window.
+        scroll.measure(&numbered_output(1, 20..130), 80, 10);
+        assert_eq!(scroll.top(), Some(65));
+        // A narrower pane reflows each line onto two rows around the same line.
+        scroll.measure(&numbered_output(1, 20..130), 4, 10);
+        assert_eq!(scroll.top(), Some(130));
+        scroll.measure(&numbered_output(1, 20..130), 80, 10);
+        assert_eq!(scroll.top(), Some(65));
+
+        // Once the pinned line leaves the scrollback, the oldest remaining line
+        // is pinned instead of the view drifting with new output.
+        scroll.measure(&numbered_output(1, 90..200), 80, 10);
+        assert_eq!(scroll.top(), Some(0));
+        scroll.measure(&numbered_output(1, 90..210), 80, 10);
+        assert_eq!(scroll.top(), Some(0));
+        scroll.measure(&numbered_output(1, 20..130), 80, 10);
+        assert!(scroll.scroll_by(-1000));
+        assert_eq!(scroll.top(), Some(0));
+        assert!(!scroll.scroll_by(-1));
+        // Reaching the newest rows follows again.
+        assert!(scroll.scroll_by(1000));
+        assert_eq!(scroll.top(), None);
+        assert!(!scroll.scroll_by(3));
+
+        // A new command's output starts at its newest line.
+        assert!(scroll.scroll_by(-3));
+        scroll.measure(&numbered_output(2, 0..100), 80, 10);
+        assert_eq!(scroll.top(), None);
+        // Short output never scrolls.
+        scroll.measure(&numbered_output(3, 0..4), 80, 10);
+        assert!(!scroll.scroll_by(-3));
+        assert_eq!(scroll.top(), None);
     }
 
     fn rendered_console_rows(output: &str) -> Vec<String> {
