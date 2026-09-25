@@ -312,7 +312,7 @@ fn submit_workspace(
 
 fn submit_resume_error(error: impl std::fmt::Display) -> String {
     format!(
-        "startup/session cannot resume: {error}; original preserved. Use --inspect or --abandon for linked fresh work"
+        "startup/session cannot resume: {error}; original preserved. Your code and recorded history are intact: fix the cause above and run the same command again; --inspect shows the preserved views. If it still cannot resume, start a new workspace with `rustrace work ASSIGNMENT.rta --workspace NEW.work` and tell your course staff; this workspace stays preserved for inspection"
     )
 }
 

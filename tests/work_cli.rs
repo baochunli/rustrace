@@ -218,7 +218,7 @@ fn real_work_cli_pty_rejects_external_without_a_conflict_choice() {
 
 #[cfg(unix)]
 #[test]
-fn damaged_session_id_cli_can_preserve_and_link_without_orphan_extraction() {
+fn damaged_session_id_cli_preserves_the_original_and_points_to_a_new_workspace() {
     let test_home = test_home::TestHome::new(false);
     let output = test_home
         .command("python3")
@@ -329,20 +329,15 @@ fn valid_unfinished_session_automatically_resumes_with_piped_stdin_like_resume_f
 
 #[test]
 fn automatic_resume_keeps_explicit_recovery_flags() {
-    for flag in ["--resume", "--restore-logical"] {
-        let fixture = WorkFixture::started(&format!(
-            "automatic-resume-{}",
-            flag.trim_start_matches('-')
-        ));
-        let (last_sequence, _) = fixture.chain();
-        let output = fixture.run_piped(Some(flag));
-        assert_no_recovery_prompt(&output);
-        assert_eq!(
-            fixture.only_new_resume(last_sequence),
-            SessionResumed { last_sequence },
-            "{flag} did not retain resume behavior"
-        );
-    }
+    let fixture = WorkFixture::started("automatic-resume-resume");
+    let (last_sequence, _) = fixture.chain();
+    let output = fixture.run_piped(Some("--resume"));
+    assert_no_recovery_prompt(&output);
+    assert_eq!(
+        fixture.only_new_resume(last_sequence),
+        SessionResumed { last_sequence },
+        "--resume did not retain resume behavior"
+    );
 
     let inspected = WorkFixture::started("automatic-resume-inspect");
     let chain = inspected.chain();
@@ -355,23 +350,24 @@ fn automatic_resume_keeps_explicit_recovery_flags() {
     );
     assert_eq!(inspected.chain(), chain, "--inspect mutated the journal");
 
-    let abandoned = WorkFixture::started("automatic-resume-abandon");
-    let original_chain = abandoned.chain();
-    let output = abandoned.run_piped(Some("--abandon"));
-    assert!(
-        output_text(&output).contains("Original preserved at"),
-        "{}",
-        output_text(&output)
-    );
-    assert!(
-        abandoned
-            .workspace
-            .join(".rustrace/abandoned.json")
-            .is_file(),
-        "--abandon did not mark the original"
-    );
-    assert_eq!(abandoned.chain(), original_chain);
-    assert_eq!(abandoned.recovery_workspaces().len(), 1);
+    // Removed recovery flags are rejected without touching the session.
+    for flag in ["--abandon", "--restore-logical"] {
+        let removed = WorkFixture::started(&format!(
+            "automatic-resume-removed-{}",
+            flag.trim_start_matches('-')
+        ));
+        let original_chain = removed.chain();
+        let output = removed.run_piped(Some(flag));
+        assert!(!output.status.success(), "{flag}: {}", output_text(&output));
+        assert!(
+            output_text(&output).contains("invalid work option"),
+            "{flag}: {}",
+            output_text(&output)
+        );
+        assert!(!removed.workspace.join(".rustrace/abandoned.json").exists());
+        assert_eq!(removed.chain(), original_chain);
+        assert!(removed.recovery_workspaces().is_empty());
+    }
 }
 
 #[test]
@@ -383,7 +379,8 @@ fn automatic_resume_keeps_incomplete_finalized_and_mismatch_errors() {
     assert!(
         text.contains("Incomplete startup or invalid session metadata")
             && text.contains("Original preserved; session identity is unknown")
-            && text.contains("incomplete startup cannot Resume/Restore; original preserved"),
+            && text.contains("incomplete startup cannot resume; original preserved")
+            && text.contains("start a new workspace with"),
         "{text}"
     );
 

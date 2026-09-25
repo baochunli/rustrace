@@ -632,8 +632,7 @@ fn inspection_retains_all_three_views_and_validates_evidence_on_restart() {
     assert_eq!(inspect.saved[&path], b"A");
     assert_eq!(inspect.logical[&path], b"BA");
     assert_eq!(inspect.disk[&path], b"C");
-    let resumed =
-        ProductionSession::resume(&dir.0, manifest(), ResumeChoice::RestoreLogical).unwrap();
+    let resumed = ProductionSession::resume(&dir.0, manifest(), ResumeChoice::Resume).unwrap();
     let evidence = resumed.evidence_paths()[0].clone();
     let exact = rustrace::session::read_recovery_evidence(&fs::read(&evidence).unwrap()).unwrap();
     assert_eq!(exact.saved[&path], b"A");
@@ -663,6 +662,212 @@ fn abandoning_preserves_corrupt_original_and_links_new_session_before_genesis() 
         .unwrap()
         .quit()
         .unwrap();
+}
+
+fn abandoned_with_recovery() -> (Directory, Directory) {
+    let dir = Directory::new();
+    let mut session = ProductionSession::start(&dir.0, manifest()).unwrap();
+    session.execute(EditorCommand::Insert('Z')).unwrap();
+    session.save_all().unwrap();
+    session.quit().unwrap();
+    let fresh = Directory::new();
+    ProductionSession::abandon_into(&dir.0, &fresh.0, manifest())
+        .unwrap()
+        .quit()
+        .unwrap();
+    assert!(dir.0.join(".rustrace/abandoned.json").exists());
+    (dir, fresh)
+}
+
+#[test]
+fn resuming_an_abandoned_original_reclaims_it_while_its_recovery_is_unused() {
+    let (dir, fresh) = abandoned_with_recovery();
+    let saved = fs::read(dir.0.join("main.rs")).unwrap();
+    let session = ProductionSession::resume(&dir.0, manifest(), ResumeChoice::Resume).unwrap();
+    session.quit().unwrap();
+    assert_eq!(fs::read(dir.0.join("main.rs")).unwrap(), saved);
+    assert!(!dir.0.join(".rustrace/abandoned.json").exists());
+    assert!(dir.0.join(".rustrace/abandoned-reclaimed-1.json").exists());
+    // The unused copy is closed so only one line of history continues.
+    let closed: serde_json::Value =
+        serde_json::from_slice(&fs::read(fresh.0.join(".rustrace/abandoned.json")).unwrap())
+            .unwrap();
+    assert_eq!(closed["decision"], "reclaimed_by_original");
+    let error = ProductionSession::resume(&fresh.0, manifest(), ResumeChoice::Resume)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("closed when its original workspace"),
+        "{error}"
+    );
+    ProductionSession::resume(&dir.0, manifest(), ResumeChoice::Resume)
+        .unwrap()
+        .quit()
+        .unwrap();
+}
+
+#[test]
+fn an_abandoned_original_stays_closed_once_its_recovery_records_work() {
+    let (dir, fresh) = abandoned_with_recovery();
+    let mut recovery =
+        ProductionSession::resume(&fresh.0, manifest(), ResumeChoice::Resume).unwrap();
+    recovery.execute(EditorCommand::Insert('R')).unwrap();
+    recovery.quit().unwrap();
+    let error = ProductionSession::resume(&dir.0, manifest(), ResumeChoice::Resume)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("work was recorded in its recovery workspace"),
+        "{error}"
+    );
+    assert!(dir.0.join(".rustrace/abandoned.json").exists());
+    assert!(!fresh.0.join(".rustrace/abandoned.json").exists());
+}
+
+#[test]
+fn an_abandoned_original_is_reclaimed_when_its_recovery_was_deleted() {
+    let (dir, fresh) = abandoned_with_recovery();
+    fs::remove_dir_all(fresh.0.join(".rustrace")).unwrap();
+    ProductionSession::resume(&dir.0, manifest(), ResumeChoice::Resume)
+        .unwrap()
+        .quit()
+        .unwrap();
+    assert!(dir.0.join(".rustrace/abandoned-reclaimed-1.json").exists());
+}
+
+fn resume_error(dir: &Directory) -> String {
+    ProductionSession::resume(&dir.0, manifest(), ResumeChoice::Resume)
+        .err()
+        .expect("resume must refuse")
+        .to_string()
+}
+
+#[test]
+fn an_abandoned_original_stays_closed_when_its_recovery_was_abandoned_or_edited_outside() {
+    // The recovery itself abandoned into a further copy.
+    let (dir, fresh) = abandoned_with_recovery();
+    let further = Directory::new();
+    ProductionSession::abandon_into(&fresh.0, &further.0, manifest())
+        .unwrap()
+        .quit()
+        .unwrap();
+    let error = resume_error(&dir);
+    assert!(error.contains("was itself closed or abandoned"), "{error}");
+    assert!(dir.0.join(".rustrace/abandoned.json").exists());
+
+    // Recovery files changed outside Rustrace leave no events.
+    let (dir, fresh) = abandoned_with_recovery();
+    fs::write(fresh.0.join("main.rs"), "edited elsewhere").unwrap();
+    let error = resume_error(&dir);
+    assert!(
+        error.contains("work was recorded in its recovery workspace"),
+        "{error}"
+    );
+    assert!(!fresh.0.join(".rustrace/abandoned.json").exists());
+}
+
+#[test]
+fn an_abandoned_original_only_closes_its_own_linked_recovery() {
+    let (dir, _fresh) = abandoned_with_recovery();
+    let unrelated = Directory::new();
+    ProductionSession::start(&unrelated.0, manifest())
+        .unwrap()
+        .quit()
+        .unwrap();
+    let record_path = dir.0.join(".rustrace/abandoned.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    record["new_directory"] = serde_json::json!(unrelated.0);
+    fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let error = resume_error(&dir);
+    assert!(
+        error.contains("is not the recovery workspace linked"),
+        "{error}"
+    );
+    assert!(!unrelated.0.join(".rustrace/abandoned.json").exists());
+}
+
+#[test]
+fn a_renamed_recovery_with_work_keeps_its_original_closed() {
+    let parent = Directory::new();
+    let (original, recovery) = (
+        parent.0.join("lab.work"),
+        parent.0.join("lab.work.recovery-1"),
+    );
+    for directory in [&original, &recovery] {
+        fs::create_dir(directory).unwrap();
+        fs::write(directory.join("main.rs"), "A").unwrap();
+    }
+    ProductionSession::start(&original, manifest())
+        .unwrap()
+        .quit()
+        .unwrap();
+    ProductionSession::abandon_into(&original, &recovery, manifest())
+        .unwrap()
+        .quit()
+        .unwrap();
+    let renamed = parent.0.join("my-lab");
+    fs::rename(&recovery, &renamed).unwrap();
+    let mut session =
+        ProductionSession::resume(&renamed, manifest(), ResumeChoice::Resume).unwrap();
+    session.execute(EditorCommand::Insert('R')).unwrap();
+    session.quit().unwrap();
+    let error = ProductionSession::resume(&original, manifest(), ResumeChoice::Resume)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("my-lab"), "{error}");
+    assert!(original.join(".rustrace/abandoned.json").exists());
+}
+
+#[test]
+fn a_moved_abandoned_original_finds_its_recovery_beside_it() {
+    let parent = Directory::new();
+    let (original, recovery) = (
+        parent.0.join("lab.work"),
+        parent.0.join("lab.work.recovery-1"),
+    );
+    for directory in [&original, &recovery] {
+        fs::create_dir(directory).unwrap();
+        fs::write(directory.join("main.rs"), "A").unwrap();
+    }
+    ProductionSession::start(&original, manifest())
+        .unwrap()
+        .quit()
+        .unwrap();
+    ProductionSession::abandon_into(&original, &recovery, manifest())
+        .unwrap()
+        .quit()
+        .unwrap();
+    let moved = Directory::new();
+    let moved_parent = moved.0.join("moved");
+    fs::rename(&parent.0, &moved_parent).unwrap();
+    ProductionSession::resume(
+        &moved_parent.join("lab.work"),
+        manifest(),
+        ResumeChoice::Resume,
+    )
+    .unwrap()
+    .quit()
+    .unwrap();
+    assert!(
+        moved_parent
+            .join("lab.work.recovery-1/.rustrace/abandoned.json")
+            .exists()
+    );
+    // Once the copy is gone from beside a moved original, resume names it.
+    let (dir, fresh) = abandoned_with_recovery();
+    let elsewhere = Directory::new();
+    let moved_original = elsewhere.0.join("moved.work");
+    fs::rename(&dir.0, &moved_original).unwrap();
+    drop(fresh);
+    let error = ProductionSession::resume(&moved_original, manifest(), ResumeChoice::Resume)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("was not found beside it"), "{error}");
 }
 
 #[test]
@@ -928,12 +1133,8 @@ fn process_interruption_preserves_exact_prefix_at_each_production_boundary() {
             b"BA".as_slice()
         };
         assert_eq!(inspection.saved[&path], expected_saved, "{stage}");
-        let choice = if stage == "disk" {
-            ResumeChoice::RestoreLogical
-        } else {
-            ResumeChoice::Resume
-        };
-        let mut resumed = ProductionSession::resume(&dir.0, manifest(), choice).unwrap();
+        let mut resumed =
+            ProductionSession::resume(&dir.0, manifest(), ResumeChoice::Resume).unwrap();
         resumed.execute(EditorCommand::Insert('!')).unwrap();
         resumed.save_all().unwrap();
         resumed.quit().unwrap();

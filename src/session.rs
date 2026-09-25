@@ -76,7 +76,6 @@ pub const SAVE_CHECK_BUSY_WARNING: &str =
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResumeChoice {
     Resume,
-    RestoreLogical,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -961,7 +960,7 @@ impl ProductionSession {
         let pinned = PinnedWorkspaceRoot::open(root)?;
         if root.join(".rustrace").try_exists()? {
             return Err(
-                "existing session or incomplete startup is preserved: use --inspect or --abandon; never restart initialization in this directory"
+                "existing session or incomplete startup is preserved: use --inspect, or start a new workspace with --workspace; never restart initialization in this directory"
                     .into(),
             );
         }
@@ -1099,25 +1098,30 @@ impl ProductionSession {
         if owner.read_artifact("manifest.toml", METADATA_LIMIT)? != manifest_bytes {
             return Err("persisted assignment manifest mismatch".into());
         }
-        if owner
+        let abandoned = owner
             .display_path()
             .parent()
             .ok_or("state directory missing")?
             .join("abandoned.json")
-            .try_exists()?
-        {
-            return Err(
-                "session was abandoned and preserved; inspect its linked replacement".into(),
-            );
-        }
+            .try_exists()?;
+        // An abandoned original that cannot be validated stays closed; point
+        // to the recovery workspace the abandonment created.
+        let note = |error: Box<dyn Error>| -> Box<dyn Error> {
+            if abandoned {
+                format!("{error}; this workspace was abandoned: continue in the recovery workspace named in .rustrace/abandoned.json").into()
+            } else {
+                error
+            }
+        };
         if let Some(parent_hash) = metadata.parent_evidence
             && digest(&owner.read_artifact("parent.json", METADATA_LIMIT)?) != parent_hash
         {
             return Err("linked recovery evidence mismatch".into());
         }
         // Validate preserved bytes read-only before SQLite can initialize an invalid original.
-        let mut journal = Journal::open_read_only_no_follow(owner.display_path())?;
-        let receipt = load_saved_receipt(&owner, &mut journal, &metadata)?;
+        let mut journal =
+            Journal::open_read_only_no_follow(owner.display_path()).map_err(|e| note(e.into()))?;
+        let receipt = load_saved_receipt(&owner, &mut journal, &metadata).map_err(note)?;
         let ValidatedPrefix {
             replay,
             sequence,
@@ -1128,7 +1132,7 @@ impl ProductionSession {
             uncaptured_edits,
             changed,
             pending_external,
-        } = validate_prefix(&mut journal, &metadata, &receipt, &owner)?;
+        } = validate_prefix(&mut journal, &metadata, &receipt, &owner).map_err(note)?;
         if replay.is_terminal() || journal.inspect_session(&metadata.session_id)?.ended {
             return Err(
                 "terminal session is preserved; start a linked attempt with `rustrace revise PARENT_WORKSPACE NEW_WORKSPACE assignment.rta`".into(),
@@ -1140,6 +1144,11 @@ impl ProductionSession {
             return Err("unfinished command evidence; inspect and use linked recovery; child death is not established by restart".into());
         }
         let interrupted_command = replay.controlled_command_pending();
+        let reclaim = if abandoned {
+            Some(prepare_reclaim(&owner, &metadata)?)
+        } else {
+            None
+        };
         let logical = replay.workspace_state().files().clone();
         let disk = read_pinned_workspace(&pinned)?;
         let policy = AllowedPathSet::from_manifest(&manifest)?;
@@ -1179,7 +1188,7 @@ impl ProductionSession {
         } else {
             false
         };
-        let _ = choice; // Legacy RestoreLogical is an alias; P2 resume is automatic.
+        let _ = choice; // Resume is automatic; the choice is kept for callers.
         drop(journal);
         owner.verify()?;
         let journal = Journal::open_retained_no_follow(owner.display_path())?;
@@ -1266,6 +1275,9 @@ impl ProductionSession {
                 disk,
             });
         }
+        if let Some(reclaim) = reclaim {
+            finish_reclaim(&session.effects.0.borrow().owner, reclaim)?;
+        }
         if interrupted_command {
             session.finish_interrupted_command()?;
         } else if stale_command {
@@ -1307,6 +1319,8 @@ impl ProductionSession {
 
     /// Preserve an unusable original in place and start explicitly linked work.
     /// The caller prepares the new bounded starter directory by validated extraction.
+    /// The CLI no longer offers this (`--abandon` was removed); it remains to
+    /// build workspaces abandoned by older versions, which resume reclaims.
     pub fn abandon_into(root: &Path, fresh_root: &Path, manifest_bytes: &[u8]) -> Result<Self> {
         Self::abandon_with(root, manifest_bytes, None, || Ok(fresh_root.to_path_buf()))
     }
@@ -3166,6 +3180,245 @@ fn read_prefix_evidence(
         Err(error) => Err(error.into()),
     }
 }
+/// An abandoned original whose linked recovery workspace recorded no work.
+/// The recovery owner is held from the check until the original resumes.
+struct AbandonedReclaim {
+    recovery: Option<(PinnedJournalFile, PathBuf)>,
+    // The recovery already holds this original's close marker.
+    replace_marker: bool,
+    root: PathBuf,
+}
+
+/// Abandonment only publishes `abandoned.json` in the original; it is never
+/// journaled there. So the original can resume, without a new event, when its
+/// recovery workspace is missing or recorded no work; that copy is then marked
+/// abandoned instead, so only one line of history continues.
+fn prepare_reclaim(
+    owner: &PinnedJournalFile,
+    metadata: &SessionMetadata,
+) -> Result<AbandonedReclaim> {
+    let bytes = owner.read_artifact("abandoned.json", METADATA_LIMIT)?;
+    let record: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if record["decision"].as_str() == Some("reclaimed_by_original") {
+        return Err(format!(
+            "this unused recovery copy was closed when its original workspace {} resumed; continue there",
+            record["original_directory"].as_str().unwrap_or("(unknown)")
+        )
+        .into());
+    }
+    if record["original_session"].as_str() != Some(metadata.session_id.as_str()) {
+        return Err("abandonment record names another session; inspect before resuming".into());
+    }
+    let recorded = PathBuf::from(
+        record["new_directory"]
+            .as_str()
+            .ok_or("abandonment record lacks its recovery workspace")?,
+    );
+    let root = fs::canonicalize(
+        owner
+            .display_path()
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("state directory missing")?,
+    )?;
+    let moved = record["original_directory"]
+        .as_str()
+        .and_then(|recorded| fs::canonicalize(recorded).ok())
+        .is_none_or(|recorded| recorded != root);
+    // Find the recovery bound to this record: beside a moved or copied
+    // original first, then where it was created, then renamed beside it.
+    let binding = digest(&bytes);
+    let beside = root
+        .parent()
+        .zip(recorded.file_name())
+        .map(|(parent, name)| parent.join(name));
+    let mut candidates = Vec::new();
+    if moved {
+        candidates.extend(beside.clone());
+    }
+    candidates.push(recorded.clone());
+    let directory = candidates
+        .into_iter()
+        .find(|candidate| candidate.join(".rustrace").exists())
+        .or_else(|| find_bound_recovery(&root, binding))
+        .unwrap_or_else(|| beside.unwrap_or(recorded));
+    if !directory.join(".rustrace").try_exists()? {
+        if moved {
+            return Err(format!(
+                "this workspace was abandoned and then moved; its recovery workspace {} was not found beside it; move it back next to this workspace and retry",
+                directory.display()
+            )
+            .into());
+        }
+        // Deleted by the student: nothing else can continue this history.
+        return Ok(AbandonedReclaim {
+            recovery: None,
+            replace_marker: false,
+            root,
+        });
+    }
+    let unusable = |error: &dyn std::fmt::Display| -> Box<dyn std::error::Error> {
+        format!(
+            "this workspace was abandoned; its recovery workspace {} could not be checked ({error}); close it if it is open and retry",
+            directory.display()
+        )
+        .into()
+    };
+    let recovery_metadata: SessionMetadata =
+        serde_json::from_slice(&read_initial_metadata(&directory).map_err(|e| unusable(&e))?)
+            .map_err(|e| unusable(&e))?;
+    // Only the recovery this record created is bound to it.
+    if recovery_metadata.parent_evidence != Some(binding) {
+        return Err(format!(
+            "{} is not the recovery workspace linked to this abandoned workspace; inspect before resuming",
+            directory.display()
+        )
+        .into());
+    }
+    let pinned = PinnedWorkspaceRoot::open(&directory).map_err(|e| unusable(&e))?;
+    let recovery = pinned
+        .open_state_directory()
+        .and_then(|state| state.open_journal_file(&recovery_metadata.session_id))
+        .map_err(|e| unusable(&e))?;
+    let continue_there = || -> Box<dyn std::error::Error> {
+        format!(
+            "this workspace was abandoned and work was recorded in its recovery workspace {}; continue there with `rustrace work ASSIGNMENT.rta --workspace '{}'`",
+            directory.display(),
+            directory.display()
+        )
+        .into()
+    };
+    // Only this original's own close marker (from an interrupted reclaim) may
+    // already be there; any other marker means the copy moved on.
+    let closed = directory.join(".rustrace/abandoned.json").try_exists()?;
+    if closed {
+        let marker: serde_json::Value = serde_json::from_slice(
+            &recovery
+                .read_artifact("abandoned.json", METADATA_LIMIT)
+                .map_err(|e| unusable(&e))?,
+        )
+        .map_err(|e| unusable(&e))?;
+        // Our own marker names this original, or a path it has since left.
+        let ours = marker["decision"].as_str() == Some("reclaimed_by_original")
+            && marker["original_directory"]
+                .as_str()
+                .is_some_and(|recorded| {
+                    fs::canonicalize(recorded).map_or(true, |recorded| recorded == root)
+                });
+        if !ours {
+            return Err(format!(
+                "this workspace was abandoned and its recovery workspace {} was itself closed or abandoned; run `rustrace work ASSIGNMENT.rta --workspace '{}' --inspect` to find the linked workspace to continue in",
+                directory.display(),
+                directory.display()
+            )
+            .into());
+        }
+    }
+    let mut journal =
+        Journal::open_read_only_no_follow(recovery.display_path()).map_err(|e| unusable(&e))?;
+    let mut next = 1;
+    loop {
+        let events = journal
+            .read_events(&recovery_metadata.session_id, next, 1024)
+            .map_err(|e| unusable(&e))?;
+        let Some(last) = events.last() else {
+            break;
+        };
+        next = last.sequence + 1;
+        if events.iter().any(|envelope| records_work(&envelope.event)) {
+            return Err(continue_there());
+        }
+    }
+    // Edits made outside Rustrace leave no events; the files must still be
+    // the starter.
+    let files = read_pinned_workspace(&pinned).map_err(|error| -> Box<dyn std::error::Error> {
+        format!(
+            "this workspace was abandoned and its recovery workspace {} has files Rustrace cannot check ({error}); continue there with `rustrace work ASSIGNMENT.rta --workspace '{}'`",
+            directory.display(),
+            directory.display()
+        )
+        .into()
+    })?;
+    if hash_entries(files.iter().map(|(path, bytes)| (path, bytes.as_slice())))?
+        != recovery_metadata.starter_hash
+    {
+        return Err(continue_there());
+    }
+    Ok(AbandonedReclaim {
+        recovery: Some((recovery, directory)),
+        replace_marker: closed,
+        root,
+    })
+}
+
+/// A recovery renamed beside its original, found by its binding to the
+/// abandonment record. The scan is bounded.
+fn find_bound_recovery(root: &Path, binding: Hash) -> Option<PathBuf> {
+    let parent = root.parent()?;
+    fs::read_dir(parent)
+        .ok()?
+        .take(4096)
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path != root && path.join(".rustrace/session.json").is_file())
+        .find(|path| {
+            read_initial_metadata(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<SessionMetadata>(&bytes).ok())
+                .is_some_and(|metadata| metadata.parent_evidence == Some(binding))
+        })
+}
+
+/// Whether a recovery session's event changed files, ran commands or made a
+/// decision; viewing, moving the caret and copying are not work.
+fn records_work(event: &Event) -> bool {
+    match event {
+        Event::SessionStarted(_)
+        | Event::SessionResumed(_)
+        | Event::SessionEnded(_)
+        | Event::FileFocused(_)
+        | Event::SelectionChanged(_)
+        | Event::ViewportChanged(_)
+        | Event::ClipboardCopied(_)
+        | Event::PasteRejected(_)
+        | Event::LspCompletionRequested(_)
+        | Event::WorkspaceCheckpoint(_) => false,
+        Event::RecoveryRecorded(recorded) => {
+            recorded.decision != RecoveryDecision::AbandonPreserved
+        }
+        _ => true,
+    }
+}
+
+fn finish_reclaim(owner: &PinnedJournalFile, reclaim: AbandonedReclaim) -> Result<()> {
+    let original = &reclaim.root;
+    if let Some((recovery, _)) = &reclaim.recovery {
+        let marker = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "decision": "reclaimed_by_original",
+            "meaning": "the original workspace resumed; this unused recovery copy is closed",
+            "original_directory": original.display().to_string(),
+        }))?;
+        recovery.publish_artifact("abandoned.json", &marker, reclaim.replace_marker)?;
+    }
+    // Keep the abandonment record as an unjournaled trace, like the original.
+    let mut index = 1;
+    while owner
+        .display_path()
+        .parent()
+        .ok_or("state directory missing")?
+        .join(format!("abandoned-reclaimed-{index}.json"))
+        .try_exists()?
+    {
+        index += 1;
+    }
+    owner.rename_artifact(
+        "abandoned.json",
+        &format!("abandoned-reclaimed-{index}.json"),
+    )?;
+    Ok(())
+}
+
 fn read_initial_metadata(root: &Path) -> Result<Vec<u8>> {
     let pinned = PinnedWorkspaceRoot::open(root)?;
     let mut options = OpenOptions::new();

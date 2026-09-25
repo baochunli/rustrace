@@ -31,7 +31,9 @@ fn inspection_contents(bytes: &[u8]) -> String {
 }
 
 pub fn run_work(args: &[String], output: &mut impl Write) -> Result<()> {
-    let package = args.first().ok_or("Usage: rustrace work assignment.rta [--workspace DIR] [--resume|--restore-logical|--inspect|--abandon]")?;
+    let package = args
+        .first()
+        .ok_or("Usage: rustrace work assignment.rta [--workspace DIR] [--resume|--inspect]")?;
     let package = PathBuf::from(package);
     let mut root = package.with_extension("work");
     let mut choice = None;
@@ -42,9 +44,7 @@ pub fn run_work(args: &[String], output: &mut impl Write) -> Result<()> {
                 index += 1;
                 root = PathBuf::from(args.get(index).ok_or("--workspace requires a directory")?);
             }
-            value @ ("--resume" | "--restore-logical" | "--inspect" | "--abandon")
-                if choice.is_none() =>
-            {
+            value @ ("--resume" | "--inspect") if choice.is_none() => {
                 choice = Some(value.to_owned());
             }
             _ => return Err("invalid work option or multiple recovery choices".into()),
@@ -102,7 +102,7 @@ pub fn run_work(args: &[String], output: &mut impl Write) -> Result<()> {
                 crate::session::verify_available_manifest(&evidence, &manifest_bytes)?;
                 writeln!(
                     output,
-                    "Incomplete startup or invalid session metadata at {}: {}. Original preserved; session identity is unknown. Use --inspect for available evidence or --abandon for linked fresh work; Resume/Restore cannot initialize this original.",
+                    "Incomplete startup or invalid session metadata at {}: {}. Original preserved; session identity is unknown. Use --inspect for available evidence; resume cannot initialize this original, so to keep working, start a new workspace with `rustrace work ASSIGNMENT.rta --workspace NEW.work` and tell your course staff; this workspace stays preserved for inspection.",
                     display::label_fmt(format_args!("{}", root.display()), 4096),
                     display::label_fmt(format_args!("{error}"), 4096)
                 )?;
@@ -138,7 +138,7 @@ pub fn run_work(args: &[String], output: &mut impl Write) -> Result<()> {
                 let evidence = ProductionSession::inspect_preserved(&root)?;
                 writeln!(
                     output,
-                    "Startup/journal validation failed: {}. Saved/logical views are unavailable. Original preserved; use --abandon for linked fresh work. Available evidence:\n{}",
+                    "Startup/journal validation failed: {}. Saved/logical views are unavailable. Original preserved; to keep working, start a new workspace with `rustrace work ASSIGNMENT.rta --workspace NEW.work` and tell your course staff; this workspace stays preserved for inspection. Available evidence:\n{}",
                     display::label_fmt(format_args!("{error}"), 4096),
                     display::json_preview(&evidence)?
                 )?;
@@ -175,54 +175,25 @@ pub fn run_work(args: &[String], output: &mut impl Write) -> Result<()> {
             &root,
             extracted.test_cases.as_ref(),
         )?);
-    } else if choice.as_deref() != Some("--abandon")
-        && incomplete.is_none()
+    } else if incomplete.is_none()
         && let Some(suite) = extracted.test_cases.as_ref()
     {
         deploy_test_case_suite(&root, suite)?;
     }
-    let mut session = if choice.as_deref() == Some("--abandon") {
-        let fresh = unique_sibling(&root, "recovery")?;
-        let session =
-            ProductionSession::abandon_with(&root, &manifest_bytes, test_case_suite_hash, || {
-                let fresh_assignment = extract_package(&package, &fresh)?;
-                if fresh_assignment.manifest_bytes != manifest_bytes
-                    || hash_workspace(&fresh)? != starter_hash
-                    || fresh_assignment.test_cases.as_ref().map(|suite| suite.hash)
-                        != test_case_suite_hash
-                {
-                    return Err(
-                        "selected package changed during recovery extraction; original preserved"
-                            .into(),
-                    );
-                }
-                Ok(fresh.clone())
-            })?;
-        writeln!(
-            output,
-            "Original preserved at {}; linked recovery workspace: {}",
-            display::label_fmt(format_args!("{}", root.display()), 4096),
-            display::label_fmt(format_args!("{}", fresh.display()), 4096)
-        )?;
-        session
-    } else if exists {
+    let mut session = if exists {
         if incomplete.is_some() {
-            return Err("incomplete startup cannot Resume/Restore; original preserved. Use --inspect or --abandon to start explicitly linked fresh work".into());
+            return Err("incomplete startup cannot resume; original preserved. To keep working, start a new workspace with `rustrace work ASSIGNMENT.rta --workspace NEW.work` and tell your course staff; this workspace stays preserved for inspection".into());
         }
         ProductionSession::resume_selected_assignment(
             &root,
             &manifest_bytes,
             test_case_suite_hash,
-            if choice.as_deref() == Some("--restore-logical") {
-                ResumeChoice::RestoreLogical
-            } else {
-                ResumeChoice::Resume
-            },
-        ).map_err(|error| format!("startup/session cannot resume: {error}; original preserved. Use --inspect or --abandon for linked fresh work"))?
+            ResumeChoice::Resume,
+        ).map_err(|error| format!("startup/session cannot resume: {error}; original preserved. Your code and recorded history are intact: fix the cause above and run the same command again; --inspect shows the preserved views. If it still cannot resume, start a new workspace with `rustrace work ASSIGNMENT.rta --workspace NEW.work` and tell your course staff; this workspace stays preserved for inspection"))?
     } else {
         ProductionSession::start_from_assignment(&root, &extracted)?
     };
-    let started_from_package = !exists || choice.as_deref() == Some("--abandon");
+    let started_from_package = !exists;
     let identity_matches = if started_from_package {
         session.metadata().starter_hash == starter_hash
             && session.metadata().test_case_suite_hash == test_case_suite_hash
