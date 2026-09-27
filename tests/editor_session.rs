@@ -1193,13 +1193,28 @@ fn crossterm_events_map_to_explicit_session_commands_without_duplicate_editing_l
         "Ctrl-/",
         "Ctrl-Tab",
         "Ctrl-BackTab",
-        "Ctrl-W",
         "Ctrl-Q",
     ] {
         assert!(
             EDITOR_KEY_HINTS.contains(binding),
             "missing hint for {binding}"
         );
+    }
+    // Deleting a file has no shortcut; Ctrl-W does nothing in the editor.
+    assert!(!EDITOR_KEY_HINTS.contains("Ctrl-W"));
+    for modifiers in [KeyModifiers::CONTROL, KeyModifiers::SUPER] {
+        for primary in [PrimaryModifier::Control, PrimaryModifier::Command] {
+            assert_eq!(
+                session_input_for_event_with_modifier(
+                    key(KeyCode::Char('w'), modifiers),
+                    12,
+                    false,
+                    primary,
+                ),
+                None,
+                "{modifiers:?} W in {primary:?} mode"
+            );
+        }
     }
 }
 
@@ -1208,7 +1223,6 @@ fn command_mode_maps_super_and_control_shortcuts_to_identical_inputs() {
     let shortcuts = [
         KeyCode::Char(' '),
         KeyCode::Char('q'),
-        KeyCode::Char('w'),
         KeyCode::Char('c'),
         KeyCode::Char('x'),
         KeyCode::Char('v'),
@@ -1254,7 +1268,6 @@ fn command_mode_maps_super_and_control_shortcuts_to_identical_inputs() {
 fn terminal_owned_super_shortcuts_remain_accepted_when_delivered() {
     for (code, expected) in [
         (KeyCode::Char('q'), EditorCommand::RequestQuit),
-        (KeyCode::Char('w'), EditorCommand::CloseActive),
         (KeyCode::Char('a'), EditorCommand::SelectAll),
         (KeyCode::Char('c'), EditorCommand::Copy),
         (KeyCode::Char('x'), EditorCommand::Cut),

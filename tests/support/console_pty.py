@@ -708,8 +708,8 @@ try:
         raise SystemExit(0)
 
     if challenge == "delete-confirmations":
-        # Reset the autosave clock, then dirty the selected file and enter the
-        # console with an input line that Ctrl-W must not consume or execute.
+        # Reset the autosave clock, then enter the console with an input line
+        # that Ctrl-W must neither consume nor turn into a delete.
         send(b"\x13")
         wait_for(
             lambda: len(list((work / ".rustrace").glob("command-*-capture.json"))) == 1
@@ -718,31 +718,42 @@ try:
             )["active"],
             "initial save-triggered Check completion",
         )
-        send(b"Z\x1b[20~Q\x17")
-        wait_screen("Delete main.rs?")
-        assert "> Q" in rendered_screen()
-        assert (work / "main.rs").exists()
+        send(b"\x1b[20~Q\x17")
+        wait_screen("> Q")
+        time.sleep(.3)
+        while read_once(.01):
+            pass
+        screen = rendered_screen()
+        assert "delete file" not in screen and "Delete main.rs?" not in screen, screen
+        assert "> Q" in screen and (work / "main.rs").exists()
 
-        send(b"n")
+        def find_on_screen(text, max_column=80):
+            for row, line in enumerate(rendered_screen().splitlines()):
+                column = line.find(text)
+                if 0 <= column < max_column:
+                    return column + 1, row + 1
+            raise AssertionError(f"{text!r} not on screen\n{rendered_screen()}")
+
+        def open_delete_prompt():
+            column, row = find_on_screen("main.rs", 24)
+            send(f"\x1b[<2;{column};{row}M\x1b[<2;{column};{row}m".encode())
+            wait_screen("delete…")
+            column, row = find_on_screen("delete…")
+            send(f"\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m".encode())
+            wait_screen("type main.rs to delete it")
+
+        # Deleting asks for the exact name; anything else keeps the file.
+        open_delete_prompt()
+        send(b"main\r")
         wait_for(
-            lambda: "Delete main.rs?" not in rendered_screen()
-            and " CONSOLE " in rendered_screen()
-            and "> Q" in rendered_screen(),
-            "cancelled delete restoring console focus and line",
+            lambda: "type main.rs to delete it" not in rendered_screen(),
+            "mistyped name closing the delete prompt",
         )
         assert (work / "main.rs").exists()
 
-        send(b"\x17")
-        wait_screen("Delete main.rs?")
-        assert "> Q" in rendered_screen()
-        send(b"y")
-        wait_for(
-            lambda: "Delete main.rs?" not in rendered_screen()
-            and " CONSOLE " in rendered_screen()
-            and "> Q" in rendered_screen()
-            and not (work / "main.rs").exists(),
-            "confirmed delete restoring console focus and line",
-        )
+        open_delete_prompt()
+        send(b"main.rs\r")
+        wait_for(lambda: not (work / "main.rs").exists(), "typed-name delete")
         assert not (work / "target/console-invocation.json").exists()
 
         metadata = json.loads((work / ".rustrace/session.json").read_bytes())
@@ -766,7 +777,7 @@ try:
         assert proc.returncode == 0, repr(bytes(transcript[-8000:]))
         assert b"TERMINAL_RESTORED_AFTER_COMMAND_REAP" in transcript
         success = True
-        print("80x24 console Ctrl-W delete confirmation precedence passed")
+        print("80x24 console Ctrl-W is inert and file delete requires the typed name")
         raise SystemExit(0)
 
     if challenge == "baseline":

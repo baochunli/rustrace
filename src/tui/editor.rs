@@ -22,7 +22,7 @@ const INDENT_WIDTH: usize = 4;
 
 pub const EDITOR_KEY_HINTS: &str = "Arrows Home End PageUp PageDown | Shift+movement select | Backspace/Delete | F5 previous F6 next\n\
 Edit: Tab indent | Shift-Tab outdent | Ctrl-/ comment | {select-all} | Ctrl-C Ctrl-X Ctrl-V | Ctrl-Z undo Ctrl-Y redo\n\
-Cmd: Ctrl-Space complete | Ctrl-F/F3 find | Ctrl-S save | Ctrl-Tab/Ctrl-BackTab switch | Ctrl-W delete Ctrl-Q quit";
+Cmd: Ctrl-Space complete | Ctrl-F/F3 find | Ctrl-S save | Ctrl-Tab/Ctrl-BackTab switch | Ctrl-Q quit";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EditorCommand {
@@ -1214,7 +1214,6 @@ fn input_for_key(
         let command = match code {
             KeyCode::Char(' ') => return Some(SessionInput::Complete),
             KeyCode::Char('q' | 'Q') => EditorCommand::RequestQuit,
-            KeyCode::Char('w' | 'W') => EditorCommand::CloseActive,
             KeyCode::Char('c' | 'C') => EditorCommand::Copy,
             KeyCode::Char('x' | 'X') => EditorCommand::Cut,
             KeyCode::Char('v' | 'V') => EditorCommand::Paste,

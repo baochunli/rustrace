@@ -304,7 +304,7 @@ def run_suite():
         ("create", [b"\x1bOQ", b"n"]),
         ("rename", [b"\x1bOQ", b"r"]),
         ("tree", [b"\x1bOQ"]),
-        ("confirmation", [b"!", b"\x17"]),
+        ("confirmation", [b"\x1b[<2;4;3M", b"\x1b[<0;5;6M"]),  # typed-name delete prompt
     ]:
         incoming = (b"\x1b[200~source\x1b[201~" if name == "equal-text"
                     else b"\x16" if name == "missing-live-source" else None)
@@ -313,9 +313,7 @@ def run_suite():
         setup = [b"\x01", b"\x18" if cut else b"\x03"]
         if cut:
             setup += [b"\x1a", b"\x19"]
-        setup += [b"\x17"]
-        if cut:
-            setup += [b"y"]
+        setup += [b"\x1b[<2;4;3M", b"\x1b[<0;5;6M", b"a.rs\r"]  # file menu delete, typed name
         setup += [b"\x01"]
         results.append(exercise("cut-flow" if cut else "copy-flow", setup, incoming=b"\x16", internal=True))
     results.append(exercise("p2-separate", [b"!"], p2=True))

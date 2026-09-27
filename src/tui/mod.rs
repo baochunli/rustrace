@@ -52,9 +52,9 @@ pub use terminal::{CrosstermTerminalOperations, TerminalOperations, TerminalSess
 pub(crate) use workspace::FormatterDocumentState;
 pub(crate) use workspace::workspace_input_for_event_with_keyboard_enhancement;
 pub use workspace::{
-    CTRL_W_DELETE_SELECTED_HELP_ENTRY, WorkspaceEffectError, WorkspaceEffects, WorkspaceError,
-    WorkspaceFile, WorkspaceFocus, WorkspaceInput, WorkspaceOutcome, WorkspaceSession,
-    diagnostic_delta_for_event, workspace_input_for_event,
+    DELETE_FILE_HELP_ENTRY, WorkspaceEffectError, WorkspaceEffects, WorkspaceError, WorkspaceFile,
+    WorkspaceFocus, WorkspaceInput, WorkspaceOutcome, WorkspaceSession, diagnostic_delta_for_event,
+    workspace_input_for_event,
 };
 
 pub const MIN_TERMINAL_WIDTH: u16 = 60;
@@ -362,9 +362,9 @@ pub const KEYBIND_ROWS: [&str; 66] = [
     "Alt-Up / Alt-Down      Cargo or live diagnostic previous / next",
     "FILES",
     "Right-click file        file menu",
+    DELETE_FILE_HELP_ENTRY,
     "TABS",
     "Ctrl-Tab / Ctrl-BackTab  next / previous buffer",
-    CTRL_W_DELETE_SELECTED_HELP_ENTRY,
     "F5 / F6                previous / next buffer",
     "COMMANDS",
     "F1                     keybinds",
@@ -494,8 +494,6 @@ pub fn primary_modifier_text_with_ghostty(
                 .replace("alt-", "Option-")
                 .replace("⌘Q", "Ctrl-Q")
                 .replace("⌘q", "Ctrl-Q")
-                .replace("⌘W", "Ctrl-W")
-                .replace("⌘w", "Ctrl-W")
                 .replace("⌘A", "Ctrl-A")
                 .replace("⌘a", "Ctrl-A")
                 .replace("⌘C", "Ctrl-C")
@@ -748,12 +746,15 @@ impl ModeBarKind {
 pub enum FilePromptKind {
     Create,
     Rename,
+    Delete,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FilePromptState {
     kind: FilePromptKind,
     input: String,
+    // The path a delete prompt asks the student to type.
+    target: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -791,7 +792,13 @@ impl FilePromptState {
         Self {
             kind,
             input: input.into(),
+            target: String::new(),
         }
+    }
+
+    pub fn with_target(mut self, target: impl Into<String>) -> Self {
+        self.target = target.into();
+        self
     }
 }
 
@@ -2582,7 +2589,20 @@ where
         let (title, submit) = match prompt.kind {
             FilePromptKind::Create => ("new file", " ↵ create "),
             FilePromptKind::Rename => ("rename file", " ↵ rename "),
+            FilePromptKind::Delete => ("delete file", " ↵ delete "),
         };
+        if prompt.kind == FilePromptKind::Delete {
+            put_text(
+                buffer,
+                inner.x,
+                inner.y + 1,
+                inner.width,
+                &format!("type {} to delete it", display::label(&prompt.target, 4096)),
+                Style::default()
+                    .fg(self.palette.red)
+                    .bg(self.palette.panel_bg),
+            );
+        }
         put_text(
             buffer,
             inner.x,
@@ -2626,7 +2646,7 @@ where
                     .scroll((0, horizontal))
                     .render(field, buffer);
             }
-            FilePromptKind::Rename => {
+            FilePromptKind::Rename | FilePromptKind::Delete => {
                 let input = format!(" {}▏", display::label(&prompt.input, 4096));
                 let horizontal = display_width(&input)
                     .saturating_sub(usize::from(input_area.width))

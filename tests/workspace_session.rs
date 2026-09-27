@@ -20,12 +20,12 @@ use rustrace::diagnostics::DiagnosticSpan;
 use rustrace::editor::{EditorEffectError, EditorEffects, EditorTransaction, Movement, Viewport};
 use rustrace::tui::theme::Palette;
 use rustrace::tui::{
-    BufferTabViewEntry, CTRL_W_DELETE_SELECTED_HELP_ENTRY, DiagnosticLineMarker,
-    DiagnosticMarkerKind, DrawGate, EditorCommand, EditorOutcome, JournalHealth, MainLayout,
-    MainView, MainViewState, MouseState, OutputRow, RecordingState, ShellInput, ShellState,
-    WorkspaceEffectError, WorkspaceEffects, WorkspaceError, WorkspaceFocus, WorkspaceInput,
-    WorkspaceOutcome, WorkspaceSession, diagnostic_delta_for_event, main_layout,
-    mouse_input_for_event, workspace_input_for_event as workspace_input_for_event_with_modifier,
+    BufferTabViewEntry, DELETE_FILE_HELP_ENTRY, DiagnosticLineMarker, DiagnosticMarkerKind,
+    DrawGate, EditorCommand, EditorOutcome, JournalHealth, MainLayout, MainView, MainViewState,
+    MouseState, OutputRow, RecordingState, ShellInput, ShellState, WorkspaceEffectError,
+    WorkspaceEffects, WorkspaceError, WorkspaceFocus, WorkspaceInput, WorkspaceOutcome,
+    WorkspaceSession, diagnostic_delta_for_event, main_layout, mouse_input_for_event,
+    workspace_input_for_event as workspace_input_for_event_with_modifier,
 };
 use rustrace_journal::{CheckpointFile, CheckpointSnapshot, OpenDocument, StoredCheckpoint};
 use rustrace_model::assignment::AssignmentManifest;
@@ -591,8 +591,15 @@ fn deleting_active_manifest_skips_the_controller_managed_lockfile() {
         .cloned()
         .unwrap();
 
+    // Even a saved file waits for confirmation; nothing leaves disk before it.
     assert_eq!(
         workspace.request_delete_selected().unwrap(),
+        WorkspaceOutcome::ConfirmationRequired
+    );
+    assert!(workspace.delete_confirmation_pending());
+    assert!(temp.path().join("Cargo.toml").exists());
+    assert_eq!(
+        workspace.confirm_delete().unwrap(),
         WorkspaceOutcome::FileDeleted
     );
     assert_eq!(workspace.active_path(), &path("src/lib.rs"));
@@ -1188,6 +1195,10 @@ fn lifecycle_events_replay_to_exact_live_filesystem_and_hash() {
     workspace.rename_selected("src/renamed.rs").unwrap();
     assert_eq!(
         workspace.request_delete_selected().unwrap(),
+        WorkspaceOutcome::ConfirmationRequired
+    );
+    assert_eq!(
+        workspace.confirm_delete().unwrap(),
         WorkspaceOutcome::FileDeleted
     );
 
@@ -1797,7 +1808,9 @@ fn lifecycle_recording_failures_poison_create_rename_and_delete_before_mutation(
         let result = match operation {
             "create" => workspace.create_file("src/new.rs"),
             "rename" => workspace.rename_selected("src/renamed.rs"),
-            "delete" => workspace.request_delete_selected(),
+            "delete" => workspace
+                .request_delete_selected()
+                .and_then(|_| workspace.confirm_delete()),
             _ => unreachable!(),
         };
 
@@ -2354,15 +2367,12 @@ fn file_management_is_mouse_only_while_primary_w_stays_global() {
                     WorkspaceFocus::Editor,
                     false,
                 ),
-                Some(
-                    WorkspaceInput::BeginCreate
-                        | WorkspaceInput::BeginRename
-                        | WorkspaceInput::DeleteSelected
-                )
+                Some(WorkspaceInput::BeginCreate | WorkspaceInput::BeginRename)
             ),
             "{code:?} retained a file-panel management route"
         );
     }
+    // Deleting has no shortcut: Ctrl-W, which closes a tab in most editors, is inert.
     assert_eq!(
         workspace_input_for_event(
             key(KeyCode::Char('w'), KeyModifiers::CONTROL),
@@ -2370,14 +2380,15 @@ fn file_management_is_mouse_only_while_primary_w_stays_global() {
             WorkspaceFocus::Editor,
             false,
         ),
-        Some(WorkspaceInput::DeleteSelected)
+        None
     );
+    assert!(rustrace::tui::KEYBIND_ROWS.contains(&DELETE_FILE_HELP_ENTRY));
+    assert!(DELETE_FILE_HELP_ENTRY.contains("type its name"));
     assert!(
-        rustrace::tui::KEYBIND_ROWS.contains(&CTRL_W_DELETE_SELECTED_HELP_ENTRY),
-        "Ctrl-W's destructive routing must use its selected-file confirmation help entry"
+        !rustrace::tui::KEYBIND_ROWS
+            .iter()
+            .any(|row| row.starts_with("Ctrl-W"))
     );
-    assert!(CTRL_W_DELETE_SELECTED_HELP_ENTRY.contains("delete selected file"));
-    assert!(CTRL_W_DELETE_SELECTED_HELP_ENTRY.contains("confirm"));
     assert!(rustrace::tui::KEYBIND_ROWS.contains(&"Right-click file        file menu"));
     for removed in [
         "F2 / Esc               focus files / return",
@@ -2419,7 +2430,7 @@ fn console_focus_keeps_global_quit_and_delete_but_does_not_edit_the_workspace() 
             WorkspaceFocus::Console,
             false,
         ),
-        Some(WorkspaceInput::DeleteSelected),
+        None,
     );
     assert_eq!(
         workspace_input_for_event(
@@ -2479,8 +2490,8 @@ fn workspace_command_mode_keeps_control_aliases_and_routes_super_globally() {
                 false,
                 PrimaryModifier::Command,
             ),
-            Some(WorkspaceInput::DeleteSelected),
-            "exact Super-W was not global for {focus:?}",
+            None,
+            "Super-W must not delete from {focus:?}",
         );
     }
 }
@@ -2552,10 +2563,9 @@ fn mixed_modifiers_preserve_legacy_global_and_workspace_routes() {
         );
     }
 
-    let delete = Some(WorkspaceInput::DeleteSelected);
-    let close = Some(WorkspaceInput::Editor(
-        rustrace::tui::SessionInput::Command(EditorCommand::CloseActive),
-    ));
+    // No Control-W or Super-W form reaches deletion or closing.
+    let delete = None;
+    let close = None;
     for primary_modifier in [PrimaryModifier::Control, PrimaryModifier::Command] {
         assert_eq!(
             workspace_input_for_event_with_modifier(
@@ -2580,7 +2590,7 @@ fn mixed_modifiers_preserve_legacy_global_and_workspace_routes() {
                     primary_modifier,
                 ),
                 close,
-                "mixed Control-W must retain the base editor CloseActive route",
+                "mixed Control-W must stay inert",
             );
         }
     }
@@ -2593,7 +2603,7 @@ fn mixed_modifiers_preserve_legacy_global_and_workspace_routes() {
             PrimaryModifier::Command,
         ),
         delete,
-        "exact Super-W must match exact Control-W",
+        "exact Super-W must stay inert",
     );
 }
 

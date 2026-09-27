@@ -2300,6 +2300,10 @@ impl ProductionSession {
         let outcome = self.workspace.rename_selected(path)?;
         self.finish_lifecycle(outcome)
     }
+    pub fn check_delete_selected(&self) -> Result<()> {
+        self.require_command_idle()?;
+        Ok(self.workspace.check_delete_selected()?)
+    }
     pub fn delete_selected(&mut self) -> Result<crate::tui::WorkspaceOutcome> {
         self.require_command_idle()?;
         self.recheck_external()?;
@@ -3692,7 +3696,11 @@ format = ["cargo", "fmt"]
                     session.rename_selected("renamed.rs").unwrap();
                 }
                 "delete" => {
+                    // Every delete, even of a saved file, waits for confirmation.
                     session.delete_selected().unwrap();
+                    assert!(session.workspace.delete_confirmation_pending());
+                    assert!(dir.0.join("other.rs").exists());
+                    session.confirm_delete().unwrap();
                 }
                 "confirm" => {
                     assert!(session.workspace.delete_confirmation_pending());
