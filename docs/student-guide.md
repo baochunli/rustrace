@@ -688,7 +688,7 @@ Left and Right or Up and Down choose, Enter activates, and Esc closes.
 | Menu row | Action |
 | --- | --- |
 | Check | Check saved files |
-| Run | Run the program |
+| Run | Open the console and run `cargo run` there |
 | Clippy | Run Clippy |
 | Format | Format files |
 | Doc | Build documentation |
@@ -710,17 +710,19 @@ to visit the diagnostics in your source. Output rows have no `stdout:` or
 a stream cue. The command result, not the row color alone, determines whether
 the action succeeded.
 
-Choosing Check, Run, Clippy, Format, Doc, or Update dependencies while the
-console is showing switches back to the output pane and returns keyboard focus
-to the editor. If a console command already owns the runner, the new action is
-skipped with the existing busy toast, but the view still switches. F9 reopens
-the console with its prior output, input, and resized height intact.
+Choosing Check, Clippy, Format, Doc, or Update dependencies while the console
+is showing switches back to the output pane and returns keyboard focus to the
+editor. Run instead opens the console, focuses it, and starts `cargo run` there
+exactly as if you had typed it, so your program reads standard input from the
+console prompt and Ctrl-C or Esc stops it. If a command already owns the
+runner, the new action is skipped with the existing busy toast, but the view
+still switches. F9 reopens the console with its prior output, input, and
+resized height intact.
 
 Compiling commands use your saved files and may download dependencies, but
 `--locked` makes them fail instead of changing `Cargo.lock`. Downloaded
 dependencies and their build scripts execute on your machine under the retained
-Cargo configuration. Run here has closed standard input, so use the console for
-programs that read input. Format runs rustfmt on a copy of your files. Manage
+Cargo configuration. Format runs rustfmt on a copy of your files. Manage
 dependencies by typing `cargo add` or `cargo remove` in the console. Those
 commands and the menu's Update dependencies action run Cargo on a copy and apply
 only the resulting `Cargo.toml` and `Cargo.lock` changes as recorded edits. Doc
@@ -861,7 +863,7 @@ parallel. Each case may run for at most 10 seconds, including the `cargo run`
 build, so a program that hangs fails that case with a deadline ERROR and Run
 all moves on. During a run the mode bar reads `esc/ctrl-c cancel`: Esc or
 Ctrl-C cancels the active run and the rest of the queue; F1, F7, and F9 wait
-until that sequence finishes. Menu commands show the same hint while they run. If the picker was opened over
+until that sequence finishes. Menu commands other than Run show the same hint while they run. If the picker was opened over
 the Console view, closing its final reopened modal restores that view. A
 selected case uses the same prepared, policy-checked, limited, and recorded
 Cargo action as typing `cargo run < NAME.in` in the console, apart from its
