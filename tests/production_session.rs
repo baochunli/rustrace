@@ -1169,6 +1169,8 @@ fn production_lifecycle_barriers_resume_without_false_divergence_or_reused_ids()
     session.create_file("new.rs").unwrap();
     let created = session.workspace().active_document_id().clone();
     session.delete_selected().unwrap();
+    session.confirm_delete().unwrap();
+    assert!(!dir.0.join("new.rs").exists());
     session.quit().unwrap();
     let mut resumed = ProductionSession::resume(&dir.0, manifest(), ResumeChoice::Resume).unwrap();
     assert_eq!(fs::read(dir.0.join("main.rs")).unwrap(), b"BA");

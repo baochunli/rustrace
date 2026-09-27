@@ -2583,7 +2583,10 @@ fn apply_path_prompt_action(
             let result = match prompt.operation {
                 PathOperation::Create => session.create_file(&path),
                 PathOperation::Rename => session.rename_selected(&path),
-                PathOperation::Delete if path != prompt.target => {
+                PathOperation::Delete
+                    if path != prompt.target
+                        || session.workspace().selected_path().as_str() != prompt.target =>
+                {
                     status.replace(format!(
                         "file not deleted: type {} exactly to delete it",
                         prompt.target

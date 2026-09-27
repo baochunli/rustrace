@@ -2300,8 +2300,9 @@ impl ProductionSession {
         let outcome = self.workspace.rename_selected(path)?;
         self.finish_lifecycle(outcome)
     }
-    pub fn check_delete_selected(&self) -> Result<()> {
+    pub fn check_delete_selected(&mut self) -> Result<()> {
         self.require_command_idle()?;
+        self.recheck_external()?;
         Ok(self.workspace.check_delete_selected()?)
     }
     pub fn delete_selected(&mut self) -> Result<crate::tui::WorkspaceOutcome> {

@@ -218,12 +218,13 @@ with tempfile.TemporaryDirectory(prefix="rustrace-files-menu-pty-") as root:
             f"\x1b[<0;{delete_column + 1};{delete_row + 1}M".encode(),
         )
         wait_for(
-            lambda: "Delete src/b.rs?" in "\n".join("".join(row) for row in rendered_screen(transcript)),
+            lambda: "type src/b.rs to delete it" in "\n".join("".join(row) for row in rendered_screen(transcript)),
             master,
             transcript,
-            "delete menu entry did not open the existing confirmation",
+            "delete menu entry did not ask for the file's name",
         )
-        os.write(master, b"\r")
+        # One write keeps the typed name inside b.rs's autosave window.
+        os.write(master, b"src/b.rs\r")
         deleted = os.path.join(root, "assignment.work", "src", "b.rs")
         wait_for(
             lambda: not os.path.exists(deleted),
