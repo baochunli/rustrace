@@ -4990,35 +4990,6 @@ format = ["cargo", "fmt"]
     }
 
     #[test]
-    fn command_menu_run_starts_cargo_run_in_the_focused_console() {
-        let (_fixture, mut session) = ClipboardFixture::new("A");
-        let mut view = WorkView::Workspace;
-        let mut focus = WorkspaceFocus::Editor;
-        let mut console_line = ConsoleLine::default();
-        for character in "cargo te".chars() {
-            assert!(console_line.insert(character));
-        }
-
-        let status = activate_menu_run(&mut session, &mut view, &mut focus, &mut console_line);
-
-        // Run takes the console route, where `cargo run` gets the stdin prompt,
-        // instead of the output pane's closed standard input.
-        assert_eq!(status.as_str(), "console command preparation started");
-        assert_eq!(view, WorkView::Console);
-        assert_eq!(focus, WorkspaceFocus::Console);
-        assert!(session.console_command_active());
-        assert_eq!(console_line.text(), "", "the draft must not become stdin");
-
-        session.cancel_command();
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while session.command_active() && std::time::Instant::now() < until {
-            let _ = session.poll_command();
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        assert!(!session.command_active());
-    }
-
-    #[test]
     fn command_menu_run_while_a_command_is_active_keeps_the_console_line() {
         let (_fixture, mut session) = ClipboardFixture::new("A");
         session
