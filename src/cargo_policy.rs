@@ -346,9 +346,10 @@ fn prepare_inner(
         .env("CARGO_ENCODED_RUSTFLAGS", "")
         .env("CARGO_ENCODED_RUSTDOCFLAGS", "")
         .env("CARGO_TARGET_DIR", workspace.join("target"))
-        // Cargo template-expands this setting before resolving it against cwd.
-        // Keep literal braces in the workspace path out of that template.
-        .env("CARGO_BUILD_BUILD_DIR", "target")
+        .env(
+            "CARGO_BUILD_BUILD_DIR",
+            build_dir_from(workspace, workspace)?,
+        )
         .env("CARGO_TERM_COLOR", "never")
         .env("CARGO_TERM_PROGRESS_WHEN", "never");
     if action.is_dependency() {
@@ -441,6 +442,67 @@ pub(crate) fn validate_command(
     allowed
         .then_some(deny_warnings)
         .ok_or(PreparationError::UnsupportedCommand)
+}
+
+/// `CARGO_BUILD_BUILD_DIR` for a command run from `working_directory`: always
+/// `WORKSPACE/target`, spelled relative to the working directory.
+///
+/// Cargo substitutes `{workspace-root}`, `{cargo-cache-home}`, and
+/// `{workspace-path-hash}` in `build.build-dir` and then refuses any brace
+/// left in the result, including braces inside a substituted or absolute
+/// workspace path (Cargo 1.98.1 reports "unexpected variable"). A relative
+/// spelling never includes the workspace's ancestors. From the workspace it
+/// is exactly `target`, as for every command before format 3; from a format
+/// 3 fixture folder it is `../../WORKSPACE_NAME/target`, and format 3 refuses
+/// workspace names containing braces. Both paths must be absolute and
+/// normalized.
+pub fn build_dir_from(
+    workspace: &Path,
+    working_directory: &Path,
+) -> Result<PathBuf, PreparationError> {
+    validate_path(workspace)?;
+    validate_path(working_directory)?;
+    let workspace = workspace.components().collect::<Vec<_>>();
+    let working_directory = working_directory.components().collect::<Vec<_>>();
+    let common = workspace
+        .iter()
+        .zip(&working_directory)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut relative = PathBuf::new();
+    for _ in common..working_directory.len() {
+        relative.push("..");
+    }
+    for component in &workspace[common..] {
+        relative.push(component.as_os_str());
+    }
+    relative.push("target");
+    let spelled = relative.to_str().ok_or(PreparationError::InvalidPath)?;
+    if spelled.contains(['{', '}']) {
+        return Err(PreparationError::InvalidPath);
+    }
+    Ok(relative)
+}
+
+impl PreparedCargoCommand {
+    /// Runs a prepared console Run from `directory` (a format 3 fixture
+    /// folder) while Cargo still builds `workspace` into `WORKSPACE/target`.
+    /// It appends `--manifest-path WORKSPACE/Cargo.toml` after `--locked`,
+    /// so call it before appending any `-- ARG...`, and it keeps the build
+    /// directory independent of `directory`.
+    pub fn run_from_directory(
+        &mut self,
+        workspace: &Path,
+        directory: &Path,
+    ) -> Result<(), PreparationError> {
+        let build_dir = build_dir_from(workspace, directory)?;
+        self.command
+            .current_dir(directory)
+            .env("CARGO_BUILD_BUILD_DIR", build_dir)
+            .arg("--manifest-path")
+            .arg(workspace.join("Cargo.toml"));
+        Ok(())
+    }
 }
 
 fn validate_path(path: &Path) -> Result<(), PreparationError> {

@@ -875,3 +875,243 @@ fn locked_compile_failure_never_changes_lockfile_bytes() {
     assert_eq!(std::fs::read(parent.join("Cargo.lock")).unwrap(), lock);
     std::fs::remove_dir_all(parent).unwrap();
 }
+
+#[test]
+fn build_dir_is_the_workspace_target_spelled_from_the_working_directory() {
+    use rustrace::cargo_policy::build_dir_from;
+    let workspace = PathBuf::from("/course/{term}/lab2.work");
+    assert_eq!(
+        build_dir_from(&workspace, &workspace).unwrap(),
+        PathBuf::from("target"),
+        "commands run in the workspace keep the historical `target`"
+    );
+    assert_eq!(
+        build_dir_from(
+            &workspace,
+            &PathBuf::from("/course/{term}/lab2.test-cases/files")
+        )
+        .unwrap(),
+        PathBuf::from("../../lab2.work/target"),
+        "braces in shared ancestors never reach Cargo's template"
+    );
+    assert_eq!(
+        build_dir_from(&workspace, &PathBuf::from("/course/{term}/lab2.work/src")).unwrap(),
+        PathBuf::from("../target")
+    );
+    for (workspace, directory) in [
+        ("/course/lab{2}.work", "/course/lab2.test-cases/files"),
+        ("course/lab2.work", "/course/lab2.test-cases/files"),
+        ("/course/lab2.work", "course/lab2.test-cases/files"),
+        ("/course/../lab2.work", "/course/lab2.test-cases/files"),
+    ] {
+        assert!(
+            build_dir_from(&PathBuf::from(workspace), &PathBuf::from(directory)).is_err(),
+            "{workspace} from {directory}"
+        );
+    }
+
+    // Every prepared action keeps the exact format 2 environment value.
+    let workspace = PathBuf::from("/workspace");
+    for (action, subcommand) in [
+        (CargoAction::Check, "check"),
+        (CargoAction::Test, "test"),
+        (CargoAction::Run, "run"),
+        (CargoAction::Clippy, "clippy"),
+        (CargoAction::Doc, "doc"),
+        (CargoAction::Format, "fmt"),
+    ] {
+        let prepared =
+            prepare(action, &argv(&["cargo", subcommand]), &tools(), &workspace).unwrap();
+        let build_dir = prepared
+            .command
+            .get_envs()
+            .find(|(name, _)| *name == "CARGO_BUILD_BUILD_DIR")
+            .and_then(|(_, value)| value);
+        assert_eq!(
+            build_dir,
+            Some(std::ffi::OsStr::new("target")),
+            "{action:?}"
+        );
+        assert_eq!(
+            prepared.command.get_current_dir(),
+            Some(workspace.as_path())
+        );
+    }
+    let request = parse_console_command("cargo run").unwrap();
+    let mut prepared = prepare_console(&request, &tools(), &workspace).unwrap();
+    let fixtures = PathBuf::from("/workspace.test-cases/files");
+    prepared.run_from_directory(&workspace, &fixtures).unwrap();
+    assert_eq!(prepared.command.get_current_dir(), Some(fixtures.as_path()));
+    let args = prepared
+        .command
+        .get_args()
+        .map(|arg| arg.to_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        args[args.len() - 3..],
+        ["--locked", "--manifest-path", "/workspace/Cargo.toml"]
+    );
+    assert!(prepared.command.get_envs().any(|(name, value)| {
+        name == "CARGO_BUILD_BUILD_DIR"
+            && value == Some(std::ffi::OsStr::new("../../workspace/target"))
+    }));
+}
+
+/// Resolves installed tools for the selected toolchain, as the session does.
+fn installed_tools(root: &std::path::Path) -> ResolvedTools {
+    let pin = std::env::var("RUSTUP_TOOLCHAIN")
+        .expect("run contributor tests through installed rustup Cargo");
+    let report = rustrace::toolchain::discover(root, Some(&pin));
+    assert!(
+        !report.has_blockers(),
+        "required installed tools unavailable"
+    );
+    let rustup = PathBuf::from(&report.probes[0].argv[0]);
+    let selection = report.selected_toolchain.unwrap();
+    let resolve = |name: &str| {
+        let mut command = Command::new(&rustup);
+        rustrace::cargo_policy::retain_execution_environment(&mut command);
+        let output = command
+            .args(["which", "--toolchain", &selection, name])
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .env("RUSTUP_TOOLCHAIN", &selection)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "installed {name} is required");
+        PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+    };
+    ResolvedTools {
+        cargo: resolve("cargo"),
+        rustc: resolve("rustc"),
+        rustdoc: resolve("rustdoc"),
+        cargo_clippy: None,
+        formatter: None,
+        rustup,
+        selection,
+    }
+}
+
+/// A copied controlled package whose program prints its working directory.
+fn cwd_printing_workspace(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir(root.join(".cargo")).unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cargo-policy");
+    for name in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "src/lib.rs",
+        ".cargo/config.toml",
+    ] {
+        std::fs::copy(fixture.join(name), root.join(name)).unwrap();
+    }
+    std::fs::write(
+        root.join("src/main.rs"),
+        "fn main() { println!(\"{}\", std::env::current_dir().unwrap().display()); }\n",
+    )
+    .unwrap();
+}
+
+/// Cargo 1.98.1: a Run from a format 3 fixture folder builds into
+/// WORKSPACE/target even when an ancestor path contains braces, while the
+/// program runs in the fixture folder and nothing is written there.
+#[test]
+fn fixture_directory_run_builds_into_the_workspace_target() {
+    let base = std::env::temp_dir().join(format!("rustrace-fixture-cwd-{}", std::process::id()));
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(base.clone());
+    let parent = base.join("{course}");
+    std::fs::create_dir_all(&parent).unwrap();
+    let parent = std::fs::canonicalize(parent).unwrap();
+    let workspace = parent.join("lab2.work");
+    cwd_printing_workspace(&workspace);
+    let fixtures = parent.join("lab2.test-cases/files");
+    std::fs::create_dir_all(&fixtures).unwrap();
+    std::fs::write(fixtures.join("data.txt"), "fixture\n").unwrap();
+    let selected = installed_tools(&workspace);
+
+    let request = parse_console_command("cargo run").unwrap();
+    let mut prepared = prepare_console(&request, &selected, &workspace).unwrap();
+    prepared.run_from_directory(&workspace, &fixtures).unwrap();
+    let output = prepared.command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim_end(),
+        fixtures.to_str().unwrap(),
+        "the program runs in the fixture folder"
+    );
+    assert!(workspace.join("target/debug").is_dir());
+    let entries = |path: &std::path::Path| {
+        let mut names = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    assert_eq!(entries(&fixtures), ["data.txt"]);
+    assert_eq!(entries(&parent.join("lab2.test-cases")), ["files"]);
+    assert_eq!(entries(&parent), ["lab2.test-cases", "lab2.work"]);
+    assert_eq!(entries(&base), ["{course}"]);
+
+    // A run in the workspace uses the same directories as before.
+    let before = entries(&workspace.join("target"));
+    let mut prepared = prepare_console(&request, &selected, &workspace).unwrap();
+    let output = prepared.command.output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim_end(),
+        workspace.to_str().unwrap()
+    );
+    assert_eq!(entries(&workspace.join("target")), before);
+    assert_eq!(entries(&parent), ["lab2.test-cases", "lab2.work"]);
+}
+
+/// Cargo 1.98.1 refuses the `{workspace-root}` template once the substituted
+/// workspace path itself contains a brace, so Rustrace cannot use it.
+#[test]
+fn cargo_build_dir_template_refuses_braces_in_the_workspace_path() {
+    let base = std::env::temp_dir().join(format!("rustrace-build-template-{}", std::process::id()));
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(base.clone());
+    let workspace = base.join("lab{2}.work");
+    cwd_printing_workspace(&workspace);
+    let workspace = std::fs::canonicalize(workspace).unwrap();
+    let selected = installed_tools(&workspace);
+    let request = parse_console_command("cargo run").unwrap();
+    let mut prepared = prepare_console(&request, &selected, &workspace).unwrap();
+    prepared
+        .command
+        .env("CARGO_BUILD_BUILD_DIR", "{workspace-root}/target");
+    let output = prepared.command.output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unexpected variable"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The relative spelling that Rustrace records builds this workspace.
+    let mut prepared = prepare_console(&request, &selected, &workspace).unwrap();
+    let output = prepared.command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(workspace.join("target/debug").is_dir());
+}
