@@ -101,7 +101,10 @@ fn v2_returns_sorted_complete_cases_without_extracting_them_into_the_workspace()
     let suite = extracted.test_cases.expect("v2 suite");
     assert_eq!(suite.cases.len(), 2);
     assert_eq!(suite.cases[0].name, "a_first");
-    assert_eq!(suite.cases[0].input, b"a-in\n");
+    assert_eq!(suite.cases[0].input.as_deref(), Some(&b"a-in\n"[..]));
+    assert_eq!(suite.cases[0].args_file, None);
+    assert!(suite.cases[0].args.is_empty());
+    assert_eq!(suite.fixtures, None);
     assert_eq!(suite.cases[0].expected, b"a-out\n");
     assert_eq!(suite.cases[1].name, "z-last");
     assert_eq!(suite.total_bytes, 22);
@@ -167,7 +170,7 @@ fn v2_requires_a_nonempty_complete_suite() {
 
         assert!(matches!(
             error,
-            AssignmentPackageError::MissingTestCases
+            AssignmentPackageError::MissingTestCases { format_version: 2 }
                 | AssignmentPackageError::IncompleteTestCase { .. }
         ));
         assert!(error.to_string().contains(expected));
