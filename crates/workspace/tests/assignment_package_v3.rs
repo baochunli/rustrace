@@ -135,6 +135,7 @@ fn format_three_returns_optional_input_parsed_args_and_the_fixture_tree() {
     let extracted = extract(3, search_suite()).expect("valid format 3 package");
     assert_eq!(extracted.manifest.format_version, 3);
     let suite = extracted.test_cases.expect("format 3 suite");
+    assert_eq!(suite.format_version, 3);
     let names = suite
         .cases
         .iter()
@@ -367,6 +368,59 @@ fn format_three_hashes_match_their_documented_encodings_and_goldens() {
 }
 
 #[test]
+fn format_three_rejects_case_names_that_differ_only_in_letter_case() {
+    let error = extract(
+        3,
+        vec![
+            Entry::file("test-cases/Search.expected", "a"),
+            Entry::file("test-cases/search.expected", "b"),
+        ],
+    )
+    .expect_err("case alias");
+    assert!(
+        matches!(
+            &error,
+            AssignmentPackageError::TestCaseNameConflict { name, other }
+                if name == "search" && other == "Search"
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "assignment package test cases `Search` and `search` differ only in letter case"
+    );
+    let error = extract(
+        3,
+        vec![
+            Entry::file("test-cases/A-1.args", "x\n"),
+            Entry::file("test-cases/A-1.expected", ""),
+            Entry::file("test-cases/a-1.in", ""),
+        ],
+    )
+    .expect_err("an alias through another role still merges");
+    assert!(matches!(
+        error,
+        AssignmentPackageError::TestCaseNameConflict { .. }
+    ));
+
+    // Format 2 keeps accepting such names, exactly as before.
+    let suite = extract(
+        2,
+        vec![
+            Entry::file("test-cases/Search.in", ""),
+            Entry::file("test-cases/Search.expected", "a"),
+            Entry::file("test-cases/search.in", ""),
+            Entry::file("test-cases/search.expected", "b"),
+        ],
+    )
+    .expect("format 2 is unchanged")
+    .test_cases
+    .unwrap();
+    assert_eq!(suite.format_version, 2);
+    assert_eq!(suite.cases.len(), 2);
+}
+
+#[test]
 fn format_three_requires_expected_output_for_every_case_and_one_case() {
     for (label, entries, missing) in [
         (
@@ -545,6 +599,45 @@ fn format_three_fixtures_accept_only_canonical_regular_files_and_directories() {
             Entry::file("test-cases/files/a\u{7}.txt", "x"),
         ),
         ("newline", Entry::file("test-cases/files/a\nb", "x")),
+        (
+            "Cargo configuration",
+            Entry::file("test-cases/files/.cargo/config.toml", "x"),
+        ),
+        (
+            "nested Cargo configuration",
+            Entry::file("test-cases/files/src/.cargo/config", "x"),
+        ),
+        (
+            "Cargo directory",
+            Entry::directory("test-cases/files/.cargo/"),
+        ),
+        (
+            "Cargo directory in another letter case",
+            Entry::directory("test-cases/files/.CARGO/"),
+        ),
+        (
+            "Finder metadata",
+            Entry::file("test-cases/files/.DS_Store", "x"),
+        ),
+        (
+            "nested Finder metadata",
+            Entry::file("test-cases/files/src/.DS_Store", "x"),
+        ),
+        (
+            "Windows thumbnails",
+            Entry::file("test-cases/files/Thumbs.db", "x"),
+        ),
+        (
+            "Windows folder settings",
+            Entry::file("test-cases/files/desktop.ini", "x"),
+        ),
+        (
+            "editor temporary",
+            Entry::file(
+                "test-cases/files/.rustrace-editor-0123456789abcdef0123456789abcdef.tmp",
+                "x",
+            ),
+        ),
         ("backslash", Entry::file("test-cases/files/a\\b", "x")),
         ("other directory", Entry::directory("test-cases/data/")),
         (

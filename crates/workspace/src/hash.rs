@@ -2055,10 +2055,15 @@ fn is_excluded_directory(path: &WorkspacePath) -> bool {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_excluded_file(path: &WorkspacePath) -> bool {
     let name = path.as_str().rsplit('/').next().unwrap_or(path.as_str());
+    is_excluded_file_name(name)
+}
+
+/// File names that operating-system file browsers and Rustrace's own editor
+/// create beside real files. Workspace and fixture-tree hashes skip them.
+pub fn is_excluded_file_name(name: &str) -> bool {
     matches!(name, ".DS_Store" | "Thumbs.db" | "desktop.ini") || is_editor_temporary(name)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_editor_temporary(name: &str) -> bool {
     name.strip_prefix(".rustrace-editor-")
         .and_then(|value| value.strip_suffix(".tmp"))

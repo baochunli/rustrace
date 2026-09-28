@@ -23,7 +23,7 @@ use rustrace_model::{
     parse_test_case_args,
 };
 
-use crate::fixture_tree::{FIXTURE_ROOT, FixtureTree, FixtureTreeError, is_fixture_path};
+use crate::fixture_tree::{FIXTURE_ROOT, FixtureTree, FixtureTreeError, fixture_path_problem};
 use crate::hash::{
     MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_FILES, MAX_WORKSPACE_TOTAL_BYTES, PinnedWorkspaceRoot,
 };
@@ -132,6 +132,9 @@ pub struct ExtractedAssignment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedTestCaseSuite {
+    /// The package's `format_version` (2 or 3), which selects where the cases
+    /// are deployed and which files make a case.
+    pub format_version: u32,
     pub cases: Vec<ExtractedTestCase>,
     /// The format 3 `test-cases/files/` tree; always `None` for format 2.
     pub fixtures: Option<FixtureTree>,
@@ -647,6 +650,7 @@ fn extract_supported<R: Read>(
             let cases = complete_test_cases(test_cases)?;
             let hash = hash_test_case_suite(&cases);
             Some(ExtractedTestCaseSuite {
+                format_version: 2,
                 cases,
                 fixtures: None,
                 hash,
@@ -665,6 +669,7 @@ fn extract_supported<R: Read>(
             }
             let hash = hash_test_case_suite_v2(&cases, fixtures.as_ref());
             Some(ExtractedTestCaseSuite {
+                format_version: 3,
                 cases,
                 fixtures,
                 hash,
@@ -819,6 +824,10 @@ pub enum AssignmentPackageError {
     InvalidTestCaseArgs {
         name: String,
         source: TestCaseArgsError,
+    },
+    TestCaseNameConflict {
+        name: String,
+        other: String,
     },
     Fixtures {
         source: FixtureTreeError,
@@ -980,6 +989,10 @@ impl fmt::Display for AssignmentPackageError {
             Self::Fixtures { source } => {
                 write!(formatter, "assignment package test-cases/{source}")
             }
+            Self::TestCaseNameConflict { name, other } => write!(
+                formatter,
+                "assignment package test cases `{other}` and `{name}` differ only in letter case"
+            ),
             Self::WouldOverwrite { path } => write!(
                 formatter,
                 "refusing to overwrite existing extraction path `{}`",
@@ -1266,13 +1279,19 @@ fn classify_entry(
             if let Some(fixture) = relative.strip_prefix("files/") {
                 let fixture = WorkspacePath::new(fixture)
                     .ok()
-                    .filter(is_fixture_path)
+                    .filter(|fixture| {
+                        fixture_path_problem(fixture)
+                            .is_none_or(|reason| !reason.contains("canonical"))
+                    })
                     .ok_or_else(|| {
                         invalid_test_case_path(
                             path,
                             "fixture paths must be canonical NFC workspace paths without control characters",
                         )
                     })?;
+                if let Some(reason) = fixture_path_problem(&fixture) {
+                    return Err(invalid_test_case_path(path, reason));
+                }
                 return Ok(match kind {
                     EntryKind::File => PackageEntry::FixtureFile(fixture),
                     EntryKind::Directory => PackageEntry::FixtureDirectory(fixture),
@@ -1383,6 +1402,17 @@ fn complete_test_cases(
 fn complete_format3_test_cases(
     cases: BTreeMap<String, PartialTestCase>,
 ) -> Result<Vec<ExtractedTestCase>, AssignmentPackageError> {
+    // Case files share one deployed folder; names that differ only in ASCII
+    // letter case would merge on case-insensitive filesystems such as macOS.
+    let mut folded = BTreeMap::<String, &str>::new();
+    for name in cases.keys() {
+        if let Some(other) = folded.insert(name.to_ascii_lowercase(), name) {
+            return Err(AssignmentPackageError::TestCaseNameConflict {
+                name: name.clone(),
+                other: other.to_owned(),
+            });
+        }
+    }
     cases
         .into_iter()
         .map(|(name, case)| {

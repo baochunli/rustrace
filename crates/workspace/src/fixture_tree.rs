@@ -14,7 +14,7 @@ use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::assignment_package::{MAX_TEST_CASE_FILE_BYTES, MAX_TEST_CASE_TOTAL_BYTES};
-use crate::hash::PinnedWorkspaceRoot;
+use crate::hash::{PinnedWorkspaceRoot, is_excluded_file_name};
 
 /// The fixture root's name inside the packaged and deployed `test-cases/`.
 pub const FIXTURE_ROOT: &str = "files";
@@ -217,21 +217,40 @@ impl FixtureTree {
 }
 
 /// Fixture paths are canonical workspace paths without control characters,
-/// short enough to remain canonical below `files/` in the deployed
-/// `test-cases/` directory.
+/// short enough to remain canonical below `files/` in the deployed case
+/// folder. No component may be a `.cargo` directory, which would configure a
+/// Cargo command run from the tree, or a name that file browsers and editors
+/// create (such as `.DS_Store`), which deployed-tree hashing skips.
 pub fn is_fixture_path(path: &WorkspacePath) -> bool {
-    !path.as_str().chars().any(char::is_control)
-        && WorkspacePath::new(format!("{FIXTURE_ROOT}/{}", path.as_str())).is_ok()
+    fixture_path_problem(path).is_none()
+}
+
+/// Why `path` cannot appear in a fixture tree, if it cannot.
+pub(crate) fn fixture_path_problem(path: &WorkspacePath) -> Option<&'static str> {
+    if path.as_str().chars().any(char::is_control)
+        || WorkspacePath::new(format!("{FIXTURE_ROOT}/{}", path.as_str())).is_err()
+    {
+        return Some("has a name that is not a canonical workspace path");
+    }
+    if path
+        .components()
+        .any(|component| component.eq_ignore_ascii_case(".cargo"))
+    {
+        return Some("is a `.cargo` Cargo configuration path");
+    }
+    if path.components().any(is_excluded_file_name) {
+        return Some("has a name that file browsers or editors create");
+    }
+    None
 }
 
 fn require_fixture_path(path: &WorkspacePath) -> Result<(), FixtureTreeError> {
-    if is_fixture_path(path) {
-        Ok(())
-    } else {
-        Err(FixtureTreeError::UnsupportedEntry {
+    match fixture_path_problem(path) {
+        None => Ok(()),
+        Some(reason) => Err(FixtureTreeError::UnsupportedEntry {
             path: path.to_string(),
-            reason: "has a name that is not a canonical workspace path",
-        })
+            reason,
+        }),
     }
 }
 
@@ -347,9 +366,10 @@ mod deployed {
     use rustix::io::Errno;
     use rustrace_model::WorkspacePath;
 
-    use super::{FIXTURE_ROOT, FixtureTree, FixtureTreeError, is_fixture_path};
+    use super::{FIXTURE_ROOT, FixtureTree, FixtureTreeError, fixture_path_problem};
     use crate::assignment_package::MAX_TEST_CASE_FILE_BYTES;
     use crate::hash::PinnedWorkspaceRoot;
+    use crate::hash::is_excluded_file_name;
 
     const DIRECTORY_OPEN_FLAGS: OFlags = OFlags::RDONLY
         .union(OFlags::DIRECTORY)
@@ -427,15 +447,25 @@ mod deployed {
                     reason: "has a name that is not UTF-8",
                 });
             };
-            let path = WorkspacePath::new(display(name))
-                .ok()
-                .filter(is_fixture_path)
-                .ok_or_else(|| FixtureTreeError::UnsupportedEntry {
-                    path: display(name),
-                    reason: "has a name that is not a canonical workspace path",
-                })?;
             let stat = statat(directory, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|error| filesystem("inspect fixture entry", &child_absolute, error))?;
+            // Finder and editors leave these beside real files; like the
+            // workspace hash, the fixture-tree hash ignores them.
+            if file_type(&stat) == FileType::RegularFile && is_excluded_file_name(name) {
+                continue;
+            }
+            let path = WorkspacePath::new(display(name)).map_err(|_| {
+                FixtureTreeError::UnsupportedEntry {
+                    path: display(name),
+                    reason: "has a name that is not a canonical workspace path",
+                }
+            })?;
+            if let Some(reason) = fixture_path_problem(&path) {
+                return Err(FixtureTreeError::UnsupportedEntry {
+                    path: path.to_string(),
+                    reason,
+                });
+            }
             match file_type(&stat) {
                 FileType::Directory => {
                     let child = open_directory(directory, OsStr::from_bytes(raw_name), &stat)

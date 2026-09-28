@@ -133,6 +133,25 @@ fn deployed_tree_hashes_like_the_packaged_tree_and_detects_changes() {
         hash_deployed_fixture_tree(&root).unwrap().unwrap(),
         deployed
     );
+
+    // Opening the folder in Finder or an editor must not break verification.
+    for noise in [
+        "files/.DS_Store",
+        "files/src/.DS_Store",
+        "files/Thumbs.db",
+        "files/desktop.ini",
+        "files/.rustrace-editor-0123456789abcdef0123456789abcdef.tmp",
+    ] {
+        fs::write(cases.join(noise), "noise").unwrap();
+        assert_eq!(
+            hash_deployed_fixture_tree(&root).unwrap().unwrap(),
+            deployed,
+            "{noise}"
+        );
+    }
+    fs::create_dir(cases.join("files/.cargo")).unwrap();
+    let error = read_deployed_fixture_tree(&root).expect_err("Cargo configuration");
+    assert!(error.to_string().contains(".cargo"), "{error}");
 }
 
 #[test]
