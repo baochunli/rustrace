@@ -226,11 +226,21 @@ pub fn run_work(args: &[String], output: &mut impl Write) -> Result<()> {
     crate::work_editor::run_editor(session, &extracted.manifest.title, update_state)
 }
 
-fn preflight_test_case_suite(workspace_root: &Path, suite: &ExtractedTestCaseSuite) -> Result<()> {
+pub(crate) fn preflight_test_case_suite(
+    workspace_root: &Path,
+    suite: &ExtractedTestCaseSuite,
+) -> Result<()> {
     let sibling = test_case_sibling(workspace_root, suite)?;
     let Some(root) = open_existing_test_case_root(&sibling)? else {
         return Ok(());
     };
+    if suite.format_version == 3 {
+        crate::console::CaseFolderMarker::require(
+            &root,
+            &crate::console::case_folder_owner(workspace_root)?,
+            Some(suite.hash),
+        )?;
+    }
     for_each_managed_node(suite, |node| match node {
         ManagedNode::Directory(path) => preflight_test_case_directory(&root, path),
         ManagedNode::File(path, contents) => preflight_test_case_file(&root, path, contents),
@@ -239,7 +249,10 @@ fn preflight_test_case_suite(workspace_root: &Path, suite: &ExtractedTestCaseSui
     Ok(())
 }
 
-fn deploy_test_case_suite(workspace_root: &Path, suite: &ExtractedTestCaseSuite) -> Result<()> {
+pub(crate) fn deploy_test_case_suite(
+    workspace_root: &Path,
+    suite: &ExtractedTestCaseSuite,
+) -> Result<()> {
     deploy_test_case_suite_with(workspace_root, suite, |_index, _path| Ok(()))
 }
 
@@ -256,35 +269,45 @@ fn deploy_test_case_suite_with(
     };
     let mut created = Vec::<CreatedNode>::new();
     let mut managed_node_index = 0;
-    let deployment = for_each_managed_node(suite, |node| {
-        managed_node_index += 1;
-        match node {
-            ManagedNode::Directory(path) => {
-                before_managed_file(managed_node_index, path)?;
-                if external_directory_exists_in(&root, path)? {
-                    return Ok(());
-                }
-                let identity = create_external_directory_in(&root, path)?;
-                created.push(CreatedNode::Directory(path.clone(), identity));
-            }
-            ManagedNode::File(path, contents) => {
-                before_managed_file(managed_node_index, path)?;
-                if external_regular_file_exists_in(&root, path)? {
-                    return preflight_test_case_file(&root, path, contents);
-                }
-                let mut file = create_external_regular_file_in(&root, path)?;
-                created.push(CreatedNode::File(path.clone(), file.identity()));
-                file.file_mut().write_all(contents)?;
-                file.file_mut().sync_all()?;
-            }
-        }
-        root.verify_binding()?;
+    // A format 3 folder is claimed for this workspace and suite before any
+    // case is written; preflight already checked an existing marker.
+    let claim = if suite.format_version == 3 {
+        claim_case_folder(&root, workspace_root, suite, &mut created)
+    } else {
         Ok(())
-    })
-    .and_then(|()| {
-        root.verify_binding()?;
-        Ok(())
-    });
+    };
+    let deployment = claim
+        .and_then(|()| {
+            for_each_managed_node(suite, |node| {
+                managed_node_index += 1;
+                match node {
+                    ManagedNode::Directory(path) => {
+                        before_managed_file(managed_node_index, path)?;
+                        if external_directory_exists_in(&root, path)? {
+                            return Ok(());
+                        }
+                        let identity = create_external_directory_in(&root, path)?;
+                        created.push(CreatedNode::Directory(path.clone(), identity));
+                    }
+                    ManagedNode::File(path, contents) => {
+                        before_managed_file(managed_node_index, path)?;
+                        if external_regular_file_exists_in(&root, path)? {
+                            return preflight_test_case_file(&root, path, contents);
+                        }
+                        let mut file = create_external_regular_file_in(&root, path)?;
+                        created.push(CreatedNode::File(path.clone(), file.identity()));
+                        file.file_mut().write_all(contents)?;
+                        file.file_mut().sync_all()?;
+                    }
+                }
+                root.verify_binding()?;
+                Ok(())
+            })
+        })
+        .and_then(|()| {
+            root.verify_binding()?;
+            Ok(())
+        });
     if let Err(error) = deployment {
         let mut cleanup_failures = Vec::new();
         for node in created.into_iter().rev() {
@@ -478,6 +501,29 @@ fn test_case_sibling(workspace_root: &Path, suite: &ExtractedTestCaseSuite) -> R
     )
 }
 
+/// Writes the format 3 ownership marker when the case folder has none.
+fn claim_case_folder(
+    root: &PinnedWorkspaceRoot,
+    workspace_root: &Path,
+    suite: &ExtractedTestCaseSuite,
+    created: &mut Vec<CreatedNode>,
+) -> Result<()> {
+    let path = WorkspacePath::new(crate::console::CASE_FOLDER_MARKER)?;
+    if external_regular_file_exists_in(root, &path)? {
+        return Ok(());
+    }
+    let marker = crate::console::CaseFolderMarker::new(
+        &crate::console::case_folder_owner(workspace_root)?,
+        suite.hash,
+    );
+    let mut file = create_external_regular_file_in(root, &path)?;
+    created.push(CreatedNode::File(path, file.identity()));
+    file.file_mut().write_all(&marker.encode())?;
+    file.file_mut().sync_all()?;
+    root.verify_binding()?;
+    Ok(())
+}
+
 fn open_existing_test_case_root(path: &Path) -> Result<Option<PinnedWorkspaceRoot>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -506,6 +552,8 @@ fn open_existing_test_case_root(path: &Path) -> Result<Option<PinnedWorkspaceRoo
         )
         .into());
     }
+    // Never deploy cases into another workspace, in any format.
+    crate::console::refuse_workspace_as_case_folder(root.path())?;
     root.verify_binding()?;
     Ok(Some(root))
 }
@@ -642,6 +690,11 @@ mod deployment_tests {
     use rustrace_workspace::hash::PinnedWorkspaceRoot;
 
     use super::{cleanup_failed_publication, deploy_test_case_suite, publish_fresh_workspace_with};
+    use crate::console::{CASE_FOLDER_MARKER, CaseFolderMarker};
+
+    fn suite_fixture_hash(suite: &ExtractedTestCaseSuite) -> Hash {
+        suite.fixtures.as_ref().unwrap().hash()
+    }
 
     fn path(value: &str) -> rustrace_model::WorkspacePath {
         rustrace_model::WorkspacePath::new(value).unwrap()
@@ -816,6 +869,11 @@ mod deployment_tests {
             let temp = TempRoot::new();
             let sibling = temp.path().join("lab2.test-cases");
             fs::create_dir(&sibling).unwrap();
+            fs::write(
+                sibling.join(CASE_FOLDER_MARKER),
+                CaseFolderMarker::new("lab2.work", Hash::zero()).encode(),
+            )
+            .unwrap();
             fs::write(sibling.join("stdin.in"), b"fn\n").unwrap();
             fs::write(sibling.join("unrelated.txt"), b"keep\n").unwrap();
             let prepared = temp.path().join("lab2.prepare");
@@ -838,8 +896,127 @@ mod deployment_tests {
                 .map(|entry| entry.unwrap().file_name().into_string().unwrap())
                 .collect::<Vec<_>>();
             remaining.sort();
-            assert_eq!(remaining, ["stdin.in", "unrelated.txt"], "{target}");
+            assert_eq!(
+                remaining,
+                [CASE_FOLDER_MARKER, "stdin.in", "unrelated.txt"],
+                "{target}"
+            );
         }
+
+        // A folder this attempt created, marker included, is removed whole.
+        let temp = TempRoot::new();
+        let prepared = temp.path().join("lab2.prepare");
+        prepare_workspace(&prepared);
+        publish_fresh_workspace_with(
+            &prepared,
+            &temp.path().join("lab2.work"),
+            Some(&format3_suite()),
+            fail_managed_file(1),
+        )
+        .expect_err("injected failure");
+        assert!(!temp.path().join("lab2.test-cases").exists());
+    }
+
+    #[test]
+    fn format3_case_folders_are_claimed_for_one_workspace_and_suite() {
+        let temp = TempRoot::new();
+        let prepared = temp.path().join("lab2.prepare");
+        prepare_workspace(&prepared);
+        drop(
+            publish_fresh_workspace_with(
+                &prepared,
+                &temp.path().join("lab2.work"),
+                Some(&format3_suite()),
+                |_, _| Ok(()),
+            )
+            .unwrap(),
+        );
+        let folder = temp.path().join("lab2.test-cases");
+        assert_eq!(
+            fs::read(folder.join(CASE_FOLDER_MARKER)).unwrap(),
+            CaseFolderMarker::new("lab2.work", Hash::zero()).encode()
+        );
+        let tree = suite_fixture_hash(&format3_suite());
+        let root = PinnedWorkspaceRoot::open(&folder).unwrap();
+        assert_eq!(
+            hash_deployed_fixture_tree(&root).unwrap(),
+            Some(tree),
+            "the marker is outside the fixture tree"
+        );
+
+        // `lab2` maps to the same folder, which belongs to `lab2.work`.
+        let prepared = temp.path().join("other.prepare");
+        prepare_workspace(&prepared);
+        let error = publish_fresh_workspace_with(
+            &prepared,
+            &temp.path().join("lab2"),
+            Some(&format3_suite()),
+            |_, _| Ok(()),
+        )
+        .expect_err("another workspace's folder");
+        assert!(
+            error
+                .to_string()
+                .contains("belongs to the workspace `lab2.work`"),
+            "{error}"
+        );
+        assert!(!prepared.exists() && !temp.path().join("lab2").exists());
+
+        // Another package version is refused as well.
+        let mut other_version = format3_suite();
+        other_version.hash = Hash::from_bytes([9; Hash::LENGTH]);
+        let error = deploy_test_case_suite(&temp.path().join("lab2.work"), &other_version)
+            .expect_err("another suite");
+        assert!(
+            error.to_string().contains("different assignment package"),
+            "{error}"
+        );
+
+        // A folder without a marker is not claimed silently.
+        fs::create_dir(temp.path().join("lab3.test-cases")).unwrap();
+        let prepared = temp.path().join("lab3.prepare");
+        prepare_workspace(&prepared);
+        let error = publish_fresh_workspace_with(
+            &prepared,
+            &temp.path().join("lab3.work"),
+            Some(&format3_suite()),
+            |_, _| Ok(()),
+        )
+        .expect_err("unmarked folder");
+        assert!(
+            error.to_string().contains("not created by Rustrace"),
+            "{error}"
+        );
+
+        // A case folder that is itself a workspace is refused in both formats.
+        fs::create_dir_all(temp.path().join("lab4.test-cases/.rustrace")).unwrap();
+        let prepared = temp.path().join("lab4.prepare");
+        prepare_workspace(&prepared);
+        let error = publish_fresh_workspace_with(
+            &prepared,
+            &temp.path().join("lab4.work"),
+            Some(&format3_suite()),
+            |_, _| Ok(()),
+        )
+        .expect_err("workspace as case folder");
+        assert!(
+            error.to_string().contains("is a Rustrace workspace"),
+            "{error}"
+        );
+        fs::create_dir_all(temp.path().join("test-cases/.rustrace")).unwrap();
+        let prepared = temp.path().join("lab1.prepare");
+        prepare_workspace(&prepared);
+        let error = publish_fresh_workspace_with(
+            &prepared,
+            &temp.path().join("lab1.work"),
+            Some(&suite()),
+            |_, _| Ok(()),
+        )
+        .expect_err("format 2 workspace as case folder");
+        assert!(
+            error.to_string().contains("is a Rustrace workspace"),
+            "{error}"
+        );
     }
 
     #[test]

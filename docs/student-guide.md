@@ -440,8 +440,12 @@ after it: `lab2.work` gets `lab2.test-cases/`, with any `files/` folder inside
 it, so two version 3 assignments in one folder keep their cases apart. A
 workspace name without `.work` gets `.test-cases` added to the whole name.
 Rustrace refuses a version 3 workspace named `test-cases`, ending in
-`.test-cases`, or containing `{` or `}`. Opening these folders in Finder is
-fine; its `.DS_Store` files are ignored.
+`.test-cases`, or containing `{` or `}`. The folder's `.rustrace-cases.json`
+records which workspace and package it belongs to, so `lab2` cannot reuse the
+folder of `lab2.work`, and a folder from another package version is refused;
+move such a folder aside and run the command again. Rustrace never uses a
+workspace as a test-case folder. Opening these folders in Finder is fine; its
+`.DS_Store` files are ignored.
 Rustrace checks every packaged case path before publishing a fresh workspace.
 It never replaces a different file, symlink, directory, or other special entry.
 If the sibling directory already contains the exact packaged bytes, startup

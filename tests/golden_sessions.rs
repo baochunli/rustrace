@@ -493,6 +493,25 @@ fn run_controlled_child(case: &Path, mode: &str) {
             ]);
         }
         fs::write(case.join("assignment.rta"), assignment_tar(&entries)).unwrap();
+        if format3 {
+            // Deployment claims a format 3 case folder with this marker.
+            let suite = extract_assignment_package(
+                fs::File::open(case.join("assignment.rta")).unwrap(),
+                &case.join("marker-extraction"),
+                ExtractionLimits::default(),
+            )
+            .unwrap()
+            .test_cases
+            .unwrap();
+            fs::write(
+                test_cases.join(".rustrace-cases.json"),
+                format!(
+                    "{{\"version\":1,\"workspace\":\"workspace\",\"test_case_suite_hash\":\"{}\"}}\n",
+                    suite.hash
+                ),
+            )
+            .unwrap();
+        }
     } else if mode == "formatting" {
         for index in 0..5 {
             fs::write(

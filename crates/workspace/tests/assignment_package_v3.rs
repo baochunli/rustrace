@@ -715,6 +715,10 @@ fn format_three_fixtures_accept_only_canonical_regular_files_and_directories() {
             Entry::file("test-cases/data/case.expected", "x"),
         ),
         ("unknown case file", Entry::file("test-cases/case.txt", "x")),
+        (
+            "case folder marker",
+            Entry::file("test-cases/.rustrace-cases.json", "{}"),
+        ),
     ] {
         let error = extract(3, vec![case(), entry]).expect_err(label);
         assert!(

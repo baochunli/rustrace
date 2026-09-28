@@ -612,14 +612,23 @@ impl ProductionSession {
     }
 
     pub fn list_test_cases(&self) -> Result<Vec<TestCase>> {
-        TestCaseDirectory::open(self.workspace.root(), self.test_case_layout())?.list_cases()
+        TestCaseDirectory::open(
+            self.workspace.root(),
+            self.test_case_layout(),
+            self.metadata.test_case_suite_hash,
+        )?
+        .list_cases()
     }
 
     pub fn start_test_case(&mut self, case: TestCase) -> Result<()> {
         self.clear_completion();
         self.require_command_idle()?;
         let manifest = self.command_manifest()?;
-        let cases = TestCaseDirectory::open(self.workspace.root(), self.test_case_layout())?;
+        let cases = TestCaseDirectory::open(
+            self.workspace.root(),
+            self.test_case_layout(),
+            self.metadata.test_case_suite_hash,
+        )?;
         let input = cases.open_input(&case.input_path())?;
         // Reject bad expected files before launch by design. ExpectedUnreadable and
         // ExpectedOversized remain in the closed vocabulary for stream acceptance only.
@@ -674,7 +683,13 @@ impl ProductionSession {
     fn prepare_console_launch(&self, request: ConsoleCommand) -> Result<ConsoleLaunch> {
         let needs_cases = request.stdin.is_some() || request.stdout.is_some();
         let cases = needs_cases
-            .then(|| TestCaseDirectory::open(self.workspace.root(), self.test_case_layout()))
+            .then(|| {
+                TestCaseDirectory::open(
+                    self.workspace.root(),
+                    self.test_case_layout(),
+                    self.metadata.test_case_suite_hash,
+                )
+            })
             .transpose()?;
         let input = match (&cases, &request.stdin) {
             (Some(cases), Some(path)) => Some(cases.open_input(path)?),
