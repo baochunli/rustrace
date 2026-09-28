@@ -381,6 +381,29 @@ impl TestCaseDirectory {
         Ok(open_external_regular_file_read_in(&self.root, path)?)
     }
 
+    /// Opens a format 3 case's `NAME.in`, hashes its bytes (at most the 1 MiB
+    /// case-file limit), and rewinds it so the program reads from the start.
+    /// The hash is the `stdin.blake3` a comparison's invocation records.
+    #[allow(dead_code)] // Launched by the format 3 runner in T10.50.
+    pub(crate) fn open_input_with_blake3(
+        &self,
+        case: &TestCase,
+    ) -> Result<(OpenedRegularFile, Hash)> {
+        use std::io::{Seek, SeekFrom};
+
+        let mut opened = self.open_input(&case.input_path())?;
+        let mut bytes = Vec::new();
+        (&mut opened.file_mut())
+            .take(MAX_TEST_CASE_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_TEST_CASE_FILE_BYTES {
+            return Err("test input exceeds the 1048576-byte limit".into());
+        }
+        opened.file_mut().seek(SeekFrom::Start(0))?;
+        self.root.verify_binding()?;
+        Ok((opened, hash_bytes(&bytes)))
+    }
+
     pub(crate) fn read_expected(&self, case: &TestCase) -> Result<Vec<u8>> {
         self.read_bounded_case_file(
             &case.expected_path(),
@@ -1057,6 +1080,38 @@ mod tests {
         let added_input = identity(&directory);
         assert_ne!(added_input, changed_args);
         assert!(added_input.has_input());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn format3_input_is_hashed_then_rewound_for_the_program() {
+        let parent = fixture("input-hash");
+        let cases_root = parent.join("test-cases");
+        fs::create_dir(&cases_root).unwrap();
+        fs::write(cases_root.join("case.in"), b"alpha\nbeta\n").unwrap();
+        fs::write(cases_root.join("case.expected"), b"").unwrap();
+        fs::write(
+            cases_root.join("large.in"),
+            vec![b'x'; MAX_TEST_CASE_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        fs::write(cases_root.join("large.expected"), b"").unwrap();
+        let directory = TestCaseDirectory::open(&parent.join("assignment.work")).unwrap();
+        let cases = directory.list_cases_for(TestCaseLayout::Extended).unwrap();
+
+        let (mut input, blake3) = directory.open_input_with_blake3(&cases[0]).unwrap();
+        assert_eq!(blake3, hash_bytes(b"alpha\nbeta\n"));
+        let mut read = Vec::new();
+        input.file_mut().read_to_end(&mut read).unwrap();
+        assert_eq!(read, b"alpha\nbeta\n");
+        assert!(
+            directory
+                .open_input_with_blake3(&cases[1])
+                .unwrap_err()
+                .to_string()
+                .contains("1048576-byte limit")
+        );
         fs::remove_dir_all(parent).unwrap();
     }
 
