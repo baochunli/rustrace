@@ -368,6 +368,76 @@ fn format_three_hashes_match_their_documented_encodings_and_goldens() {
 }
 
 #[test]
+fn format_three_starters_cannot_carry_cargo_configuration() {
+    // Even a policy that allows every path cannot ship `.cargo`: fixture runs
+    // would not read it, so they would build differently from F7.
+    let open_policy = |version: u32| {
+        manifest(version).replace(
+            r#"allowed_paths = ["src/**/*.rs", "Cargo.toml"]"#,
+            r#"allowed_paths = ["**"]"#,
+        )
+    };
+    for (label, entry) in [
+        (
+            "file",
+            Entry::file("starter/.cargo/config.toml", "[build]\n"),
+        ),
+        ("directory", Entry::directory("starter/.cargo/")),
+        (
+            "upper case",
+            Entry::file("starter/.Cargo/config", "[build]\n"),
+        ),
+        (
+            "nested",
+            Entry::file("starter/tools/.cargo/config.toml", ""),
+        ),
+    ] {
+        let manifest = open_policy(3);
+        let mut entries = vec![
+            Entry::file("assignment.toml", &manifest),
+            Entry::file("starter/Cargo.toml", b"[package]\n[workspace]\n"),
+            Entry::file("starter/src/main.rs", b"fn main() {}\n"),
+            Entry::file("test-cases/case.expected", ""),
+        ];
+        entries.push(entry);
+        let root = TempRoot::new();
+        let error = extract_assignment_package(
+            Cursor::new(package(&entries)),
+            &root.path().join("workspace"),
+            ExtractionLimits::default(),
+        )
+        .expect_err(label);
+        assert!(
+            matches!(
+                error,
+                AssignmentPackageError::StarterCargoConfiguration { .. }
+            ),
+            "{label}: {error}"
+        );
+        assert!(!root.path().join("workspace").exists());
+    }
+
+    // Format 2 packages keep accepting what their policy allows.
+    let manifest = open_policy(2);
+    let entries = [
+        Entry::file("assignment.toml", &manifest),
+        Entry::file("starter/Cargo.toml", b"[package]\n[workspace]\n"),
+        Entry::file("starter/src/main.rs", b"fn main() {}\n"),
+        Entry::file("starter/.cargo/config.toml", "[build]\n"),
+        Entry::file("test-cases/case.in", ""),
+        Entry::file("test-cases/case.expected", ""),
+    ];
+    let root = TempRoot::new();
+    extract_assignment_package(
+        Cursor::new(package(&entries)),
+        &root.path().join("workspace"),
+        ExtractionLimits::default(),
+    )
+    .expect("format 2 is unchanged");
+    assert!(root.path().join("workspace/.cargo/config.toml").is_file());
+}
+
+#[test]
 fn format_three_rejects_case_names_that_differ_only_in_letter_case() {
     let error = extract(
         3,

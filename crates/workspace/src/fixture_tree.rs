@@ -225,21 +225,46 @@ pub fn is_fixture_path(path: &WorkspacePath) -> bool {
     fixture_path_problem(path).is_none()
 }
 
+/// Why a path cannot appear in a fixture tree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FixturePathProblem {
+    /// Not NFC, holds a control character, or too long or deep below `files/`.
+    NotCanonical,
+    /// A `.cargo` component, in any letter case.
+    CargoConfiguration,
+    /// A name that file browsers and editors create, such as `.DS_Store`.
+    PlatformClutter,
+}
+
+impl FixturePathProblem {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::NotCanonical => "has a name that is not a canonical workspace path",
+            Self::CargoConfiguration => "is a `.cargo` Cargo configuration path",
+            Self::PlatformClutter => "has a name that file browsers or editors create",
+        }
+    }
+}
+
+/// Whether any component of `path` is `.cargo`, in any letter case (Cargo
+/// finds `.CARGO` on a case-insensitive filesystem).
+pub(crate) fn has_cargo_configuration_component(path: &WorkspacePath) -> bool {
+    path.components()
+        .any(|component| component.eq_ignore_ascii_case(".cargo"))
+}
+
 /// Why `path` cannot appear in a fixture tree, if it cannot.
-pub(crate) fn fixture_path_problem(path: &WorkspacePath) -> Option<&'static str> {
+pub(crate) fn fixture_path_problem(path: &WorkspacePath) -> Option<FixturePathProblem> {
     if path.as_str().chars().any(char::is_control)
         || WorkspacePath::new(format!("{FIXTURE_ROOT}/{}", path.as_str())).is_err()
     {
-        return Some("has a name that is not a canonical workspace path");
+        return Some(FixturePathProblem::NotCanonical);
     }
-    if path
-        .components()
-        .any(|component| component.eq_ignore_ascii_case(".cargo"))
-    {
-        return Some("is a `.cargo` Cargo configuration path");
+    if has_cargo_configuration_component(path) {
+        return Some(FixturePathProblem::CargoConfiguration);
     }
     if path.components().any(is_excluded_file_name) {
-        return Some("has a name that file browsers or editors create");
+        return Some(FixturePathProblem::PlatformClutter);
     }
     None
 }
@@ -247,9 +272,9 @@ pub(crate) fn fixture_path_problem(path: &WorkspacePath) -> Option<&'static str>
 fn require_fixture_path(path: &WorkspacePath) -> Result<(), FixtureTreeError> {
     match fixture_path_problem(path) {
         None => Ok(()),
-        Some(reason) => Err(FixtureTreeError::UnsupportedEntry {
+        Some(problem) => Err(FixtureTreeError::UnsupportedEntry {
             path: path.to_string(),
-            reason,
+            reason: problem.reason(),
         }),
     }
 }
@@ -460,10 +485,10 @@ mod deployed {
                     reason: "has a name that is not a canonical workspace path",
                 }
             })?;
-            if let Some(reason) = fixture_path_problem(&path) {
+            if let Some(problem) = fixture_path_problem(&path) {
                 return Err(FixtureTreeError::UnsupportedEntry {
                     path: path.to_string(),
-                    reason,
+                    reason: problem.reason(),
                 });
             }
             match file_type(&stat) {

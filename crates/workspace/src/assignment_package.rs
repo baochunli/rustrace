@@ -23,7 +23,10 @@ use rustrace_model::{
     parse_test_case_args,
 };
 
-use crate::fixture_tree::{FIXTURE_ROOT, FixtureTree, FixtureTreeError, fixture_path_problem};
+use crate::fixture_tree::{
+    FIXTURE_ROOT, FixturePathProblem, FixtureTree, FixtureTreeError, fixture_path_problem,
+    has_cargo_configuration_component,
+};
 use crate::hash::{
     MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_FILES, MAX_WORKSPACE_TOTAL_BYTES, PinnedWorkspaceRoot,
 };
@@ -829,6 +832,9 @@ pub enum AssignmentPackageError {
         name: String,
         other: String,
     },
+    StarterCargoConfiguration {
+        path: String,
+    },
     Fixtures {
         source: FixtureTreeError,
     },
@@ -989,6 +995,10 @@ impl fmt::Display for AssignmentPackageError {
             Self::Fixtures { source } => {
                 write!(formatter, "assignment package test-cases/{source}")
             }
+            Self::StarterCargoConfiguration { path } => write!(
+                formatter,
+                "assignment package format_version 3 cannot include Cargo configuration `{path}`: programs run from test-cases/files/, where Cargo does not read it"
+            ),
             Self::TestCaseNameConflict { name, other } => write!(
                 formatter,
                 "assignment package test cases `{other}` and `{name}` differ only in letter case"
@@ -1277,20 +1287,17 @@ fn classify_entry(
                 };
             }
             if let Some(fixture) = relative.strip_prefix("files/") {
-                let fixture = WorkspacePath::new(fixture)
-                    .ok()
-                    .filter(|fixture| {
-                        fixture_path_problem(fixture)
-                            .is_none_or(|reason| !reason.contains("canonical"))
-                    })
-                    .ok_or_else(|| {
-                        invalid_test_case_path(
-                            path,
-                            "fixture paths must be canonical NFC workspace paths without control characters",
-                        )
-                    })?;
-                if let Some(reason) = fixture_path_problem(&fixture) {
-                    return Err(invalid_test_case_path(path, reason));
+                let not_canonical = || {
+                    invalid_test_case_path(
+                        path,
+                        "fixture paths must be canonical NFC workspace paths without control characters",
+                    )
+                };
+                let fixture = WorkspacePath::new(fixture).map_err(|_| not_canonical())?;
+                match fixture_path_problem(&fixture) {
+                    None => {}
+                    Some(FixturePathProblem::NotCanonical) => return Err(not_canonical()),
+                    Some(problem) => return Err(invalid_test_case_path(path, problem.reason())),
                 }
                 return Ok(match kind {
                     EntryKind::File => PackageEntry::FixtureFile(fixture),
@@ -1361,6 +1368,14 @@ fn classify_entry(
             source,
         },
     })?;
+    // Format 3 runs a program from test-cases/files/, where Cargo does not read
+    // the workspace's `.cargo` configuration, so F7 builds and fixture runs
+    // would build differently.
+    if format_version == Some(3) && has_cargo_configuration_component(&relative) {
+        return Err(AssignmentPackageError::StarterCargoConfiguration {
+            path: path.to_owned(),
+        });
+    }
     Ok(match kind {
         EntryKind::File => PackageEntry::StarterFile(relative),
         EntryKind::Directory => PackageEntry::StarterDirectory(relative),
