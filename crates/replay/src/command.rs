@@ -180,16 +180,53 @@ impl CommandReplay {
                     .console
                     .as_ref()
                     .ok_or_else(|| invalid("comparison requires a console Run"))?;
-                let ConsoleStdinRoute::File { path } = &route.stdin else {
-                    return Err(invalid("comparison requires file stdin"));
-                };
                 if comparison.command_id != finished.started.command_id
                     || finished.started.action != ControlledAction::Run
-                    || path.as_str() != format!("{}.in", comparison.case)
                     || route.stdout != ConsoleStdoutRoute::Console
                     || finished.finished.stdout.mode != CommandCaptureMode::Captured
                 {
                     return Err(invalid("comparison command/case/route mismatch"));
+                }
+                match (&route.test_case, &comparison.invocation) {
+                    // Format 2: the case reads its own NAME.in, in the
+                    // workspace, with no program arguments.
+                    (None, None) => {
+                        let ConsoleStdinRoute::File { path } = &route.stdin else {
+                            return Err(invalid("comparison requires file stdin"));
+                        };
+                        if path.as_str() != format!("{}.in", comparison.case) || !route.is_plain() {
+                            return Err(invalid("comparison command/case/route mismatch"));
+                        }
+                    }
+                    // Format 3: the Run route names the case, and the
+                    // comparison's invocation block restates its arguments,
+                    // stdin source, and fixture tree. Start validation already
+                    // tied a file stdin route to the case's own NAME.in.
+                    (Some(case), Some(invocation)) => {
+                        if *case != comparison.case {
+                            return Err(invalid("comparison command/case/route mismatch"));
+                        }
+                        if invocation.args_blake3 != test_case_args_blake3(&route.args) {
+                            return Err(invalid("comparison arguments differ from the Run route"));
+                        }
+                        if !matches!(
+                            (&route.stdin, &invocation.stdin),
+                            (ConsoleStdinRoute::Closed, TestCaseStdin::Closed)
+                                | (ConsoleStdinRoute::File { .. }, TestCaseStdin::File { .. })
+                        ) {
+                            return Err(invalid("comparison stdin differs from the Run route"));
+                        }
+                        if invocation.fixtures_blake3 != route.working_directory.fixtures_blake3() {
+                            return Err(invalid(
+                                "comparison fixture tree differs from the Run route",
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(invalid(
+                            "comparison invocation must accompany a Run route naming the case",
+                        ));
+                    }
                 }
                 let stdout_blake3 = rustrace_model::rprov_raw_blake3(&finished.stdout);
                 let expected_actual =
