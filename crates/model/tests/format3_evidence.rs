@@ -554,3 +554,71 @@ fn format_three_comparisons_have_exact_golden_json() {
         );
     }
 }
+
+#[test]
+fn packaged_case_constructors_build_evidence_that_validates_and_links() {
+    use rustrace_model::{
+        ConsoleCommandRoute, ConsoleStdinRoute, ConsoleWorkingDirectory, Hash, TestCaseInvocation,
+        TestCaseStdin,
+    };
+
+    let fixtures = Hash::from_bytes([0x44; Hash::LENGTH]);
+    let route = ConsoleCommandRoute::packaged_case(
+        "search-1",
+        false,
+        vec!["-n".to_owned(), "fn main".to_owned()],
+        Some(fixtures),
+    )
+    .unwrap();
+    assert_eq!(route.stdin, ConsoleStdinRoute::Closed);
+    assert_eq!(
+        route.working_directory,
+        ConsoleWorkingDirectory::Fixtures {
+            fixtures_blake3: fixtures
+        }
+    );
+    let bytes = run(
+        &[
+            "--locked",
+            "--manifest-path",
+            MANIFEST_PATH,
+            "--",
+            "-n",
+            "fn main",
+        ],
+        serde_json::to_value(&route).unwrap(),
+    );
+    assert!(accepted(&bytes));
+
+    let invocation = TestCaseInvocation::for_route(&route, None).unwrap();
+    assert_eq!(
+        invocation.args_blake3,
+        test_case_args_blake3(&["-n", "fn main"])
+    );
+    assert_eq!(invocation.stdin, TestCaseStdin::Closed);
+    assert_eq!(invocation.fixtures_blake3, Some(fixtures));
+    assert!(TestCaseInvocation::for_route(&route, Some(fixtures)).is_none());
+
+    let with_input = ConsoleCommandRoute::packaged_case("case", true, Vec::new(), None).unwrap();
+    assert_eq!(
+        serde_json::to_value(&with_input).unwrap(),
+        json!({"stdin":{"kind":"file","path":"case.in"},"stdout":{"kind":"console"},
+            "test_case":"case"})
+    );
+    let input = Hash::from_bytes([0x55; Hash::LENGTH]);
+    assert_eq!(
+        TestCaseInvocation::for_route(&with_input, Some(input))
+            .unwrap()
+            .stdin,
+        TestCaseStdin::File { blake3: input }
+    );
+    assert!(TestCaseInvocation::for_route(&with_input, None).is_none());
+    let unmarked = ConsoleCommandRoute::new(
+        ConsoleStdinRoute::Submitted,
+        rustrace_model::ConsoleStdoutRoute::Console,
+    );
+    assert!(TestCaseInvocation::for_route(&unmarked, None).is_none());
+
+    assert!(ConsoleCommandRoute::packaged_case("bad.name", true, Vec::new(), None).is_err());
+    assert!(ConsoleCommandRoute::packaged_case("case", true, vec![String::new()], None).is_err());
+}

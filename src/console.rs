@@ -1,11 +1,12 @@
 //! Small local state for the embedded piped Cargo console.
 
-use rustrace_model::{Hash, WorkspacePath};
+use rustrace_model::{Hash, MAX_TEST_CASE_ARGS_FILE_BYTES, WorkspacePath, parse_test_case_args};
 use rustrace_workspace::hash::PinnedWorkspaceRoot;
 use rustrace_workspace::{
     OpenedRegularFile,
     assignment_package::{MAX_TEST_CASE_FILE_BYTES, MAX_TEST_CASE_TOTAL_BYTES, MAX_TEST_CASES},
     create_external_regular_file_in, external_regular_file_exists_in,
+    fixture_tree::{FIXTURE_ROOT, FixtureTree, read_deployed_fixture_tree},
     list_external_regular_files_in_with_filter, open_external_regular_file_read_in,
     open_external_regular_file_write_in,
 };
@@ -14,7 +15,7 @@ use std::{
     error::Error,
     fs,
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -36,26 +37,47 @@ pub(crate) enum OutputDisposition {
     Overwrite,
 }
 
+/// Which files make a live packaged case, by assignment format.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TestCaseLayout {
+    /// Format 2: a complete `NAME.in` and `NAME.expected` pair.
+    Paired,
+    /// Format 3: `NAME.expected` with optional `NAME.in` and `NAME.args`.
+    Extended,
+}
+
+impl TestCaseLayout {
+    #[allow(dead_code)] // T10.50/T10.51 select the layout from the session manifest.
+    pub(crate) fn for_format_version(format_version: u32) -> Option<Self> {
+        match format_version {
+            2 => Some(Self::Paired),
+            3 => Some(Self::Extended),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct TestCase {
     name: String,
     pair_blake3: Option<Hash>,
+    has_input: bool,
+    /// Parsed `NAME.args`; empty without the file, `None` when a present file
+    /// cannot be read or parsed. Format 2 cases never have arguments.
+    args: Option<Vec<String>>,
 }
 
 impl TestCase {
     pub(crate) fn new(name: impl Into<String>) -> Result<Self> {
         let name = name.into();
-        if name.is_empty()
-            || name.len() > rustrace_model::MAX_TEST_CASE_NAME_BYTES
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
+        if !rustrace_model::is_valid_test_case_name(&name) {
             return Err("invalid packaged test-case name".into());
         }
         Ok(Self {
             name,
             pair_blake3: None,
+            has_input: true,
+            args: Some(Vec::new()),
         })
     }
 
@@ -63,8 +85,24 @@ impl TestCase {
         &self.name
     }
 
+    /// Whether the case has a `NAME.in`; without one it runs with stdin closed.
+    #[allow(dead_code)] // Read by the format 3 runner and picker (T10.50/T10.51).
+    pub(crate) fn has_input(&self) -> bool {
+        self.has_input
+    }
+
+    /// The case's program arguments, or `None` when its `NAME.args` is invalid.
+    #[allow(dead_code)] // Read by the format 3 runner and picker (T10.50/T10.51).
+    pub(crate) fn args(&self) -> Option<&[String]> {
+        self.args.as_deref()
+    }
+
     pub(crate) fn input_path(&self) -> WorkspacePath {
         WorkspacePath::new(format!("{}.in", self.name)).expect("validated test-case path")
+    }
+
+    pub(crate) fn args_path(&self) -> WorkspacePath {
+        WorkspacePath::new(format!("{}.args", self.name)).expect("validated test-case path")
     }
 
     pub(crate) fn expected_path(&self) -> WorkspacePath {
@@ -137,11 +175,151 @@ impl TestCaseDirectory {
     }
 
     pub(crate) fn list(&self) -> Result<Vec<WorkspacePath>> {
-        Ok(list_external_regular_files_in_with_filter(
-            &self.root,
-            MAX_TEST_CASES * 2,
-            is_test_case_candidate,
-        )?)
+        self.list_for(TestCaseLayout::Paired)
+    }
+
+    fn list_for(&self, layout: TestCaseLayout) -> Result<Vec<WorkspacePath>> {
+        Ok(match layout {
+            TestCaseLayout::Paired => list_external_regular_files_in_with_filter(
+                &self.root,
+                MAX_TEST_CASES * 2,
+                is_test_case_candidate,
+            )?,
+            TestCaseLayout::Extended => list_external_regular_files_in_with_filter(
+                &self.root,
+                MAX_TEST_CASES * 3,
+                is_extended_test_case_candidate,
+            )?,
+        })
+    }
+
+    /// Lists live cases for one assignment format. Format 2 lists complete
+    /// `.in`/`.expected` pairs exactly as [`Self::list_cases`] does.
+    #[allow(dead_code)] // The picker selects the format 3 layout in T10.51.
+    pub(crate) fn list_cases_for(&self, layout: TestCaseLayout) -> Result<Vec<TestCase>> {
+        match layout {
+            TestCaseLayout::Paired => self.list_cases(),
+            TestCaseLayout::Extended => self.list_extended_cases(),
+        }
+    }
+
+    fn list_extended_cases(&self) -> Result<Vec<TestCase>> {
+        #[derive(Default)]
+        struct Files {
+            input: bool,
+            args: bool,
+            expected: bool,
+        }
+
+        let mut groups = BTreeMap::<String, Files>::new();
+        for path in self.list_for(TestCaseLayout::Extended)? {
+            let Some((name, suffix)) = path.as_str().rsplit_once('.') else {
+                continue;
+            };
+            if path.as_str().contains('/') || TestCase::new(name).is_err() {
+                continue;
+            }
+            let files = groups.entry(name.to_owned()).or_default();
+            match suffix {
+                "in" => files.input = true,
+                "args" => files.args = true,
+                "expected" => files.expected = true,
+                _ => {}
+            }
+        }
+        let refresh_id = TEST_CASE_REFRESH_ID.fetch_add(1, Ordering::Relaxed);
+        let mut remaining_identity_bytes = MAX_TEST_CASE_TOTAL_BYTES;
+        let mut cases = Vec::new();
+        for (name, files) in groups {
+            if !files.expected {
+                continue;
+            }
+            let mut case = TestCase {
+                pair_blake3: Some(refresh_identity(refresh_id, &name)),
+                name,
+                has_input: files.input,
+                args: Some(Vec::new()),
+            };
+            if files.args {
+                case.args = self.read_args(&case).ok();
+            }
+            if remaining_identity_bytes > 0
+                && let Ok(identity) =
+                    self.extended_identity(&case, files.args, &mut remaining_identity_bytes)
+            {
+                case.pair_blake3 = Some(identity);
+            }
+            cases.push(case);
+        }
+        Ok(cases)
+    }
+
+    /// Reads and parses the live `NAME.args` with the package rules.
+    pub(crate) fn read_args(&self, case: &TestCase) -> Result<Vec<String>> {
+        let mut opened = open_external_regular_file_read_in(&self.root, &case.args_path())?;
+        let mut bytes = Vec::with_capacity(MAX_TEST_CASE_ARGS_FILE_BYTES);
+        opened
+            .file_mut()
+            .take(MAX_TEST_CASE_ARGS_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        self.root.verify_binding()?;
+        Ok(parse_test_case_args(&bytes).map_err(|error| format!("test-case arguments {error}"))?)
+    }
+
+    /// The deployed fixture root that a format 3 case runs from.
+    #[allow(dead_code)] // The fixture working directory is launched in T10.50.
+    pub(crate) fn fixtures_path(&self) -> PathBuf {
+        self.root.path().join(FIXTURE_ROOT)
+    }
+
+    /// Reads the deployed `files/` tree without following links, or `None`
+    /// when it is absent. Symlinks, special files, and oversized trees fail.
+    pub(crate) fn fixture_tree(&self) -> Result<Option<FixtureTree>> {
+        Ok(read_deployed_fixture_tree(&self.root)?)
+    }
+
+    /// The hash to record for a fixture working directory, computed from the
+    /// deployed bytes immediately before launch.
+    #[allow(dead_code)] // Verified before launch in T10.50.
+    pub(crate) fn fixture_tree_hash(&self) -> Result<Option<Hash>> {
+        Ok(self.fixture_tree()?.map(|tree| tree.hash()))
+    }
+
+    fn extended_identity(
+        &self,
+        case: &TestCase,
+        has_args: bool,
+        remaining_bytes: &mut u64,
+    ) -> Result<Hash> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"rustrace.live-test-case.v2");
+        for (present, path, oversized) in [
+            (
+                has_args,
+                case.args_path(),
+                "test arguments exceed the 1048576-byte limit",
+            ),
+            (
+                case.has_input,
+                case.input_path(),
+                "test input exceeds the 1048576-byte limit",
+            ),
+            (
+                true,
+                case.expected_path(),
+                "expected output exceeds the 1048576-byte limit",
+            ),
+        ] {
+            if present {
+                let bytes = self.read_case_file_for_identity(&path, oversized, remaining_bytes)?;
+                hasher.update(&[1]);
+                hasher.update(&(bytes.len() as u64).to_le_bytes());
+                hasher.update(&bytes);
+            } else {
+                hasher.update(&[0]);
+            }
+        }
+        Ok(Hash::from_bytes(*hasher.finalize().as_bytes()))
     }
 
     pub(crate) fn list_cases(&self) -> Result<Vec<TestCase>> {
@@ -181,6 +359,8 @@ impl TestCaseDirectory {
                 (pair.input && pair.expected).then(|| TestCase {
                     pair_blake3: Some(refresh_identity(refresh_id, &name)),
                     name,
+                    has_input: true,
+                    args: Some(Vec::new()),
                 })
             })
             .collect::<Vec<_>>();
@@ -305,6 +485,16 @@ fn is_test_case_candidate(path: &WorkspacePath) -> bool {
         .strip_suffix(".in")
         .or_else(|| value.strip_suffix(".expected"))
         .is_some_and(|name| TestCase::new(name).is_ok())
+}
+
+/// Format 3 case files are top-level; nothing below `files/` is a case.
+fn is_extended_test_case_candidate(path: &WorkspacePath) -> bool {
+    is_test_case_candidate(path)
+        || !path.as_str().contains('/')
+            && path
+                .as_str()
+                .strip_suffix(".args")
+                .is_some_and(|name| TestCase::new(name).is_ok())
 }
 
 pub(crate) fn hash_bytes(bytes: &[u8]) -> Hash {
@@ -769,6 +959,133 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["0", "a-b_C9"]
         );
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn format3_listing_accepts_optional_input_and_args_and_ignores_fixtures() {
+        let parent = fixture("format3-listing");
+        let cases_root = parent.join("test-cases");
+        fs::create_dir(&cases_root).unwrap();
+        for (path, bytes) in [
+            ("usage.expected", &b"usage\n"[..]),
+            ("count.args", b"-c\nfn main\n"),
+            ("count.expected", b"2\n"),
+            ("stdin.in", b"alpha\n"),
+            ("stdin.expected", b"alpha\n"),
+            ("broken.args", b"no final newline"),
+            ("broken.expected", b""),
+            ("orphan.args", b"x\n"),
+            ("orphan.in", b"x\n"),
+            ("notes.txt", b"ignored"),
+        ] {
+            fs::write(cases_root.join(path), bytes).unwrap();
+        }
+        fs::create_dir_all(cases_root.join("files/nested")).unwrap();
+        fs::write(cases_root.join("files/hidden.expected"), b"fixture").unwrap();
+        fs::write(cases_root.join("files/hidden.in"), b"fixture").unwrap();
+        fs::write(cases_root.join("files/nested/deep.expected"), b"fixture").unwrap();
+
+        let directory = TestCaseDirectory::open(&parent.join("assignment.work")).unwrap();
+        let cases = directory.list_cases_for(TestCaseLayout::Extended).unwrap();
+        let summary = cases
+            .iter()
+            .map(|case| {
+                (
+                    case.name(),
+                    case.has_input(),
+                    case.args().map(<[String]>::to_vec),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                ("broken", false, None),
+                (
+                    "count",
+                    false,
+                    Some(vec!["-c".to_owned(), "fn main".to_owned()])
+                ),
+                ("stdin", true, Some(Vec::new())),
+                ("usage", false, Some(Vec::new())),
+            ]
+        );
+        assert!(
+            directory
+                .read_args(&cases[0])
+                .unwrap_err()
+                .to_string()
+                .contains("must end every argument line with LF")
+        );
+
+        // Format 2 listing is unchanged: complete pairs only, no `.args`.
+        assert_eq!(
+            directory
+                .list_cases_for(TestCaseLayout::Paired)
+                .unwrap()
+                .iter()
+                .map(TestCase::name)
+                .collect::<Vec<_>>(),
+            ["stdin"]
+        );
+        assert_eq!(
+            TestCaseLayout::for_format_version(2),
+            Some(TestCaseLayout::Paired)
+        );
+        assert_eq!(
+            TestCaseLayout::for_format_version(3),
+            Some(TestCaseLayout::Extended)
+        );
+        assert_eq!(TestCaseLayout::for_format_version(1), None);
+
+        // Argument, input, and expected changes all refresh the identity.
+        let identity = |directory: &TestCaseDirectory| {
+            directory
+                .list_cases_for(TestCaseLayout::Extended)
+                .unwrap()
+                .into_iter()
+                .find(|case| case.name() == "count")
+                .unwrap()
+        };
+        let original = identity(&directory);
+        fs::write(cases_root.join("count.args"), b"-c\nfn  main\n").unwrap();
+        let changed_args = identity(&directory);
+        assert_ne!(changed_args, original);
+        fs::write(cases_root.join("count.in"), b"").unwrap();
+        let added_input = identity(&directory);
+        assert_ne!(added_input, changed_args);
+        assert!(added_input.has_input());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixture_tree_hash_reads_the_deployed_tree_or_reports_its_absence() {
+        let parent = fixture("fixture-hash");
+        let cases_root = parent.join("test-cases");
+        fs::create_dir(&cases_root).unwrap();
+        fs::write(cases_root.join("case.expected"), b"").unwrap();
+        let directory = TestCaseDirectory::open(&parent.join("assignment.work")).unwrap();
+        assert_eq!(directory.fixture_tree_hash().unwrap(), None);
+        assert_eq!(directory.fixtures_path(), cases_root.join("files"));
+
+        fs::create_dir_all(cases_root.join("files/src")).unwrap();
+        fs::write(cases_root.join("files/src/lib.rs"), b"fn a() {}\n").unwrap();
+        let expected = FixtureTree::from_parts(
+            [],
+            [(
+                WorkspacePath::new("src/lib.rs").unwrap(),
+                b"fn a() {}\n".to_vec(),
+            )],
+        )
+        .unwrap()
+        .hash();
+        assert_eq!(directory.fixture_tree_hash().unwrap(), Some(expected));
+
+        symlink("../../outside", cases_root.join("files/src/escape")).unwrap();
+        assert!(directory.fixture_tree_hash().is_err());
         fs::remove_dir_all(parent).unwrap();
     }
 

@@ -148,6 +148,42 @@ impl ConsoleCommandRoute {
     pub fn is_plain(&self) -> bool {
         self.args.is_empty() && self.working_directory.is_workspace() && self.test_case.is_none()
     }
+
+    /// The route of a format 3 packaged-case Run: stdin is the case's own
+    /// `NAME.in` when it has one and closed otherwise, stdout is captured for
+    /// comparison, and a fixture hash selects the `test-cases/files/` working
+    /// directory. The Run argv must then end with
+    /// `--locked [--manifest-path PATH] [-- ARG...]` to validate.
+    pub fn packaged_case(
+        case: &str,
+        has_input: bool,
+        args: Vec<String>,
+        fixtures_blake3: Option<Hash>,
+    ) -> Result<Self, ValidationError> {
+        require(is_valid_test_case_name(case), "test-case name grammar")?;
+        require(
+            are_valid_test_case_args(&args),
+            "bounded literal console Run arguments",
+        )?;
+        let stdin = if has_input {
+            ConsoleStdinRoute::File {
+                path: WorkspacePath::new(format!("{case}.in"))
+                    .expect("a valid case name makes a valid input path"),
+            }
+        } else {
+            ConsoleStdinRoute::Closed
+        };
+        Ok(Self {
+            stdin,
+            stdout: ConsoleStdoutRoute::Console,
+            args,
+            working_directory: fixtures_blake3
+                .map_or(ConsoleWorkingDirectory::Workspace, |fixtures_blake3| {
+                    ConsoleWorkingDirectory::Fixtures { fixtures_blake3 }
+                }),
+            test_case: Some(case.to_owned()),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -302,6 +338,26 @@ pub struct TestCaseInvocation {
 pub enum TestCaseStdin {
     Closed,
     File { blake3: Hash },
+}
+
+impl TestCaseInvocation {
+    /// The invocation block for a comparison of a Run on `route`, given the
+    /// BLAKE3 of the `NAME.in` bytes that were read before launch. Returns
+    /// `None` unless the route names a packaged case and the input hash is
+    /// present exactly when the route reads `NAME.in`.
+    pub fn for_route(route: &ConsoleCommandRoute, input_blake3: Option<Hash>) -> Option<Self> {
+        route.test_case.as_ref()?;
+        let stdin = match (&route.stdin, input_blake3) {
+            (ConsoleStdinRoute::Closed, None) => TestCaseStdin::Closed,
+            (ConsoleStdinRoute::File { .. }, Some(blake3)) => TestCaseStdin::File { blake3 },
+            _ => return None,
+        };
+        Some(Self {
+            args_blake3: test_case_args_blake3(&route.args),
+            stdin,
+            fixtures_blake3: route.working_directory.fixtures_blake3(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
