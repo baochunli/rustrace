@@ -3,14 +3,17 @@ use crate::display;
 use crate::session::{ProductionSession, ReadOnlyFinalizationStatus, ResumeChoice};
 use rustrace_model::WorkspacePath;
 use rustrace_workspace::{
-    RegularFileIdentity,
+    DirectoryIdentity, RegularFileIdentity, WorkspaceMutationError,
     assignment_package::{
         ExtractedTestCaseSuite, ExtractionLimits, PublishPreparedWorkspaceError,
         create_empty_directory_no_replace, extract_assignment_package, publish_prepared_workspace,
     },
-    create_external_regular_file_in, external_regular_file_exists_in,
+    create_external_directory_in, create_external_regular_file_in, external_directory_exists_in,
+    external_regular_file_exists_in,
+    fixture_tree::FIXTURE_ROOT,
     hash::{PinnedWorkspaceRoot, hash_workspace},
-    open_external_regular_file_read_in, remove_created_external_regular_file_in,
+    open_external_regular_file_read_in, remove_created_external_directory_in,
+    remove_created_external_regular_file_in,
 };
 use std::{
     error::Error,
@@ -225,8 +228,9 @@ fn preflight_test_case_suite(workspace_root: &Path, suite: &ExtractedTestCaseSui
     let Some(root) = open_existing_test_case_root(&sibling)? else {
         return Ok(());
     };
-    for_each_test_case_file(suite, |path, contents| {
-        preflight_test_case_file(&root, path, contents)
+    for_each_managed_node(suite, |node| match node {
+        ManagedNode::Directory(path) => preflight_test_case_directory(&root, path),
+        ManagedNode::File(path, contents) => preflight_test_case_file(&root, path, contents),
     })?;
     root.verify_binding()?;
     Ok(())
@@ -247,18 +251,30 @@ fn deploy_test_case_suite_with(
         Some(root) => (root, false),
         None => (create_empty_directory_no_replace(&sibling)?, true),
     };
-    let mut created = Vec::<(WorkspacePath, RegularFileIdentity)>::new();
-    let mut managed_file_index = 0;
-    let deployment = for_each_test_case_file(suite, |path, contents| {
-        managed_file_index += 1;
-        before_managed_file(managed_file_index, path)?;
-        if external_regular_file_exists_in(&root, path)? {
-            return preflight_test_case_file(&root, path, contents);
+    let mut created = Vec::<CreatedNode>::new();
+    let mut managed_node_index = 0;
+    let deployment = for_each_managed_node(suite, |node| {
+        managed_node_index += 1;
+        match node {
+            ManagedNode::Directory(path) => {
+                before_managed_file(managed_node_index, path)?;
+                if external_directory_exists_in(&root, path)? {
+                    return Ok(());
+                }
+                let identity = create_external_directory_in(&root, path)?;
+                created.push(CreatedNode::Directory(path.clone(), identity));
+            }
+            ManagedNode::File(path, contents) => {
+                before_managed_file(managed_node_index, path)?;
+                if external_regular_file_exists_in(&root, path)? {
+                    return preflight_test_case_file(&root, path, contents);
+                }
+                let mut file = create_external_regular_file_in(&root, path)?;
+                created.push(CreatedNode::File(path.clone(), file.identity()));
+                file.file_mut().write_all(contents)?;
+                file.file_mut().sync_all()?;
+            }
         }
-        let mut file = create_external_regular_file_in(&root, path)?;
-        created.push((path.clone(), file.identity()));
-        file.file_mut().write_all(contents)?;
-        file.file_mut().sync_all()?;
         root.verify_binding()?;
         Ok(())
     })
@@ -268,8 +284,18 @@ fn deploy_test_case_suite_with(
     });
     if let Err(error) = deployment {
         let mut cleanup_failures = Vec::new();
-        for (path, identity) in created.into_iter().rev() {
-            if let Err(cleanup) = remove_created_external_regular_file_in(&root, &path, identity) {
+        for node in created.into_iter().rev() {
+            let (path, cleanup) = match node {
+                CreatedNode::File(path, identity) => {
+                    let cleanup = remove_created_external_regular_file_in(&root, &path, identity);
+                    (path, cleanup)
+                }
+                CreatedNode::Directory(path, identity) => {
+                    let cleanup = remove_created_external_directory_in(&root, &path, identity);
+                    (path, cleanup)
+                }
+            };
+            if let Err(cleanup) = cleanup {
                 cleanup_failures.push(format!("{path}: {cleanup}"));
             }
         }
@@ -347,12 +373,34 @@ fn cleanup_failed_publication(
     cleanup_error(error, cleanup, &path)
 }
 
+/// A missing parent means the packaged path does not exist yet; deployment
+/// creates parents before their children.
+fn missing_parent_is_absent(
+    result: std::result::Result<bool, WorkspaceMutationError>,
+) -> Result<bool> {
+    match result {
+        Ok(exists) => Ok(exists),
+        Err(WorkspaceMutationError::MissingParent { .. }) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn preflight_test_case_directory(root: &PinnedWorkspaceRoot, path: &WorkspacePath) -> Result<()> {
+    missing_parent_is_absent(external_directory_exists_in(root, path)).map_err(|error| {
+        format!(
+            "packaged fixture directory `{}` cannot be deployed: {error}",
+            root.path().join(path.as_str()).display()
+        )
+    })?;
+    Ok(())
+}
+
 fn preflight_test_case_file(
     root: &PinnedWorkspaceRoot,
     path: &WorkspacePath,
     expected: &[u8],
 ) -> Result<()> {
-    if !external_regular_file_exists_in(root, path)? {
+    if !missing_parent_is_absent(external_regular_file_exists_in(root, path))? {
         return Ok(());
     }
     let mut opened = open_external_regular_file_read_in(root, path)?;
@@ -373,15 +421,47 @@ fn preflight_test_case_file(
     Ok(())
 }
 
-fn for_each_test_case_file(
+/// One packaged path in the sibling `test-cases/` directory.
+enum ManagedNode<'a> {
+    Directory(&'a WorkspacePath),
+    File(&'a WorkspacePath, &'a [u8]),
+}
+
+enum CreatedNode {
+    File(WorkspacePath, RegularFileIdentity),
+    Directory(WorkspacePath, DirectoryIdentity),
+}
+
+/// Visits every packaged path in deployment order: each case's `.in`,
+/// `.args`, and `.expected` in name order, then the format 3 fixture tree
+/// with `files/` and every directory before the files below it.
+fn for_each_managed_node(
     suite: &ExtractedTestCaseSuite,
-    mut visit: impl FnMut(&WorkspacePath, &[u8]) -> Result<()>,
+    mut visit: impl FnMut(ManagedNode<'_>) -> Result<()>,
 ) -> Result<()> {
     for case in &suite.cases {
-        let input = WorkspacePath::new(format!("{}.in", case.name))?;
-        visit(&input, &case.input)?;
-        let expected = WorkspacePath::new(format!("{}.expected", case.name))?;
-        visit(&expected, &case.expected)?;
+        for (suffix, contents) in [
+            ("in", case.input.as_deref()),
+            ("args", case.args_file.as_deref()),
+            ("expected", Some(case.expected.as_slice())),
+        ] {
+            if let Some(contents) = contents {
+                let path = WorkspacePath::new(format!("{}.{suffix}", case.name))?;
+                visit(ManagedNode::File(&path, contents))?;
+            }
+        }
+    }
+    if let Some(fixtures) = &suite.fixtures {
+        let root = WorkspacePath::new(FIXTURE_ROOT)?;
+        visit(ManagedNode::Directory(&root))?;
+        for directory in fixtures.directories() {
+            let path = WorkspacePath::new(format!("{FIXTURE_ROOT}/{directory}"))?;
+            visit(ManagedNode::Directory(&path))?;
+        }
+        for (file, contents) in fixtures.files() {
+            let path = WorkspacePath::new(format!("{FIXTURE_ROOT}/{file}"))?;
+            visit(ManagedNode::File(&path, contents))?;
+        }
     }
     Ok(())
 }
@@ -559,9 +639,143 @@ mod deployment_tests {
         AssignmentPackageError, ExtractedTestCase, ExtractedTestCaseSuite,
         PublishPreparedWorkspaceError,
     };
+    use rustrace_workspace::fixture_tree::{FixtureTree, hash_deployed_fixture_tree};
     use rustrace_workspace::hash::PinnedWorkspaceRoot;
 
-    use super::{cleanup_failed_publication, publish_fresh_workspace_with};
+    use super::{cleanup_failed_publication, deploy_test_case_suite, publish_fresh_workspace_with};
+
+    fn path(value: &str) -> rustrace_model::WorkspacePath {
+        rustrace_model::WorkspacePath::new(value).unwrap()
+    }
+
+    fn format3_suite() -> ExtractedTestCaseSuite {
+        let fixtures = FixtureTree::from_parts(
+            [path("empty")],
+            [
+                (path("src/lib.rs"), b"fn a() {}\n".to_vec()),
+                (path("notes.txt"), b"fn\n".to_vec()),
+            ],
+        )
+        .unwrap();
+        ExtractedTestCaseSuite {
+            cases: vec![
+                ExtractedTestCase {
+                    name: "count".to_owned(),
+                    input: None,
+                    args_file: Some(b"-c\nfn\n".to_vec()),
+                    args: vec!["-c".to_owned(), "fn".to_owned()],
+                    expected: b"1\n".to_vec(),
+                },
+                ExtractedTestCase::paired("stdin", b"fn\n".to_vec(), b"fn\n".to_vec()),
+            ],
+            fixtures: Some(fixtures),
+            hash: Hash::zero(),
+            total_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn format3_deployment_writes_args_optional_input_and_the_fixture_tree() {
+        let temp = TempRoot::new();
+        let suite = format3_suite();
+        let prepared = temp.path().join("lab2.prepare");
+        let workspace = temp.path().join("lab2.work");
+        prepare_workspace(&prepared);
+        drop(
+            publish_fresh_workspace_with(&prepared, &workspace, Some(&suite), |_, _| Ok(()))
+                .unwrap(),
+        );
+
+        let sibling = temp.path().join("test-cases");
+        assert_eq!(fs::read(sibling.join("count.args")).unwrap(), b"-c\nfn\n");
+        assert_eq!(fs::read(sibling.join("count.expected")).unwrap(), b"1\n");
+        assert!(
+            !sibling.join("count.in").exists(),
+            "absent input stays absent"
+        );
+        assert_eq!(fs::read(sibling.join("stdin.in")).unwrap(), b"fn\n");
+        assert!(!sibling.join("stdin.args").exists());
+        assert!(sibling.join("files/empty").is_dir());
+        assert_eq!(
+            fs::read(sibling.join("files/src/lib.rs")).unwrap(),
+            b"fn a() {}\n"
+        );
+        assert!(!workspace.join("files").exists());
+        let root = PinnedWorkspaceRoot::open(&sibling).unwrap();
+        let expected = suite.fixtures.as_ref().unwrap().hash();
+        assert_eq!(hash_deployed_fixture_tree(&root).unwrap(), Some(expected));
+
+        // Resume recreates missing packaged paths and accepts identical ones.
+        fs::remove_file(sibling.join("files/src/lib.rs")).unwrap();
+        fs::remove_dir(sibling.join("files/src")).unwrap();
+        fs::remove_dir(sibling.join("files/empty")).unwrap();
+        fs::write(sibling.join("files/local.txt"), b"unrelated\n").unwrap();
+        deploy_test_case_suite(&workspace, &suite).unwrap();
+        assert_eq!(
+            fs::read(sibling.join("files/src/lib.rs")).unwrap(),
+            b"fn a() {}\n"
+        );
+        assert!(sibling.join("files/empty").is_dir());
+        assert_eq!(
+            fs::read(sibling.join("files/local.txt")).unwrap(),
+            b"unrelated\n"
+        );
+        fs::remove_file(sibling.join("files/local.txt")).unwrap();
+        assert_eq!(hash_deployed_fixture_tree(&root).unwrap(), Some(expected));
+
+        // A changed packaged fixture is refused, never overwritten.
+        fs::write(sibling.join("files/notes.txt"), b"edited\n").unwrap();
+        let error = deploy_test_case_suite(&workspace, &suite).expect_err("changed fixture");
+        assert!(error.to_string().contains("different bytes"), "{error}");
+        assert_eq!(
+            fs::read(sibling.join("files/notes.txt")).unwrap(),
+            b"edited\n"
+        );
+        fs::write(sibling.join("files/notes.txt"), b"fn\n").unwrap();
+
+        // A symlinked or non-directory fixture directory is refused.
+        fs::remove_dir(sibling.join("files/empty")).unwrap();
+        std::os::unix::fs::symlink("../..", sibling.join("files/empty")).unwrap();
+        assert!(deploy_test_case_suite(&workspace, &suite).is_err());
+        fs::remove_file(sibling.join("files/empty")).unwrap();
+        fs::write(sibling.join("files/empty"), b"").unwrap();
+        assert!(deploy_test_case_suite(&workspace, &suite).is_err());
+    }
+
+    #[test]
+    fn failed_fixture_deployment_rolls_back_created_files_and_directories() {
+        // Managed order: count.args, count.expected, stdin.in,
+        // stdin.expected, files, files/empty, files/src, files/notes.txt,
+        // files/src/lib.rs.
+        for target in [6, 7, 9] {
+            let temp = TempRoot::new();
+            let sibling = temp.path().join("test-cases");
+            fs::create_dir(&sibling).unwrap();
+            fs::write(sibling.join("stdin.in"), b"fn\n").unwrap();
+            fs::write(sibling.join("unrelated.txt"), b"keep\n").unwrap();
+            let prepared = temp.path().join("lab2.prepare");
+            let workspace = temp.path().join("lab2.work");
+            prepare_workspace(&prepared);
+            let error = publish_fresh_workspace_with(
+                &prepared,
+                &workspace,
+                Some(&format3_suite()),
+                fail_managed_file(target),
+            )
+            .expect_err("injected failure");
+            assert!(
+                error.to_string().contains("injected deployment failure"),
+                "{target}: {error}"
+            );
+            assert!(!workspace.exists());
+            let mut remaining = fs::read_dir(&sibling)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<Vec<_>>();
+            remaining.sort();
+            assert_eq!(remaining, ["stdin.in", "unrelated.txt"], "{target}");
+        }
+    }
 
     #[test]
     fn failed_case_deployment_rolls_back_only_attempt_created_paths() {
@@ -675,17 +889,18 @@ mod deployment_tests {
     fn suite() -> ExtractedTestCaseSuite {
         ExtractedTestCaseSuite {
             cases: vec![
-                ExtractedTestCase {
-                    name: "alpha".to_owned(),
-                    input: b"alpha input\n".to_vec(),
-                    expected: b"alpha expected\n".to_vec(),
-                },
-                ExtractedTestCase {
-                    name: "beta".to_owned(),
-                    input: b"beta input\n".to_vec(),
-                    expected: b"beta expected\n".to_vec(),
-                },
+                ExtractedTestCase::paired(
+                    "alpha",
+                    b"alpha input\n".to_vec(),
+                    b"alpha expected\n".to_vec(),
+                ),
+                ExtractedTestCase::paired(
+                    "beta",
+                    b"beta input\n".to_vec(),
+                    b"beta expected\n".to_vec(),
+                ),
             ],
+            fixtures: None,
             hash: Hash::zero(),
             total_bytes: 52,
         }

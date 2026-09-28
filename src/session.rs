@@ -2760,12 +2760,15 @@ fn require_test_case_suite_identity(
     test_case_suite_hash: Option<Hash>,
 ) -> Result<()> {
     match (manifest.format_version, test_case_suite_hash) {
-        (1, None) | (2, Some(_)) => Ok(()),
+        (1, None) | (2 | 3, Some(_)) => Ok(()),
         (1, Some(_)) => {
             Err("format_version = 1 sessions cannot record a packaged test-case suite".into())
         }
         (2, None) => {
             Err("format_version = 2 sessions require a validated test-case suite hash".into())
+        }
+        (3, None) => {
+            Err("format_version = 3 sessions require a validated test-case suite hash".into())
         }
         _ => Err("unsupported assignment package identity".into()),
     }
