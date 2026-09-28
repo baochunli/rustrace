@@ -1451,6 +1451,86 @@ fn format3_reference_verifies_arguments_closed_stdin_and_fixtures() {
 }
 
 #[test]
+fn format3_revision_gets_its_own_claimed_case_folder() {
+    let fixture = FixtureRoot::new("format3-revise");
+    let root = fixture.case("course");
+    let manifest = String::from_utf8(SESSION_MANIFEST.to_vec())
+        .unwrap()
+        .replacen("format_version = 1", "format_version = 3", 1);
+    let package = root.join("lab2.rta");
+    fs::write(
+        &package,
+        assignment_tar(&[
+            StoredZipEntry::file("assignment.toml", manifest.as_bytes()),
+            StoredZipEntry::file(
+                "starter/Cargo.toml",
+                b"[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n[workspace]\n",
+            ),
+            StoredZipEntry::file("starter/main.rs", b"fn main() {}\n"),
+            StoredZipEntry::file("test-cases/sample.args", b"-n\n"),
+            StoredZipEntry::file("test-cases/sample.expected", b"1\n"),
+            StoredZipEntry::file("test-cases/files/notes.txt", b"notes\n"),
+        ]),
+    )
+    .unwrap();
+    let parent = root.join("lab2.work");
+    let extracted = extract_assignment_package(
+        fs::File::open(&package).unwrap(),
+        &parent,
+        ExtractionLimits::default(),
+    )
+    .unwrap();
+    let fixtures = extracted
+        .test_cases
+        .as_ref()
+        .unwrap()
+        .fixtures
+        .as_ref()
+        .unwrap()
+        .hash();
+    ProductionSession::start_from_assignment(&parent, &extracted)
+        .unwrap()
+        .finalize("student-1")
+        .unwrap();
+    let arg = |path: &Path| path.to_string_lossy().into_owned();
+
+    // An unusable revision name is refused before anything is created.
+    let refused = root.join("lab2-rev.test-cases");
+    let error = rustrace::session::run_revise(
+        &[arg(&parent), arg(&refused), arg(&package)],
+        &mut Vec::new(),
+    )
+    .expect_err("case-folder name");
+    assert!(error.to_string().contains("format 3 workspace"), "{error}");
+    assert!(!refused.exists());
+
+    let revision = root.join("lab2-rev.work");
+    let mut output = Vec::new();
+    rustrace::session::run_revise(&[arg(&parent), arg(&revision), arg(&package)], &mut output)
+        .unwrap();
+    let folder = root.join("lab2-rev.test-cases");
+    let marker: Value =
+        serde_json::from_slice(&fs::read(folder.join(".rustrace-cases.json")).unwrap()).unwrap();
+    assert_eq!(marker["workspace"], "lab2-rev.work");
+    assert_eq!(fs::read(folder.join("sample.args")).unwrap(), b"-n\n");
+    assert_eq!(
+        fs::read(folder.join("files/notes.txt")).unwrap(),
+        b"notes\n"
+    );
+    let metadata: Value =
+        serde_json::from_slice(&fs::read(revision.join(".rustrace/session.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        metadata["test_case_fixtures_hash"],
+        Value::from(fixtures.to_string())
+    );
+    assert!(
+        !root.join("test-cases").exists(),
+        "format 3 never uses the shared folder"
+    );
+}
+
+#[test]
 fn format2_packaged_case_evidence_keeps_its_historical_shape() {
     let fixture = FixtureRoot::new("format2-shape");
     let case = fixture.case("lab1");
