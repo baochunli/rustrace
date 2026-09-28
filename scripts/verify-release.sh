@@ -74,7 +74,7 @@ fi
 for required_line in \
     "event format: 1" \
     "package format: 1" \
-    "assignment format: 2" \
+    "assignment format: 3" \
     "target: $target"
 do
     if ! grep -Fqx "$required_line" "$version_file"; then

@@ -1989,6 +1989,7 @@ fn linked_v1_event_stream_round_trips_the_additive_comparison_event() {
             expected_blake3: digest,
             actual_blake3: Some(digest),
             outcome: TestCaseComparisonOutcome::Pass,
+            invocation: None,
         }),
     );
     let event_count = events.len() as u64 + 1;

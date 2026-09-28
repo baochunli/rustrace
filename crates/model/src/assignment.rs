@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::Deserialize;
 
-pub const SUPPORTED_FORMAT_VERSION: u32 = 2;
+pub const SUPPORTED_FORMAT_VERSION: u32 = 3;
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 pub const MAX_IDENTIFIER_BYTES: usize = 128;
 pub const MAX_TITLE_BYTES: usize = 256;

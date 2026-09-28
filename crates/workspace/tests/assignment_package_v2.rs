@@ -460,7 +460,10 @@ fn v1_suite_hash_domain_has_a_fixed_golden_value() {
     let mut entries = base_entries(&manifest);
     entries.extend([
         Entry::file("test-cases/01-opening.in", b"d3\n"),
-        Entry::file("test-cases/01-opening.expected", b"  abcdefgh\n1 ........\n"),
+        Entry::file(
+            "test-cases/01-opening.expected",
+            b"  abcdefgh\n1 ........\n",
+        ),
         Entry::file("test-cases/02-empty.in", b""),
         Entry::file("test-cases/02-empty.expected", b""),
     ]);

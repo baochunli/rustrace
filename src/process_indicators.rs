@@ -1100,7 +1100,7 @@ fn legacy_action(start: &rustrace_model::CommandStarted) -> Option<ControlledAct
 fn is_natural_output_console_command(start: &ControlledCommandStarted) -> bool {
     start.console.is_some()
         && !start
-            .argv
+            .cargo_argv()
             .iter()
             .any(|argument| argument == "--message-format=json")
 }
@@ -1942,6 +1942,39 @@ mod tests {
     }
 
     #[test]
+    fn program_arguments_never_make_a_natural_run_look_structured() {
+        let mut harness = Harness::new();
+        let mut start = started("format-3-run", ControlledAction::Run);
+        start.argv = [
+            "rustup",
+            "run",
+            "1.98.1",
+            "cargo",
+            "run",
+            "--locked",
+            "--",
+            "--message-format=json",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let mut route =
+            ConsoleCommandRoute::new(ConsoleStdinRoute::Closed, ConsoleStdoutRoute::Console);
+        route.args = vec!["--message-format=json".to_owned()];
+        route.test_case = Some("flag-lookalike".to_owned());
+        start.console = Some(route);
+        command_with_start(
+            &mut harness,
+            start,
+            b"natural program output\n",
+            CommandOutcome::Exited { code: 0 },
+            CaptureCompleteness::Complete,
+        );
+        let (factual, _) = harness.finish();
+        let run = run_facts(&factual);
+        assert_eq!((run.complete, run.exit_zero, run.unknown), (1, 1, 0));
+    }
+
+    #[test]
     fn natural_console_and_packaged_runs_are_known_without_structured_diagnostics() {
         for (id, stdin) in [
             ("console-run", ConsoleStdinRoute::Submitted),
@@ -1962,10 +1995,7 @@ mod tests {
                 "run".to_owned(),
                 "--locked".to_owned(),
             ];
-            start.console = Some(ConsoleCommandRoute {
-                stdin,
-                stdout: ConsoleStdoutRoute::Console,
-            });
+            start.console = Some(ConsoleCommandRoute::new(stdin, ConsoleStdoutRoute::Console));
             command_with_start(
                 &mut harness,
                 start,
@@ -2012,10 +2042,10 @@ mod tests {
                 let mut harness = Harness::new();
                 let mut start = started("natural-console", action);
                 start.argv = vec!["--locked".to_owned()];
-                start.console = Some(ConsoleCommandRoute {
-                    stdin: ConsoleStdinRoute::Closed,
-                    stdout: ConsoleStdoutRoute::Console,
-                });
+                start.console = Some(ConsoleCommandRoute::new(
+                    ConsoleStdinRoute::Closed,
+                    ConsoleStdoutRoute::Console,
+                ));
                 command_with_start(
                     &mut harness,
                     start,

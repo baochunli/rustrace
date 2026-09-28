@@ -786,6 +786,7 @@ fn prepared_compared_finish(
         expected_blake3: hash,
         actual_blake3: Some(hash),
         outcome: TestCaseComparisonOutcome::Pass,
+        invocation: None,
     };
     (finish, comparison)
 }

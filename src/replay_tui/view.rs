@@ -3984,6 +3984,7 @@ format = ["cargo", "fmt"]
                 expected_len: 4,
                 actual_len: 5,
             },
+            invocation: None,
         };
         let controller = ReplayController::from_test_events(
             clean_report(),

@@ -115,8 +115,8 @@ fn verbose_version_values_equal_fresh_production_session_metadata() {
         rustrace_model::RPROV_FORMAT_VERSION_V1
     );
     assert_eq!(persisted.format_version, 1);
-    assert_eq!(rustrace_model::assignment::SUPPORTED_FORMAT_VERSION, 2);
-    assert_eq!(reported.assignment_format, 2);
+    assert_eq!(rustrace_model::assignment::SUPPORTED_FORMAT_VERSION, 3);
+    assert_eq!(reported.assignment_format, 3);
     assert_eq!(
         reported.assignment_format,
         rustrace_model::assignment::SUPPORTED_FORMAT_VERSION
@@ -132,14 +132,14 @@ fn verbose_version_values_equal_fresh_production_session_metadata() {
     assert_eq!(
         output
             .lines()
-            .filter(|line| *line == "assignment format: 2")
+            .filter(|line| *line == "assignment format: 3")
             .count(),
         1
     );
     assert_eq!(
         output,
         format!(
-            "rustrace {}\nbuild commit: {}\nevent format: {persisted_event_format}\npackage format: {}\nassignment format: 2\ntarget: {}\n",
+            "rustrace {}\nbuild commit: {}\nevent format: {persisted_event_format}\npackage format: {}\nassignment format: 3\ntarget: {}\n",
             metadata.client_version,
             reported.build_commit(),
             persisted.format_version,

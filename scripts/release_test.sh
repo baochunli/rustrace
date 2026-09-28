@@ -24,7 +24,7 @@ printf '%s\n' \\
     'build commit: 0123456789abcdef' \\
     'event format: 1' \\
     'package format: 1' \\
-    'assignment format: 2' \\
+    'assignment format: 3' \\
     'target: $target'
 EOF
     chmod +x "$artifact_dir/rustrace"

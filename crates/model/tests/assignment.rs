@@ -62,8 +62,23 @@ fn parses_the_supported_v2_manifest_with_the_v1_fields() {
 }
 
 #[test]
+fn parses_the_supported_v3_manifest_with_the_v1_fields() {
+    let input = SAMPLE.replacen("format_version = 1", "format_version = 3", 1);
+
+    let manifest = AssignmentManifest::parse(input.as_bytes()).expect("valid v3 manifest");
+
+    assert_eq!(manifest.format_version, 3);
+    assert_eq!(manifest.commands.run, ["cargo", "run", "--locked"]);
+    let with_new_field = format!("{input}\nargs = [\"x\"]\n");
+    assert!(matches!(
+        AssignmentManifest::parse(with_new_field.as_bytes()),
+        Err(AssignmentManifestError::Malformed { .. })
+    ));
+}
+
+#[test]
 fn rejects_unsupported_format_versions_before_using_the_manifest() {
-    for version in [0, 3] {
+    for version in [0, 4] {
         let input = format!("format_version = {version}\n");
         let error = AssignmentManifest::parse(input.as_bytes()).expect_err("unsupported version");
 
@@ -71,7 +86,7 @@ fn rejects_unsupported_format_versions_before_using_the_manifest() {
             error,
             AssignmentManifestError::UnsupportedVersion {
                 found,
-                supported: 2
+                supported: 3
             } if found == version
         ));
         assert!(

@@ -164,6 +164,7 @@ fn compared_submissions() -> [EventSubmission; 2] {
         expected_blake3: Hash::zero(),
         actual_blake3: Some(Hash::zero()),
         outcome: rustrace_model::TestCaseComparisonOutcome::Pass,
+        invocation: None,
     });
     [finish, comparison].map(|event| EventSubmission {
         session_id: session_id(),

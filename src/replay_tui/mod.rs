@@ -2169,6 +2169,7 @@ mod tests {
                 expected_len: 4,
                 actual_len: 5,
             },
+            invocation: None,
         };
         let events = vec![
             envelope(
