@@ -48,7 +48,7 @@ impl Fixture {
         fs::write(self.receipt_path(),serde_json::to_vec(&serde_json::json!({"schema_version":1,"method":method,"path":self.binary,"repository":"https://github.com/baochunli/rustrace","version":env!("CARGO_PKG_VERSION"),"tag":format!("v{}",env!("CARGO_PKG_VERSION"))})).unwrap()).unwrap();
     }
     fn manifest(&self, version: &str) {
-        fs::write(self.root.join("latest.json"),serde_json::to_vec(&serde_json::json!({"schema_version":1,"version":version,"tag":format!("v{version}"),"commit":"a".repeat(40),"event_format":1,"package_format":1,"assignment_format":2,"source":{"repository":"https://github.com/baochunli/rustrace","tag":format!("v{version}")},"targets":{}})).unwrap()).unwrap();
+        fs::write(self.root.join("latest.json"),serde_json::to_vec(&serde_json::json!({"schema_version":1,"version":version,"tag":format!("v{version}"),"commit":"a".repeat(40),"event_format":1,"package_format":1,"assignment_format":3,"source":{"repository":"https://github.com/baochunli/rustrace","tag":format!("v{version}")},"targets":{}})).unwrap()).unwrap();
     }
     fn command(&self) -> Command {
         let mut cmd = self.home.command(&self.binary);
@@ -614,7 +614,7 @@ fn real_cargo_installs_tiny_local_tagged_crate() {
     )
     .unwrap();
     let version = format!(
-        "rustrace 99.0.0\nbuild commit: {}\nevent format: 1\npackage format: 1\nassignment format: 2\ntarget: {}",
+        "rustrace 99.0.0\nbuild commit: {}\nevent format: 1\npackage format: 1\nassignment format: 3\ntarget: {}",
         "a".repeat(40),
         rustrace::version::version_metadata().target()
     );

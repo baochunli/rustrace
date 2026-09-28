@@ -19,7 +19,7 @@ if mode in ['failure', 'wait-failure']:
     sys.exit(17)
 version = sys.argv[sys.argv.index('--tag') + 1][1:]
 target = os.environ['UPDATE_TARGET']
-lines = {'event': '1', 'package': '1', 'assignment': '2'}
+lines = {'event': '1', 'package': '1', 'assignment': '3'}
 if mode == 'version':
     version = '98.0.0'
 if mode == 'target':
