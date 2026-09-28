@@ -429,7 +429,7 @@ mod deployed {
             };
             let path = WorkspacePath::new(display(name))
                 .ok()
-                .filter(|path| is_fixture_path(path))
+                .filter(is_fixture_path)
                 .ok_or_else(|| FixtureTreeError::UnsupportedEntry {
                     path: display(name),
                     reason: "has a name that is not a canonical workspace path",
