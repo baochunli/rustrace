@@ -414,6 +414,36 @@ fn historical_controlled_events_reencode_without_new_default_fields() {
 }
 
 #[test]
+fn format_two_console_routes_reencode_byte_identically() {
+    // Lab 1 (format 2) packaged-case and console Run starts. Their canonical
+    // bytes must not gain any route field added for format 3 cases.
+    for route in [
+        json!({"stdin":{"kind":"file","path":"sample.in"},"stdout":{"kind":"console"}}),
+        json!({"stdin":{"kind":"submitted"},"stdout":{"kind":"console"}}),
+        json!({"stdin":{"kind":"file","path":"in.txt"},"stdout":{"kind":"file","path":"out.txt"}}),
+    ] {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&cargo_start("run", "run", &["--locked"], true)).unwrap();
+        value["event"]["payload"]["console"] = route.clone();
+        let original = serde_json::to_vec(&value).unwrap();
+        let DecodeOutcome::Decoded(decoded) =
+            decode_envelope(&original, DecodePolicy::RejectUnsupported).unwrap()
+        else {
+            panic!("not decoded")
+        };
+        let encoded = encode_envelope(&decoded).unwrap();
+        let reencoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(reencoded["event"]["payload"]["console"], route);
+        let DecodeOutcome::Decoded(again) =
+            decode_envelope(&encoded, DecodePolicy::RejectUnsupported).unwrap()
+        else {
+            panic!("not decoded")
+        };
+        assert_eq!(encode_envelope(&again).unwrap(), encoded);
+    }
+}
+
+#[test]
 fn comparison_events_have_exact_golden_json_and_closed_error_reasons() {
     let expected = "22".repeat(32);
     let actual = "33".repeat(32);
