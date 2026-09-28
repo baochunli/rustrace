@@ -5529,7 +5529,7 @@ format = ["cargo", "fmt"]
         let notice = session.external_notice().unwrap().to_owned();
         assert_eq!(
             notice,
-            "External changes are not accepted.\nRustrace preserves recovery evidence.\nRestoring current contents, including unsaved edits."
+            "External changes are not accepted.\nRustrace preserves recovery evidence.\nRestoring current contents, including unsaved edits.\nThe outside version is kept: run rustrace set-aside to view it."
         );
 
         let state = MainViewState::new(
@@ -5579,6 +5579,10 @@ format = ["cargo", "fmt"]
             (1, "External changes are not accepted."),
             (2, "Rustrace preserves recovery evidence."),
             (3, "Restoring current contents, including unsaved edits."),
+            (
+                4,
+                "The outside version is kept: run rustrace set-aside to view it.",
+            ),
         ] {
             let row = row_text(layout.bottom.y + offset);
             assert!(row.trim_end().ends_with(expected), "{row:?}",);

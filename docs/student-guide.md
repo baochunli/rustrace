@@ -77,6 +77,7 @@ blocked.
 | `rustrace submit WORKSPACE --student-id ID [--allow-incomplete] [--output PATH]` | Finalize locally and write the ZIP |
 | `rustrace revise PARENT_WORKSPACE NEW_WORKSPACE assignment.rta` | Start a new linked attempt after finalizing |
 | `rustrace cleanup WORKSPACE [--confirm] [--destroy-provenance]` | Remove build output, or all local recorded data after grades |
+| `rustrace set-aside WORKSPACE [--show N [--file PATH]]` | List or show file versions from outside Rustrace that recovery set aside |
 
 | Key | In the editor |
 | --- | --- |
@@ -455,7 +456,8 @@ choice. Resume validates the whole recorded history, restores your open files,
 and continues the same attempt. Undo history starts empty after a restart. If a
 file on disk changed while Rustrace was closed, resume restores the recorded
 contents and records what it observed; your work is not lost, but the outside
-change is not adopted.
+change is not adopted. Rustrace keeps the outside version, and
+[`rustrace set-aside`](#view-a-set-aside-version) shows it.
 
 Explicit recovery controls remain available: `--resume` selects the same path
 as automatic resume and `--inspect` shows the preserved views. You cannot resume a finalized attempt; Rustrace tells you to use
@@ -1099,6 +1101,40 @@ bundle and tells you to rerun with `--allow-incomplete`. That produces a ZIP
 clearly marked `INCOMPLETE RECOVERY EXPORT` which does not pass clean
 verification. Upload it only if your course staff ask for it, and tell them what
 happened.
+
+## View a set-aside version
+
+Rustrace records only the code you write in its editor. If a file changes
+outside Rustrace, for example because you edited it in another editor or copied
+a backup into the workspace, Rustrace does not adopt the change. It keeps the
+outside version as recovery evidence, puts back the recorded contents, and
+shows:
+
+```text
+External changes are not accepted.
+Rustrace preserves recovery evidence.
+Restoring current contents, including unsaved edits.
+The outside version is kept: run rustrace set-aside to view it.
+```
+
+Nothing is deleted. To see what was set aside, close Rustrace and run:
+
+```console
+rustrace set-aside assignment.work
+```
+
+It lists each set-aside version with its number, when it was captured, and how
+each file compares with your current recorded code. To read one file of a
+version, or every changed file when you leave out `--file`:
+
+```console
+rustrace set-aside assignment.work --show 1 --file src/main.rs
+```
+
+These commands only read; they never change your workspace or its history.
+Rustrace cannot bring a set-aside version back into the workspace. To use that
+code, type it in the Rustrace editor; pasting from outside Rustrace is blocked.
+If you need to re-enter a large amount of code this way, tell your course staff.
 
 ## Privacy notice
 
