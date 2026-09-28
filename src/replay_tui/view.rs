@@ -1936,6 +1936,28 @@ fn push_comparison_details(
         ),
         width,
     );
+    if let Some(invocation) = &comparison.invocation {
+        push_wrapped_lines(
+            lines,
+            &format!("Arguments BLAKE3: {}", invocation.args_blake3),
+            width,
+        );
+        let stdin = match &invocation.stdin {
+            rustrace_model::TestCaseStdin::Closed => "closed".to_owned(),
+            rustrace_model::TestCaseStdin::File { blake3 } => format!("input file {blake3}"),
+        };
+        push_wrapped_lines(lines, &format!("Standard input: {stdin}"), width);
+        push_wrapped_lines(
+            lines,
+            &format!(
+                "Fixture tree BLAKE3: {}",
+                invocation
+                    .fixtures_blake3
+                    .map_or_else(|| "none".to_owned(), |hash| hash.to_string())
+            ),
+            width,
+        );
+    }
 }
 
 fn comparison_error_label(reason: rustrace_model::TestCaseComparisonError) -> &'static str {
@@ -4013,6 +4035,50 @@ format = ["cargo", "fmt"]
         );
         assert!(rendered.contains("Expected BLAKE3:"), "{rendered}");
         assert!(rendered.contains("Actual BLAKE3:"), "{rendered}");
+        assert!(!rendered.contains("Arguments BLAKE3:"), "{rendered}");
+    }
+
+    #[test]
+    fn format3_comparison_details_show_the_recorded_case_identity() {
+        let comparison = rustrace_model::TestCaseCompared {
+            command_id: rustrace_model::CommandId::new("command-1").unwrap(),
+            case: "search".to_owned(),
+            expected_blake3: Hash::from_bytes([1; 32]),
+            actual_blake3: Some(Hash::from_bytes([1; 32])),
+            outcome: rustrace_model::TestCaseComparisonOutcome::Pass,
+            invocation: Some(rustrace_model::TestCaseInvocation {
+                args_blake3: Hash::from_bytes([3; 32]),
+                stdin: rustrace_model::TestCaseStdin::Closed,
+                fixtures_blake3: Some(Hash::from_bytes([4; 32])),
+            }),
+        };
+        let controller = ReplayController::from_test_events(
+            clean_report(),
+            super::super::TimingAvailability::Recorded,
+            vec![EventEnvelope {
+                format_version: 1,
+                session_id: SessionId::new("render-test").unwrap(),
+                sequence: 1,
+                monotonic_millis: 0,
+                wall_clock_utc: None,
+                previous_event_hash: Hash::zero(),
+                event_hash: Hash::zero(),
+                event: RecordedEvent::TestCaseCompared(comparison),
+            }],
+        );
+
+        let rendered = render_controller(&controller, 160, 40);
+
+        assert!(rendered.contains("Test case search: pass"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("Arguments BLAKE3: {}", "03".repeat(32))),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Standard input: closed"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("Fixture tree BLAKE3: {}", "04".repeat(32))),
+            "{rendered}"
+        );
     }
 
     #[test]
