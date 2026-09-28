@@ -63,11 +63,14 @@ for operation in ["rename", "rename-controls", "rename-cancel", "delete", "confi
                 send(b"\x7f" * len("other.rs")); send(b"renamed.rs")
                 if operation == "rename-controls":
                     send(b"x\x7f\x1b[B")  # Backspace and ignored tree navigation.
-            if operation in ["confirm", "cancel"]:
-                confirmation_deadline = time.monotonic() + 2
-                while "Delete other.rs?" not in rendered_screen(transcript, rows=32, columns=120) and time.monotonic() < confirmation_deadline:
+            def wait_delete_prompt():
+                # Deleting asks for the file's exact name.
+                prompt_deadline = time.monotonic() + 2
+                while "type other.rs to delete it" not in rendered_screen(transcript, rows=32, columns=120) and time.monotonic() < prompt_deadline:
                     pump(.05)
-                assert "Delete other.rs?" in rendered_screen(transcript, rows=32, columns=120), transcript
+                assert "type other.rs to delete it" in rendered_screen(transcript, rows=32, columns=120), transcript
+            if operation in ["confirm", "cancel"]:
+                wait_delete_prompt()
             (root / "assignment.work/main.rs").write_bytes(b"C")
             if operation != "rename": pump(2.3)  # Poll while prompt/selection is live.
             if operation.startswith("rename"):
@@ -75,8 +78,10 @@ for operation in ["rename", "rename-controls", "rename-cancel", "delete", "confi
             else:
                 if operation == "delete":
                     send(b"\x1b[<2;4;4M"); send(b"\x1b[<0;5;7M")
+                    wait_delete_prompt()
+                    send(b"other.rs\r")
                 else:
-                    send({"confirm": b"y", "cancel": b"\x1b"}[operation])
+                    send({"confirm": b"other.rs\r", "cancel": b"\x1b"}[operation])
             send(b"\x11"); proc.wait(timeout=15); pump(.1)
             assert proc.returncode == 0, transcript
             assert b"TERMINAL_RESTORED" in transcript

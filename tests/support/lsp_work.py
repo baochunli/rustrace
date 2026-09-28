@@ -397,7 +397,9 @@ try:
         send(b"\x7f" * len("other.rs") + b"renamed.rs\r")
         wait_for(lambda: contents("renamed.rs", "Y" + initial["other.rs"])
                  and not (workspace / "other.rs").exists(), "rename publication")
-        send(b"\x17")  # Ctrl-W deletes the saved selected file.
+        send(b"\x1b[<2;4;4M\x1b[<0;5;7M")  # renamed.rs menu, delete.
+        wait_for(lambda: b"type renamed.rs to delete it" in output, "delete prompt")
+        send(b"renamed.rs\r")  # Deleting requires the file's exact name.
         wait_for(lambda: not (workspace / "renamed.rs").exists(), "delete publication")
         (workspace / "src").mkdir()
         send(b"\x1b[<2;4;1M\x1b[<0;5;5M")  # files header menu, new file.
@@ -776,12 +778,12 @@ try:
             for message in transcript_messages()), "autosave timer reset undo")
         send(b"X")
         wait_for(lambda: "main.rs*" in screen_text(), "dirty active file")
-        send(b"\x17")  # Workspace-owned destructive delete confirmation.
-        wait_for(lambda: "dirty file: Y/Enter deletes, N/Esc cancels" in screen_text(),
+        send(b"\x1b[<2;4;3M\x1b[<0;5;6M")  # main.rs menu, delete: a typed-name prompt.
+        wait_for(lambda: "type main.rs to delete it" in screen_text(),
                  "active destructive confirmation")
         send(b"\x1b[19~")
         assert_no_reload()
-        send(b"n")
+        send(b"\x1b")
         wait_for(lambda: "file operation cancelled" in screen_text(),
                  "cancelled destructive confirmation")
         save_expect("main.rs", "X" + initial["main.rs"])

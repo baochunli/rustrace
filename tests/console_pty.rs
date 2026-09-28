@@ -46,7 +46,7 @@ fn workspace_confirmations_precede_console_input_and_restore_console_focus() {
 }
 
 #[test]
-fn exact_ctrl_w_opens_delete_confirmation_from_console_focus() {
+fn ctrl_w_is_inert_in_the_console_and_file_delete_requires_the_typed_name() {
     run_fixture("delete-confirmations");
 }
 

@@ -202,12 +202,13 @@ fn student_guide_explains_updates_and_terminal_owned_shortcuts() {
     ] {
         assert!(guide.contains(wording), "student guide must say: {wording}");
     }
-    for chord in ["Ctrl-Q", "Ctrl-W", "Ctrl-A", "Ctrl-C", "Ctrl-X", "Ctrl-V"] {
+    for chord in ["Ctrl-Q", "Ctrl-A", "Ctrl-C", "Ctrl-X", "Ctrl-V"] {
         assert!(
             guide.contains(chord),
             "student guide must advertise {chord}"
         );
     }
+    assert!(guide.contains("Ctrl-W, which closes a tab in many editors, does nothing in Rustrace"));
     let raw_guide = read_doc("student-guide.md");
     let key_table = raw_guide
         .split("| Key | In the editor |")

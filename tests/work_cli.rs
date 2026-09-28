@@ -515,7 +515,7 @@ fn real_work_cli_mouse_drives_editor_sidebar_tabs_and_scroll_without_churn() {
 
 #[cfg(unix)]
 #[test]
-fn real_work_cli_files_menu_deletes_after_confirmation_without_mouse_provenance() {
+fn real_work_cli_files_menu_deletes_after_the_typed_name_without_mouse_provenance() {
     let test_home = test_home::TestHome::new(false);
     let output = test_home
         .command("python3")

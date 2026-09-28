@@ -1158,19 +1158,18 @@ where
         if test_cases.is_open() {
             state = state.with_test_case_picker(test_cases.view_state());
         }
-        if let Some(prompt) = path_prompt.as_ref().filter(|prompt| {
-            matches!(
-                prompt.operation,
-                PathOperation::Create | PathOperation::Rename
-            )
-        }) {
-            state = state.with_file_prompt(FilePromptState::new(
-                match prompt.operation {
-                    PathOperation::Create => FilePromptKind::Create,
-                    PathOperation::Rename => FilePromptKind::Rename,
-                },
-                &prompt.input,
-            ));
+        if let Some(prompt) = path_prompt.as_ref() {
+            state = state.with_file_prompt(
+                FilePromptState::new(
+                    match prompt.operation {
+                        PathOperation::Create => FilePromptKind::Create,
+                        PathOperation::Rename => FilePromptKind::Rename,
+                        PathOperation::Delete => FilePromptKind::Delete,
+                    },
+                    &prompt.input,
+                )
+                .with_target(&prompt.target),
+            );
         }
         if let Some(panel) = &find_panel {
             let counter = if panel.find.is_empty() {
@@ -2111,13 +2110,6 @@ where
             || test_cases.is_open()
             || selected_completion.is_some()
             || session.workspace().confirmation_pending();
-        let global_delete_shortcut = matches!(
-            &event,
-            Event::Key(key)
-                if key.kind != KeyEventKind::Release
-                    && has_exact_primary_modifier(key.modifiers, primary_modifier)
-                    && matches!(key.code, KeyCode::Char('w' | 'W'))
-        );
         // Ctrl-C stops any running command wherever focus is; the console keeps
         // its pane open, and a test-case queue stops with its active run.
         if command_active
@@ -2147,7 +2139,7 @@ where
             }
             session.cancel_command();
         }
-        if focus == WorkspaceFocus::Console && !modal_keyboard_active && !global_delete_shortcut {
+        if focus == WorkspaceFocus::Console && !modal_keyboard_active {
             if let Event::Key(key) = &event {
                 handle_console_key(
                     session,
@@ -2416,18 +2408,6 @@ where
                 path_prompt = Some(begin_path_prompt(session, PathOperation::Rename));
                 retire_paste_warning(&mut status);
             }
-            WorkspaceInput::DeleteSelected => {
-                observe_completion_trigger(
-                    session,
-                    &mut completion_trigger,
-                    CompletionTriggerInput::ModalEntry,
-                    input_now_ms,
-                );
-                match session.delete_selected() {
-                    Ok(outcome) => apply_workspace_outcome(outcome, &mut status),
-                    Err(error) => status = format!("delete rejected: {error}").into(),
-                }
-            }
             WorkspaceInput::ConfirmDestructive => {
                 observe_completion_trigger(
                     session,
@@ -2528,10 +2508,6 @@ fn apply_workspace_input(
             *path_prompt = Some(begin_path_prompt(session, PathOperation::Rename));
             retire_paste_warning(status);
         }
-        WorkspaceInput::DeleteSelected => match session.delete_selected() {
-            Ok(outcome) => apply_workspace_outcome(outcome, status),
-            Err(error) => status.replace(format!("delete rejected: {error}")),
-        },
         WorkspaceInput::ConfirmDestructive => {
             if session.workspace().delete_confirmation_pending() {
                 match session.confirm_delete() {
@@ -2574,11 +2550,16 @@ fn begin_path_prompt(
     session: &crate::session::ProductionSession,
     operation: PathOperation,
 ) -> PathPrompt {
+    let selected = session.workspace().selected_path().as_str();
     let initial = match operation {
-        PathOperation::Create => "",
-        PathOperation::Rename => session.workspace().selected_path().as_str(),
+        PathOperation::Create | PathOperation::Delete => "",
+        PathOperation::Rename => selected,
     };
-    PathPrompt::new(operation, initial)
+    let mut prompt = PathPrompt::new(operation, initial);
+    if operation == PathOperation::Delete {
+        prompt.target = selected.to_owned();
+    }
+    prompt
 }
 
 fn apply_path_prompt_action(
@@ -2602,6 +2583,17 @@ fn apply_path_prompt_action(
             let result = match prompt.operation {
                 PathOperation::Create => session.create_file(&path),
                 PathOperation::Rename => session.rename_selected(&path),
+                PathOperation::Delete
+                    if path != prompt.target
+                        || session.workspace().selected_path().as_str() != prompt.target =>
+                {
+                    status.replace(format!(
+                        "file not deleted: type {} exactly to delete it",
+                        prompt.target
+                    ));
+                    return;
+                }
+                PathOperation::Delete => delete_confirmed(session),
             };
             match result {
                 Ok(outcome) => {
@@ -2627,8 +2619,24 @@ fn apply_path_prompt_action(
 fn submitted_path(prompt: &PathPrompt) -> String {
     match prompt.operation {
         PathOperation::Create => format!("src/{}", prompt.input),
-        PathOperation::Rename => prompt.input.clone(),
+        PathOperation::Rename | PathOperation::Delete => prompt.input.clone(),
     }
+}
+
+/// The typed name is the confirmation: request the delete and confirm it at
+/// once, and never leave a pending delete behind for the Enter-to-confirm
+/// dialog.
+fn delete_confirmed(
+    session: &mut crate::session::ProductionSession,
+) -> Result<WorkspaceOutcome, Box<dyn Error>> {
+    let outcome = match session.delete_selected()? {
+        WorkspaceOutcome::ConfirmationRequired => session.confirm_delete(),
+        outcome => Ok(outcome),
+    };
+    if session.workspace().delete_confirmation_pending() {
+        session.workspace_mut().cancel_delete();
+    }
+    outcome
 }
 
 fn activate_editor_context_menu_entry(
@@ -2706,16 +2714,17 @@ fn activate_files_context_menu_entry(
             retire_paste_warning(status);
             WorkspaceOutcome::NoChange
         }
-        FilesContextMenuAction::Delete => match session.delete_selected() {
-            Ok(outcome) => {
-                apply_workspace_outcome(outcome, status);
-                outcome
+        // Deleting asks for the file's name, so it cannot happen by accident.
+        FilesContextMenuAction::Delete => {
+            match session.check_delete_selected() {
+                Ok(()) => {
+                    *path_prompt = Some(begin_path_prompt(session, PathOperation::Delete));
+                    retire_paste_warning(status);
+                }
+                Err(error) => status.replace(format!("delete rejected: {error}")),
             }
-            Err(error) => {
-                status.replace(format!("delete rejected: {error}"));
-                WorkspaceOutcome::NoChange
-            }
-        },
+            WorkspaceOutcome::NoChange
+        }
         FilesContextMenuAction::NewFile => {
             *path_prompt = Some(begin_path_prompt(session, PathOperation::Create));
             retire_paste_warning(status);
@@ -4116,7 +4125,9 @@ format = ["cargo", "fmt"]
     }
 
     #[test]
-    fn files_menu_delete_matches_confirmation_events_and_last_file_refusal() {
+    fn files_menu_delete_requires_the_typed_name_and_matches_direct_events() {
+        // Saved files: autosave keeps nearly every file saved, and these used
+        // to be deleted without any confirmation.
         let menu_fixture = FilesMenuFixture::new(&["src/a.rs", "src/b.rs"]);
         let direct_fixture = FilesMenuFixture::new(&["src/a.rs", "src/b.rs"]);
         let mut menu_session = menu_fixture.start();
@@ -4126,42 +4137,78 @@ format = ["cargo", "fmt"]
                 .workspace_mut()
                 .select_path(&WorkspacePath::new("src/b.rs").unwrap())
                 .unwrap();
-            session.workspace_mut().activate_selected().unwrap();
-            session
-                .execute(crate::tui::EditorCommand::Insert('!'))
-                .unwrap();
         }
+        let before = menu_fixture.lifecycle_events();
+        let mut status: StatusMessage = "previous notice".into();
+        let mut focus = WorkspaceFocus::Editor;
+        let mut follow = false;
+        let mut prompt = None;
+        let mut open_delete_prompt =
+            |session: &mut crate::session::ProductionSession,
+             status: &mut StatusMessage,
+             prompt: &mut Option<PathPrompt>| {
+                assert_eq!(
+                    files_menu(session, 2, status, &mut focus, &mut follow, prompt),
+                    Some((FilesContextMenuAction::Delete, WorkspaceOutcome::NoChange))
+                );
+            };
+        open_delete_prompt(&mut menu_session, &mut status, &mut prompt);
+        let opened = prompt.as_ref().expect("delete asks for the file's name");
+        assert_eq!(opened.operation, PathOperation::Delete);
+        assert_eq!(opened.target, "src/b.rs");
+        assert!(opened.input.is_empty());
+        assert!(!menu_session.workspace().delete_confirmation_pending());
+        assert!(menu_fixture.0.join("src/b.rs").exists());
 
-        let mut menu_status: StatusMessage = "previous notice".into();
-        let mut menu_focus = WorkspaceFocus::Editor;
-        let mut menu_follow = false;
-        let mut menu_prompt = None;
-        assert_eq!(
-            files_menu(
+        // Anything but the exact path keeps the file and leaves nothing pending.
+        for typed in ["", "src/b", "b.rs", "src/b.rs ", "SRC/B.RS"] {
+            if prompt.is_none() {
+                open_delete_prompt(&mut menu_session, &mut status, &mut prompt);
+            }
+            prompt.as_mut().unwrap().input = typed.to_owned();
+            let mut submit_focus = WorkspaceFocus::Editor;
+            let mut submit_follow = false;
+            apply_path_prompt_action(
                 &mut menu_session,
-                2,
-                &mut menu_status,
-                &mut menu_focus,
-                &mut menu_follow,
-                &mut menu_prompt,
-            ),
-            Some((
-                FilesContextMenuAction::Delete,
-                WorkspaceOutcome::ConfirmationRequired,
-            ))
-        );
-        let mut direct_status: StatusMessage = "previous notice".into();
-        let direct_outcome = direct_session.delete_selected().unwrap();
-        apply_workspace_outcome(direct_outcome, &mut direct_status);
-        assert_eq!(menu_status.as_str(), direct_status.as_str());
-        assert!(menu_session.workspace().delete_confirmation_pending());
+                &mut prompt,
+                PathPromptAction::Submit,
+                &mut status,
+                &mut submit_focus,
+                &mut submit_follow,
+            );
+            assert!(prompt.is_none());
+            assert!(
+                status.contains("file not deleted"),
+                "{typed:?}: {}",
+                status.as_str()
+            );
+            assert!(!menu_session.workspace().delete_confirmation_pending());
+            assert!(menu_fixture.0.join("src/b.rs").exists(), "{typed:?}");
+        }
+        assert_eq!(menu_fixture.lifecycle_events(), before);
 
-        let menu_outcome = menu_session.confirm_delete().unwrap();
-        let direct_outcome = direct_session.confirm_delete().unwrap();
-        apply_workspace_outcome(menu_outcome, &mut menu_status);
-        apply_workspace_outcome(direct_outcome, &mut direct_status);
-        assert_eq!(menu_outcome, WorkspaceOutcome::FileDeleted);
-        assert_eq!(menu_status.as_str(), direct_status.as_str());
+        open_delete_prompt(&mut menu_session, &mut status, &mut prompt);
+        prompt.as_mut().unwrap().input = "src/b.rs".to_owned();
+        let mut submit_focus = WorkspaceFocus::Editor;
+        let mut submit_follow = false;
+        apply_path_prompt_action(
+            &mut menu_session,
+            &mut prompt,
+            PathPromptAction::Submit,
+            &mut status,
+            &mut submit_focus,
+            &mut submit_follow,
+        );
+        assert!(!menu_fixture.0.join("src/b.rs").exists());
+        assert!(!menu_session.workspace().delete_confirmation_pending());
+
+        let direct_outcome = direct_session.delete_selected().unwrap();
+        assert_eq!(direct_outcome, WorkspaceOutcome::ConfirmationRequired);
+        assert!(direct_fixture.0.join("src/b.rs").exists());
+        assert_eq!(
+            direct_session.confirm_delete().unwrap(),
+            WorkspaceOutcome::FileDeleted
+        );
         assert_eq!(
             menu_fixture.lifecycle_events(),
             direct_fixture.lifecycle_events()
@@ -4174,7 +4221,6 @@ format = ["cargo", "fmt"]
                 .count(),
             1
         );
-        assert!(!menu_fixture.0.join("src/b.rs").exists());
 
         let refusal_fixture = FilesMenuFixture::new(&["src/only.rs"]);
         let mut refusal_session = refusal_fixture.start();
@@ -4198,6 +4244,10 @@ format = ["cargo", "fmt"]
             refusal_status.contains("last editable workspace file cannot be deleted"),
             "{}",
             refusal_status.as_str()
+        );
+        assert!(
+            refusal_prompt.is_none(),
+            "a refused delete asks for no name"
         );
         assert_eq!(refusal_fixture.lifecycle_events(), before);
         assert!(refusal_fixture.0.join("src/only.rs").exists());
@@ -6245,11 +6295,14 @@ format = ["cargo", "fmt"]
 enum PathOperation {
     Create,
     Rename,
+    Delete,
 }
 
 struct PathPrompt {
     operation: PathOperation,
     input: String,
+    // The selected path a delete prompt must be answered with.
+    target: String,
 }
 
 impl PathPrompt {
@@ -6257,6 +6310,7 @@ impl PathPrompt {
         Self {
             operation,
             input: initial.to_owned(),
+            target: String::new(),
         }
     }
 

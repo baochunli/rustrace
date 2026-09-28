@@ -153,13 +153,13 @@ pub enum WorkspaceInput {
     Editor(SessionInput),
     BeginCreate,
     BeginRename,
-    DeleteSelected,
     ConfirmDestructive,
     CancelDestructive,
 }
 
-pub const CTRL_W_DELETE_SELECTED_HELP_ENTRY: &str =
-    "Ctrl-W                 delete selected file (confirm if dirty)";
+/// Deleting a file is deliberately hard: there is no shortcut, and the file
+/// menu's delete asks the student to type the file's name.
+pub const DELETE_FILE_HELP_ENTRY: &str = "Right-click › delete   type its name to confirm";
 
 pub fn diagnostic_delta_for_event(event: &TerminalEvent) -> Option<isize> {
     let TerminalEvent::Key(key) = event else {
@@ -234,12 +234,6 @@ pub(crate) fn workspace_input_for_event_with_keyboard_enhancement(
             _ => None,
         };
     }
-    if has_exact_primary_modifier(key.modifiers, primary_modifier)
-        && matches!(key.code, KeyCode::Char('w' | 'W'))
-    {
-        return Some(WorkspaceInput::DeleteSelected);
-    }
-
     if focus == WorkspaceFocus::Console {
         return None;
     }
@@ -1209,9 +1203,23 @@ where
         Ok(WorkspaceOutcome::FileRenamed)
     }
 
+    /// Whether the selected file can be deleted, without changing anything.
+    pub fn check_delete_selected(&self) -> Result<(), WorkspaceError> {
+        self.ensure_mutable()?;
+        self.verified_disk_files()?;
+        self.delete_candidate().map(|_| ())
+    }
+
+    /// Every deletion waits for `confirm_delete`, even of a saved file:
+    /// autosave keeps nearly every file saved.
     pub fn request_delete_selected(&mut self) -> Result<WorkspaceOutcome, WorkspaceError> {
         self.ensure_mutable()?;
         self.verified_disk_files()?;
+        self.pending_delete = Some(self.delete_candidate()?);
+        Ok(WorkspaceOutcome::ConfirmationRequired)
+    }
+
+    fn delete_candidate(&self) -> Result<PendingDelete, WorkspaceError> {
         let selected = &self.files[self.selected_index];
         if !selected.user_editable {
             return Err(WorkspaceError::NotEditable {
@@ -1234,16 +1242,10 @@ where
         {
             return Err(WorkspaceError::LastEditableFile);
         }
-        let pending = PendingDelete {
+        Ok(PendingDelete {
             path: selected.path.clone(),
             document_id,
-        };
-        if selected.dirty {
-            self.pending_delete = Some(pending);
-            Ok(WorkspaceOutcome::ConfirmationRequired)
-        } else {
-            self.delete(pending)
-        }
+        })
     }
 
     pub fn confirm_delete(&mut self) -> Result<WorkspaceOutcome, WorkspaceError> {

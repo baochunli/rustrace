@@ -24,9 +24,9 @@ use rustrace::tui::shell::{
 };
 use rustrace::tui::theme::{Palette, ThemeConfig, ThemeName};
 use rustrace::tui::{
-    BufferTabViewEntry, COMMAND_MENU_ENTRIES, CTRL_W_DELETE_SELECTED_HELP_ENTRY, CommandMenuAction,
-    CompletionViewItem, ConfirmationState, DiagnosticLineMarker, DiagnosticMarkerKind, DrawGate,
-    EDITOR_CONTEXT_MENU_ENTRIES, EDITOR_KEY_HINTS, EditorContextMenuKeyAction,
+    BufferTabViewEntry, COMMAND_MENU_ENTRIES, CommandMenuAction, CompletionViewItem,
+    ConfirmationState, DELETE_FILE_HELP_ENTRY, DiagnosticLineMarker, DiagnosticMarkerKind,
+    DrawGate, EDITOR_CONTEXT_MENU_ENTRIES, EDITOR_KEY_HINTS, EditorContextMenuKeyAction,
     EditorContextMenuState, FILES_CONTEXT_MENU_ENTRIES, FilePromptKind, FilePromptState,
     FileTreeViewEntry, FilesContextMenuAction, FilesContextMenuKeyAction, FilesContextMenuState,
     FindPanelField, FindPanelState, JournalHealth, KEYBIND_ROWS, MIN_TERMINAL_HEIGHT,
@@ -1592,9 +1592,9 @@ fn keybinds_overlay_inventory_is_complete_and_fully_rendered() {
         "Alt-Up / Alt-Down      Cargo or live diagnostic previous / next",
         "FILES",
         "Right-click file        file menu",
+        DELETE_FILE_HELP_ENTRY,
         "TABS",
         "Ctrl-Tab / Ctrl-BackTab  next / previous buffer",
-        CTRL_W_DELETE_SELECTED_HELP_ENTRY,
         "F5 / F6                previous / next buffer",
         "COMMANDS",
         "F1                     keybinds",
@@ -1921,10 +1921,10 @@ fn primary_modifier_helper_drives_overlay_mode_bar_and_toast_rendering() {
     );
     assert_eq!(
         primary_modifier_text(
-            "Ctrl-Q Ctrl-W Ctrl-A Ctrl-C Ctrl-X Ctrl-V",
+            "Ctrl-Q Ctrl-A Ctrl-C Ctrl-X Ctrl-V",
             PrimaryModifier::Command,
         ),
-        "Ctrl-Q Ctrl-W Ctrl-A Ctrl-C Ctrl-X Ctrl-V",
+        "Ctrl-Q Ctrl-A Ctrl-C Ctrl-X Ctrl-V",
     );
     assert_eq!(
         primary_modifier_text("Ctrl-S Ctrl-F Ctrl-Z Ctrl-Y", PrimaryModifier::Command),
@@ -1986,21 +1986,21 @@ fn primary_modifier_helper_drives_overlay_mode_bar_and_toast_rendering() {
             .with_primary_modifier(modifier)
             .with_mode_bar(ModeBarState::new(
                 ModeBarKind::Confirm,
-                "Ctrl-Q Ctrl-W Ctrl-A Ctrl-C Ctrl-X Ctrl-V",
+                "Ctrl-Q Ctrl-A Ctrl-C Ctrl-X Ctrl-V",
             ))
             .with_toast(ToastState::new(
                 ToastKind::Info,
                 "notice",
-                "Ctrl-Q Ctrl-W Ctrl-A Ctrl-C Ctrl-X Ctrl-V",
+                "Ctrl-Q Ctrl-A Ctrl-C Ctrl-X Ctrl-V",
             ));
         let output = rendered_lines(&render(80, 24, &state)).join("\n");
-        for chord in ["Ctrl-Q", "Ctrl-W", "Ctrl-A", "Ctrl-C", "Ctrl-X", "Ctrl-V"] {
+        for chord in ["Ctrl-Q", "Ctrl-A", "Ctrl-C", "Ctrl-X", "Ctrl-V"] {
             assert!(
                 output.contains(chord),
                 "{modifier:?}: missing {chord}: {output}"
             );
         }
-        for chord in ["⌘Q", "⌘W", "⌘A", "⌘C", "⌘X", "⌘V"] {
+        for chord in ["⌘Q", "⌘A", "⌘C", "⌘X", "⌘V"] {
             assert!(
                 !output.contains(chord),
                 "{modifier:?}: advertised {chord}: {output}"
@@ -2338,7 +2338,7 @@ keybind = future_flag:super+home=scroll_to_top
 }
 
 #[test]
-fn file_name_panel_goldens_cover_new_and_prefilled_rename() {
+fn file_name_panel_goldens_cover_new_prefilled_rename_and_typed_delete() {
     for (kind, title, input, action) in [
         (FilePromptKind::Create, "new file", "", " ↵ create "),
         (
@@ -2347,9 +2347,15 @@ fn file_name_panel_goldens_cover_new_and_prefilled_rename() {
             "src/main.rs",
             " ↵ rename ",
         ),
+        (
+            FilePromptKind::Delete,
+            "delete file",
+            "src/ma",
+            " ↵ delete ",
+        ),
     ] {
         let state = view_state(RecordingState::Active, JournalHealth::Healthy)
-            .with_file_prompt(FilePromptState::new(kind, input));
+            .with_file_prompt(FilePromptState::new(kind, input).with_target("src/main.rs"));
         let area = Rect::new(0, 0, 80, 24);
         let mut buffer = Buffer::empty(area);
         let hits = MainView::new(&state, &editor(), &Viewport::default(), &[])
@@ -2363,8 +2369,14 @@ fn file_name_panel_goldens_cover_new_and_prefilled_rename() {
         assert!(output.contains(" esc cancel "), "{output}");
         let expected_field = match kind {
             FilePromptKind::Create => format!("src/{input}▏"),
-            FilePromptKind::Rename => format!(" {input}▏"),
+            FilePromptKind::Rename | FilePromptKind::Delete => format!(" {input}▏"),
         };
+        // The delete prompt names the exact path to type.
+        assert_eq!(
+            output.contains("type src/main.rs to delete it"),
+            kind == FilePromptKind::Delete,
+            "{output}"
+        );
         assert!(output.contains(&expected_field), "{output}");
         assert!(!hits.overlay_confirm.is_empty());
         assert!(!hits.overlay_cancel.is_empty());

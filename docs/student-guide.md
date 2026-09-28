@@ -29,7 +29,7 @@ unless the startup probe observes Ghostty's exact `super+arrow_left` →
 keyboard enhancement is active; otherwise Ctrl-A still selects all. Right-click
 in the editor and choose `Select all` for an unconditional mouse route.
 The keybinds overlay spells the modifier `Control`; mode-bar hints and toasts
-use `Ctrl`. Those compact hints use Ctrl-Q, Ctrl-W, Ctrl-C, Ctrl-X and Ctrl-V
+use `Ctrl`. Those compact hints use Ctrl-Q, Ctrl-C, Ctrl-X and Ctrl-V
 because those forms reach the editor. They show Ctrl-A only when it selects
 all; otherwise the keybind overlay shows `right-click → Select all`.
 Rustrace still accepts the Command forms when a terminal delivers them.
@@ -98,7 +98,6 @@ blocked.
 | ⌘Backspace | Delete to the start of the line |
 | Shift with a movement chord | Extend the selection from its current anchor |
 | F5, F6, Ctrl-Tab / Ctrl-BackTab | Previous or next open file |
-| Ctrl-W | Ask to delete the selected file; Ghostty reserves ⌘W by default |
 | Option-Up / Option-Down or alt-Up / alt-Down | Previous or next Cargo or live diagnostic |
 | F1 | Open the curated non-obvious keybind reference |
 | F7 | Command menu |
@@ -481,9 +480,12 @@ reference.
 Right-click a file row to open, rename, delete, or create a file. Right-click
 the ` files` header or empty space to open a menu with only `new file…` enabled.
 Disabled entries are dim and ignore clicks. Opening a file is silent; the active
-tab and caret show the change. Deleting a dirty file uses the existing
-confirmation. A second right-click, a left-click outside, or Esc closes the
-menu. The files panel is mouse-only and has no keyboard focus mode.
+tab and caret show the change. Deleting is deliberately hard: `delete…` asks
+you to type the file's exact path (for example `src/board.rs`) and deletes it
+only when the typed path matches; Enter on anything else, or Esc, keeps the
+file. There is no delete shortcut, and Ctrl-W, which closes a tab in many
+editors, does nothing in Rustrace. A second right-click, a left-click outside,
+or Esc closes the menu. The files panel is mouse-only and has no keyboard focus mode.
 
 Only files matching the assignment's allowed paths can be created or edited.
 `Cargo.lock` is controller-managed, so it is hidden from the files list and tabs

@@ -123,7 +123,7 @@ def exercise(binary, mode, setup, incoming=None):
             markers = {
                 "search": "find and replace", "create": "new file",
                 "rename": "rename file", "files-menu": "new file…",
-                "confirmation": "Delete a.rs?",
+                "confirmation": "type a.rs to delete it",
             }
             if route in markers:
                 screen = rendered_screen(transcript)
@@ -218,9 +218,8 @@ if __name__ == "__main__":
         setup = [b"\x01", b"\x18" if cut else b"\x03"]
         if cut:
             setup += [b"\x1a", b"\x19"]  # cut undo/redo retains the pre-cut slot
-        setup += [b"\x17"]  # delete source
-        if cut:
-            setup += [b"y"]  # confirm dirty source deletion
+        # Delete the source through the file menu, typing its name to confirm.
+        setup += [b"\x1b[<2;4;3M", b"\x1b[<0;5;6M", b"a.rs\r"]
         setup += [b"\x01"]  # replace destination selection
         exercise(sys.argv[1], "cut-delete-paste" if cut else "copy-delete-paste", setup, b"\x16")
     cases = [
@@ -229,7 +228,7 @@ if __name__ == "__main__":
         ("create", [b"\x1b[<2;4;1M", b"\x1b[<0;5;5M"]),
         ("rename", [b"\x1b[<2;4;3M", b"\x1b[<0;5;5M"]),
         ("files-menu", [b"\x1b[<2;4;3M"]),
-        ("confirmation", [b"!", b"\x17"]),
+        ("confirmation", [b"\x1b[<2;4;3M", b"\x1b[<0;5;6M"]),  # typed-name delete prompt
     ]
     for mode, setup in cases:
         exercise(sys.argv[1], mode, setup)
