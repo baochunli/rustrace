@@ -333,8 +333,12 @@ pub fn run_revise(args: &[String], output: &mut impl Write) -> Result<()> {
     }
 
     materialize_revision(&new_workspace, receipt.final_workspace())?;
-    let session =
-        ProductionSession::start_revision(&parent, &new_workspace, &extracted.manifest_bytes)?;
+    let session = ProductionSession::start_revision_with_fixtures(
+        &parent,
+        &new_workspace,
+        &extracted.manifest_bytes,
+        crate::session::packaged_fixtures_hash(&extracted),
+    )?;
     let child_id = session.session_id().clone();
     let parent_id = receipt.manifest().latest_session_id.clone();
     session.quit()?;

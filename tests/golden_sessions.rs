@@ -435,7 +435,12 @@ fn run_controlled_child(case: &Path, mode: &str) {
             b"[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n[workspace]\n",
         )
         .unwrap();
-        let test_cases = case.join("test-cases");
+        // Format 3 sessions read the workspace's own case folder.
+        let test_cases = case.join(if mode == "comparison-format3" {
+            "workspace.test-cases"
+        } else {
+            "test-cases"
+        });
         fs::create_dir(&test_cases).unwrap();
         fs::write(test_cases.join("sample.in"), b"input\n").unwrap();
         fs::write(
@@ -1258,6 +1263,14 @@ fn format3_reference_verifies_arguments_closed_stdin_and_fixtures() {
     .fixtures
     .unwrap()
     .hash();
+    let metadata: Value =
+        serde_json::from_slice(&fs::read(case.join("workspace/.rustrace/session.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        metadata["test_case_fixtures_hash"],
+        Value::from(packaged_fixtures.to_string()),
+        "the session records the packaged fixture tree at startup"
+    );
     let original = stored_zip_entry(&fs::read(&bundle).unwrap(), "session.rprov");
     let manifest_path = case.join("workspace/Cargo.toml");
     let manifest_path = manifest_path.to_str().unwrap();

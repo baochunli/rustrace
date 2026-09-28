@@ -603,6 +603,17 @@ impl ProductionSession {
 
     /// Starts a separate session from the exact captured parent final tree.
     pub fn start_revision(parent_root: &Path, root: &Path, manifest_bytes: &[u8]) -> Result<Self> {
+        Self::start_revision_with_fixtures(parent_root, root, manifest_bytes, None)
+    }
+
+    /// Starts a linked revision that also records the packaged fixture-tree
+    /// hash of the format 3 package it was validated against.
+    pub fn start_revision_with_fixtures(
+        parent_root: &Path,
+        root: &Path,
+        manifest_bytes: &[u8],
+        test_case_fixtures_hash: Option<Hash>,
+    ) -> Result<Self> {
         let parent_root = fs::canonicalize(parent_root)?;
         let parent = load_finalized_root(&parent_root)?;
         let parent_manifest = parent.manifest();
@@ -669,6 +680,7 @@ impl ProductionSession {
             manifest_bytes,
             Some(link_bytes),
             parent_manifest.test_case_suite_hash,
+            test_case_fixtures_hash,
         )?;
         if session.metadata.starter_hash != *final_tree {
             return Err("revision genesis does not bind the parent final tree".into());

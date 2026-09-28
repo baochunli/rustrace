@@ -37,24 +37,112 @@ pub(crate) enum OutputDisposition {
     Overwrite,
 }
 
-/// Which files make a live packaged case, by assignment format.
+/// The one case folder beside every format 1 or 2 workspace.
+pub(crate) const FIXED_TEST_CASE_FOLDER: &str = "test-cases";
+/// The suffix of a format 3 workspace's own case folder.
+pub(crate) const TEST_CASE_FOLDER_SUFFIX: &str = ".test-cases";
+const WORKSPACE_SUFFIX: &str = ".work";
+const MAX_FOLDER_NAME_BYTES: usize = 255;
+
+/// Where a session's packaged cases live and which files make a case.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TestCaseLayout {
-    /// Format 2: a complete `NAME.in` and `NAME.expected` pair.
+    /// Formats 1 and 2: the shared sibling `test-cases/`, where a case is a
+    /// complete `NAME.in` and `NAME.expected` pair.
     Paired,
-    /// Format 3: `NAME.expected` with optional `NAME.in` and `NAME.args`.
+    /// Format 3: the workspace's own sibling `NAME.test-cases/`, where a case
+    /// is `NAME.expected` with optional `NAME.in` and `NAME.args`, beside an
+    /// optional `files/` fixture tree.
     Extended,
 }
 
 impl TestCaseLayout {
-    #[allow(dead_code)] // T10.50/T10.51 select the layout from the session manifest.
-    pub(crate) fn for_format_version(format_version: u32) -> Option<Self> {
-        match format_version {
-            2 => Some(Self::Paired),
-            3 => Some(Self::Extended),
-            _ => None,
+    pub(crate) fn for_format_version(format_version: u32) -> Self {
+        if format_version == 3 {
+            Self::Extended
+        } else {
+            Self::Paired
         }
     }
+
+    /// The case folder's name beside a workspace directory named
+    /// `workspace_name`. Format 3 derives it from the workspace: `lab2.work`
+    /// gets `lab2.test-cases`, and any other name gets `.test-cases`
+    /// appended. A name that could be another workspace's case folder, the
+    /// shared format 2 folder, or a Cargo template is refused.
+    pub(crate) fn folder_name(self, workspace_name: &std::ffi::OsStr) -> Result<String> {
+        match self {
+            Self::Paired => {
+                if workspace_name == FIXED_TEST_CASE_FOLDER {
+                    return Err(
+                        "the selected workspace cannot be the fixed sibling test-cases directory"
+                            .into(),
+                    );
+                }
+                Ok(FIXED_TEST_CASE_FOLDER.to_owned())
+            }
+            Self::Extended => {
+                let name = workspace_name
+                    .to_str()
+                    .ok_or("a format 3 workspace name must be valid UTF-8")?;
+                let lowercase = name.to_ascii_lowercase();
+                if lowercase == FIXED_TEST_CASE_FOLDER
+                    || lowercase.ends_with(TEST_CASE_FOLDER_SUFFIX)
+                {
+                    return Err(format!(
+                        "a format 3 workspace cannot be named `{FIXED_TEST_CASE_FOLDER}` or end in `{TEST_CASE_FOLDER_SUFFIX}`, which name test-case folders"
+                    )
+                    .into());
+                }
+                if name.contains(['{', '}']) {
+                    return Err(
+                        "a format 3 workspace name cannot contain `{` or `}`, which Cargo reads as build-directory template variables"
+                            .into(),
+                    );
+                }
+                let stem = name.strip_suffix(WORKSPACE_SUFFIX).unwrap_or(name);
+                if stem.is_empty() {
+                    return Err("a format 3 workspace needs a name before `.work`".into());
+                }
+                let folder = format!("{stem}{TEST_CASE_FOLDER_SUFFIX}");
+                if folder.len() > MAX_FOLDER_NAME_BYTES {
+                    return Err(format!(
+                        "the test-case folder name `{folder}` would exceed {MAX_FOLDER_NAME_BYTES} bytes"
+                    )
+                    .into());
+                }
+                Ok(folder)
+            }
+        }
+    }
+}
+
+/// The sibling case folder of `workspace_root` for this layout.
+pub(crate) fn test_case_folder(workspace_root: &Path, layout: TestCaseLayout) -> Result<PathBuf> {
+    let name = workspace_root
+        .file_name()
+        .ok_or("the workspace must name a directory")?;
+    let parent = workspace_root
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or("workspace has no parent for sibling test-cases")?;
+    Ok(parent.join(layout.folder_name(name)?))
+}
+
+/// How a deployed fixture tree compares with the one the package declared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Checked before each format 3 launch in T10.50.
+pub(crate) enum FixtureTreeCheck {
+    /// The package has no fixture tree, so the program runs in the workspace.
+    /// `deployed` reports whether a `files/` folder exists anyway.
+    NotPackaged { deployed: bool },
+    /// The deployed tree hashes exactly as packaged.
+    Matches { fixtures_blake3: Hash },
+    /// The deployed tree is missing or differs; warn, and record `deployed`.
+    Differs {
+        packaged: Hash,
+        deployed: Option<Hash>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -150,14 +238,11 @@ pub(crate) struct TestCaseDirectory {
 }
 
 impl TestCaseDirectory {
-    pub(crate) fn open(workspace_root: &Path) -> Result<Self> {
+    /// Opens the session's case folder: the fixed `test-cases/` for formats
+    /// 1 and 2, or the workspace's own `NAME.test-cases/` for format 3.
+    pub(crate) fn open(workspace_root: &Path, layout: TestCaseLayout) -> Result<Self> {
         let workspace = PinnedWorkspaceRoot::open(workspace_root)?;
-        let parent = workspace
-            .path()
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .ok_or("workspace has no parent for sibling test-cases")?;
-        let expected = parent.join("test-cases");
+        let expected = test_case_folder(workspace.path(), layout)?;
         let metadata = fs::symlink_metadata(&expected)?;
         if metadata.file_type().is_symlink() {
             return Err("the fixed sibling test-cases root must not be a symlink".into());
@@ -283,6 +368,50 @@ impl TestCaseDirectory {
     #[allow(dead_code)] // Verified before launch in T10.50.
     pub(crate) fn fixture_tree_hash(&self) -> Result<Option<Hash>> {
         Ok(self.fixture_tree()?.map(|tree| tree.hash()))
+    }
+
+    /// Compares the deployed `files/` tree with the packaged fixture-tree
+    /// hash that the session recorded at startup, so a run can warn when a
+    /// student's copy differs. An unreadable tree (for example one holding a
+    /// symlink) is an error rather than a difference.
+    #[allow(dead_code)] // Checked before each format 3 launch in T10.50.
+    pub(crate) fn check_fixture_tree(&self, packaged: Option<Hash>) -> Result<FixtureTreeCheck> {
+        let deployed = self.fixture_tree_hash()?;
+        Ok(match (packaged, deployed) {
+            (None, deployed) => FixtureTreeCheck::NotPackaged {
+                deployed: deployed.is_some(),
+            },
+            (Some(packaged), Some(deployed)) if packaged == deployed => FixtureTreeCheck::Matches {
+                fixtures_blake3: deployed,
+            },
+            (Some(packaged), deployed) => FixtureTreeCheck::Differs { packaged, deployed },
+        })
+    }
+
+    /// Refuses a `.cargo` entry in the case folder or its `files/`. Cargo
+    /// reads `.cargo/config.toml` from the directory a command runs in and
+    /// from every parent, so a Run from `files/` must not start while one is
+    /// there. Parents above the case folder are shared with the workspace.
+    #[allow(dead_code)] // Called before each fixture-directory launch in T10.50.
+    pub(crate) fn reject_cargo_configuration(&self) -> Result<()> {
+        for relative in [".cargo".to_owned(), format!("{FIXTURE_ROOT}/.cargo")] {
+            match fs::symlink_metadata(self.root.path().join(&relative)) {
+                Ok(_) => {
+                    return Err(format!(
+                        "remove `{relative}` from the test-case folder: Cargo would read it as configuration"
+                    )
+                    .into());
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        self.root.verify_binding()?;
+        Ok(())
     }
 
     fn extended_identity(
@@ -830,7 +959,9 @@ mod tests {
         fs::write(parent.join("test-cases/Alpha.expected"), b"expected two").unwrap();
         fs::write(parent.join("test-cases/unpaired.in"), b"ignored").unwrap();
         fs::write(parent.join("test-cases/output.txt"), b"preserve").unwrap();
-        let cases = TestCaseDirectory::open(&parent.join("assignment.work")).unwrap();
+        let cases =
+            TestCaseDirectory::open(&parent.join("assignment.work"), TestCaseLayout::Paired)
+                .unwrap();
         assert_eq!(
             cases
                 .list_cases()
@@ -879,10 +1010,11 @@ mod tests {
             b"ordinary generated output",
         )
         .unwrap();
-        let cases = TestCaseDirectory::open(&parent.join("assignment.work"))
-            .unwrap()
-            .list_cases()
-            .unwrap();
+        let cases =
+            TestCaseDirectory::open(&parent.join("assignment.work"), TestCaseLayout::Paired)
+                .unwrap()
+                .list_cases()
+                .unwrap();
         assert_eq!(cases.len(), MAX_TEST_CASES);
         assert_eq!(cases.first().unwrap().name(), "case-000");
         assert_eq!(cases.last().unwrap().name(), "case-255");
@@ -896,7 +1028,9 @@ mod tests {
         fs::create_dir(parent.join("test-cases")).unwrap();
         fs::write(parent.join("test-cases/sample.in"), b"input one").unwrap();
         fs::write(parent.join("test-cases/sample.expected"), b"output one").unwrap();
-        let directory = TestCaseDirectory::open(&parent.join("assignment.work")).unwrap();
+        let directory =
+            TestCaseDirectory::open(&parent.join("assignment.work"), TestCaseLayout::Paired)
+                .unwrap();
         let original = directory.list_cases().unwrap().pop().unwrap();
 
         fs::write(parent.join("test-cases/sample.in"), b"input two").unwrap();
@@ -915,14 +1049,19 @@ mod tests {
         let parent = fixture("symlink-root");
         fs::create_dir(parent.join("actual-cases")).unwrap();
         symlink("actual-cases", parent.join("test-cases")).unwrap();
-        assert!(TestCaseDirectory::open(&parent.join("assignment.work")).is_err());
+        assert!(
+            TestCaseDirectory::open(&parent.join("assignment.work"), TestCaseLayout::Paired)
+                .is_err()
+        );
         fs::remove_dir_all(&parent).unwrap();
 
         let parent = fixture("symlink-entry");
         fs::create_dir(parent.join("test-cases")).unwrap();
         fs::write(parent.join("outside"), b"outside").unwrap();
         symlink("../outside", parent.join("test-cases/unsafe")).unwrap();
-        let cases = TestCaseDirectory::open(&parent.join("assignment.work")).unwrap();
+        let cases =
+            TestCaseDirectory::open(&parent.join("assignment.work"), TestCaseLayout::Paired)
+                .unwrap();
         assert!(cases.list_cases().unwrap().is_empty());
         assert!(
             cases
@@ -939,7 +1078,9 @@ mod tests {
         fs::remove_dir(parent.join("assignment.work")).unwrap();
         fs::create_dir(parent.join("test-cases")).unwrap();
         fs::write(parent.join("test-cases/managed.rs"), b"preserve").unwrap();
-        assert!(TestCaseDirectory::open(&parent.join("test-cases")).is_err());
+        assert!(
+            TestCaseDirectory::open(&parent.join("test-cases"), TestCaseLayout::Paired).is_err()
+        );
         assert_eq!(
             fs::read(parent.join("test-cases/managed.rs")).unwrap(),
             b"preserve"
@@ -972,7 +1113,9 @@ mod tests {
         fs::write(parent.join("test-cases/nested/hidden.in"), b"ignored").unwrap();
         fs::write(parent.join("test-cases/nested/hidden.expected"), b"ignored").unwrap();
 
-        let cases = TestCaseDirectory::open(&parent.join("assignment.work")).unwrap();
+        let cases =
+            TestCaseDirectory::open(&parent.join("assignment.work"), TestCaseLayout::Paired)
+                .unwrap();
         assert_eq!(
             cases
                 .list_cases()
@@ -989,7 +1132,7 @@ mod tests {
     #[test]
     fn format3_listing_accepts_optional_input_and_args_and_ignores_fixtures() {
         let parent = fixture("format3-listing");
-        let cases_root = parent.join("test-cases");
+        let cases_root = parent.join("assignment.test-cases");
         fs::create_dir(&cases_root).unwrap();
         for (path, bytes) in [
             ("usage.expected", &b"usage\n"[..]),
@@ -1010,7 +1153,9 @@ mod tests {
         fs::write(cases_root.join("files/hidden.in"), b"fixture").unwrap();
         fs::write(cases_root.join("files/nested/deep.expected"), b"fixture").unwrap();
 
-        let directory = TestCaseDirectory::open(&parent.join("assignment.work")).unwrap();
+        let directory =
+            TestCaseDirectory::open(&parent.join("assignment.work"), TestCaseLayout::Extended)
+                .unwrap();
         let cases = directory.list_cases_for(TestCaseLayout::Extended).unwrap();
         let summary = cases
             .iter()
@@ -1053,15 +1198,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["stdin"]
         );
-        assert_eq!(
-            TestCaseLayout::for_format_version(2),
-            Some(TestCaseLayout::Paired)
-        );
-        assert_eq!(
-            TestCaseLayout::for_format_version(3),
-            Some(TestCaseLayout::Extended)
-        );
-        assert_eq!(TestCaseLayout::for_format_version(1), None);
+        for (format_version, layout) in [
+            (1, TestCaseLayout::Paired),
+            (2, TestCaseLayout::Paired),
+            (3, TestCaseLayout::Extended),
+        ] {
+            assert_eq!(TestCaseLayout::for_format_version(format_version), layout);
+        }
 
         // Argument, input, and expected changes all refresh the identity.
         let identity = |directory: &TestCaseDirectory| {
@@ -1087,7 +1230,7 @@ mod tests {
     #[test]
     fn format3_input_is_hashed_then_rewound_for_the_program() {
         let parent = fixture("input-hash");
-        let cases_root = parent.join("test-cases");
+        let cases_root = parent.join("assignment.test-cases");
         fs::create_dir(&cases_root).unwrap();
         fs::write(cases_root.join("case.in"), b"alpha\nbeta\n").unwrap();
         fs::write(cases_root.join("case.expected"), b"").unwrap();
@@ -1097,7 +1240,9 @@ mod tests {
         )
         .unwrap();
         fs::write(cases_root.join("large.expected"), b"").unwrap();
-        let directory = TestCaseDirectory::open(&parent.join("assignment.work")).unwrap();
+        let directory =
+            TestCaseDirectory::open(&parent.join("assignment.work"), TestCaseLayout::Extended)
+                .unwrap();
         let cases = directory.list_cases_for(TestCaseLayout::Extended).unwrap();
 
         let (mut input, blake3) = directory.open_input_with_blake3(&cases[0]).unwrap();
@@ -1119,10 +1264,12 @@ mod tests {
     #[test]
     fn fixture_tree_hash_reads_the_deployed_tree_or_reports_its_absence() {
         let parent = fixture("fixture-hash");
-        let cases_root = parent.join("test-cases");
+        let cases_root = parent.join("assignment.test-cases");
         fs::create_dir(&cases_root).unwrap();
         fs::write(cases_root.join("case.expected"), b"").unwrap();
-        let directory = TestCaseDirectory::open(&parent.join("assignment.work")).unwrap();
+        let directory =
+            TestCaseDirectory::open(&parent.join("assignment.work"), TestCaseLayout::Extended)
+                .unwrap();
         assert_eq!(directory.fixture_tree_hash().unwrap(), None);
         assert_eq!(directory.fixtures_path(), cases_root.join("files"));
 
@@ -1139,8 +1286,162 @@ mod tests {
         .hash();
         assert_eq!(directory.fixture_tree_hash().unwrap(), Some(expected));
 
+        assert_eq!(
+            directory.check_fixture_tree(Some(expected)).unwrap(),
+            FixtureTreeCheck::Matches {
+                fixtures_blake3: expected
+            }
+        );
+        assert_eq!(
+            directory.check_fixture_tree(None).unwrap(),
+            FixtureTreeCheck::NotPackaged { deployed: true }
+        );
+        fs::write(cases_root.join("files/src/lib.rs"), b"edited\n").unwrap();
+        let edited = directory.fixture_tree_hash().unwrap();
+        assert_eq!(
+            directory.check_fixture_tree(Some(expected)).unwrap(),
+            FixtureTreeCheck::Differs {
+                packaged: expected,
+                deployed: edited
+            }
+        );
+        fs::remove_dir_all(cases_root.join("files")).unwrap();
+        assert_eq!(
+            directory.check_fixture_tree(Some(expected)).unwrap(),
+            FixtureTreeCheck::Differs {
+                packaged: expected,
+                deployed: None
+            }
+        );
+        assert_eq!(
+            directory.check_fixture_tree(None).unwrap(),
+            FixtureTreeCheck::NotPackaged { deployed: false }
+        );
+        fs::create_dir_all(cases_root.join("files/src")).unwrap();
+
         symlink("../../outside", cases_root.join("files/src/escape")).unwrap();
         assert!(directory.fixture_tree_hash().is_err());
+        assert!(directory.check_fixture_tree(Some(expected)).is_err());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_configuration_in_the_case_folder_or_fixtures_is_refused() {
+        let parent = fixture("cargo-configuration");
+        let cases_root = parent.join("assignment.test-cases");
+        fs::create_dir_all(cases_root.join("files")).unwrap();
+        let directory =
+            TestCaseDirectory::open(&parent.join("assignment.work"), TestCaseLayout::Extended)
+                .unwrap();
+        directory.reject_cargo_configuration().unwrap();
+        for (path, directory_entry) in [
+            (".cargo", true),
+            ("files/.cargo", true),
+            (".cargo", false),
+            ("files/.cargo", false),
+        ] {
+            if directory_entry {
+                fs::create_dir(cases_root.join(path)).unwrap();
+            } else {
+                fs::write(cases_root.join(path), b"").unwrap();
+            }
+            let error = directory.reject_cargo_configuration().unwrap_err();
+            assert!(error.to_string().contains(path), "{error}");
+            if directory_entry {
+                fs::remove_dir(cases_root.join(path)).unwrap();
+            } else {
+                fs::remove_file(cases_root.join(path)).unwrap();
+            }
+        }
+        symlink("../elsewhere", cases_root.join(".cargo")).unwrap();
+        assert!(directory.reject_cargo_configuration().is_err());
+        fs::remove_file(cases_root.join(".cargo")).unwrap();
+        fs::remove_dir(cases_root.join("files")).unwrap();
+        fs::write(cases_root.join("files"), b"").unwrap();
+        directory.reject_cargo_configuration().unwrap();
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn format3_case_folder_is_named_after_the_workspace() {
+        let folder = |name: &str| {
+            TestCaseLayout::Extended
+                .folder_name(std::ffi::OsStr::new(name))
+                .map_err(|error| error.to_string())
+        };
+        assert_eq!(folder("lab2.work").unwrap(), "lab2.test-cases");
+        assert_eq!(folder("Lab 2.work").unwrap(), "Lab 2.test-cases");
+        assert_eq!(folder("lab2").unwrap(), "lab2.test-cases");
+        assert_eq!(folder("lab2.work.work").unwrap(), "lab2.work.test-cases");
+        assert_eq!(folder("lab2.WORK").unwrap(), "lab2.WORK.test-cases");
+        for (name, reason) in [
+            ("test-cases", "end in `.test-cases`"),
+            ("Test-Cases", "end in `.test-cases`"),
+            ("lab2.test-cases", "end in `.test-cases`"),
+            ("lab2.TEST-CASES", "end in `.test-cases`"),
+            (".work", "needs a name before `.work`"),
+            ("lab{2}.work", "`{` or `}`"),
+            ("lab}.work", "`{` or `}`"),
+        ] {
+            let error = folder(name).unwrap_err();
+            assert!(error.contains(reason), "{name}: {error}");
+        }
+        assert!(folder(&format!("{}.work", "x".repeat(245))).is_err());
+        assert_eq!(
+            folder(&format!("{}.work", "x".repeat(244))).unwrap().len(),
+            255
+        );
+
+        // Formats 1 and 2 keep the one fixed folder.
+        for name in ["lab1.work", "lab2.test-cases", "{x}"] {
+            assert_eq!(
+                TestCaseLayout::Paired
+                    .folder_name(std::ffi::OsStr::new(name))
+                    .unwrap(),
+                "test-cases"
+            );
+        }
+        assert!(
+            TestCaseLayout::Paired
+                .folder_name(std::ffi::OsStr::new("test-cases"))
+                .is_err()
+        );
+        assert_eq!(
+            test_case_folder(Path::new("/course/lab2.work"), TestCaseLayout::Extended).unwrap(),
+            Path::new("/course/lab2.test-cases")
+        );
+        assert_eq!(
+            test_case_folder(Path::new("/course/lab1.work"), TestCaseLayout::Paired).unwrap(),
+            Path::new("/course/test-cases")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn format2_and_format3_sessions_open_different_case_folders() {
+        let parent = fixture("folder-by-format");
+        fs::create_dir(parent.join("test-cases")).unwrap();
+        fs::write(parent.join("test-cases/shared.in"), b"").unwrap();
+        fs::write(parent.join("test-cases/shared.expected"), b"").unwrap();
+        let workspace = parent.join("assignment.work");
+        assert!(
+            TestCaseDirectory::open(&workspace, TestCaseLayout::Extended).is_err(),
+            "a format 3 session never falls back to the shared folder"
+        );
+        fs::create_dir(parent.join("assignment.test-cases")).unwrap();
+        fs::write(parent.join("assignment.test-cases/own.expected"), b"").unwrap();
+        let names = |layout| {
+            TestCaseDirectory::open(&workspace, layout)
+                .unwrap()
+                .list_cases_for(layout)
+                .unwrap()
+                .iter()
+                .map(|case| case.name().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(TestCaseLayout::Paired), ["shared"]);
+        assert_eq!(names(TestCaseLayout::Extended), ["own"]);
         fs::remove_dir_all(parent).unwrap();
     }
 
@@ -1325,7 +1626,9 @@ mod tests {
             vec![b'x'; MAX_TEST_CASE_FILE_BYTES as usize + 1],
         )
         .unwrap();
-        let cases = TestCaseDirectory::open(&parent.join("assignment.work")).unwrap();
+        let cases =
+            TestCaseDirectory::open(&parent.join("assignment.work"), TestCaseLayout::Paired)
+                .unwrap();
         let case = cases.list_cases().unwrap().pop().unwrap();
         assert!(
             cases

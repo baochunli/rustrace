@@ -83,7 +83,8 @@ fn packaged_suite_identity_survives_revision_and_interrupted_recovery() {
     let parent = Fixture::new("suite-identity-parent");
     fs::write(parent.0.join("main.rs"), "A").unwrap();
     let parent_session =
-        ProductionSession::start_linked(&parent.0, MANIFEST_V2, None, Some(suite_hash)).unwrap();
+        ProductionSession::start_linked(&parent.0, MANIFEST_V2, None, Some(suite_hash), None)
+            .unwrap();
     let parent_receipt = parent_session.finalize("student-1").unwrap();
     assert_eq!(
         parent_receipt.manifest().test_case_suite_hash,
@@ -109,7 +110,7 @@ fn packaged_suite_identity_survives_revision_and_interrupted_recovery() {
     let interrupted = Fixture::new("suite-identity-recovery");
     fs::write(interrupted.0.join("main.rs"), "A").unwrap();
     let session =
-        ProductionSession::start_linked(&interrupted.0, MANIFEST_V2, None, Some(suite_hash))
+        ProductionSession::start_linked(&interrupted.0, MANIFEST_V2, None, Some(suite_hash), None)
             .unwrap();
     assert!(
         session
@@ -118,6 +119,117 @@ fn packaged_suite_identity_survives_revision_and_interrupted_recovery() {
     );
     let recovered = finalized(ProductionSession::recover_finalization(&interrupted.0).unwrap());
     assert_eq!(recovered.manifest().test_case_suite_hash, Some(suite_hash));
+}
+
+#[test]
+fn format3_sessions_record_the_packaged_fixture_hash_and_format2_metadata_is_unchanged() {
+    let suite_hash = Hash::from_bytes([42; Hash::LENGTH]);
+    let fixtures_hash = Hash::from_bytes([43; Hash::LENGTH]);
+    let manifest_v3 = String::from_utf8(MANIFEST_V2.to_vec()).unwrap().replacen(
+        "format_version = 2",
+        "format_version = 3",
+        1,
+    );
+    let metadata_json = |root: &Path| -> serde_json::Value {
+        serde_json::from_slice(&fs::read(root.join(".rustrace/session.json")).unwrap()).unwrap()
+    };
+
+    // Format 2 metadata keeps exactly its historical keys.
+    let format2 = Fixture::new("fixtures-format2");
+    fs::write(format2.0.join("main.rs"), "A").unwrap();
+    let session =
+        ProductionSession::start_linked(&format2.0, MANIFEST_V2, None, Some(suite_hash), None)
+            .unwrap();
+    assert_eq!(session.packaged_fixtures_hash(), None);
+    assert_eq!(
+        session.test_case_layout(),
+        crate::console::TestCaseLayout::Paired
+    );
+    let keys = metadata_json(&format2.0)
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert!(!keys.contains("test_case_fixtures_hash"), "{keys:?}");
+    assert!(keys.contains("test_case_suite_hash"));
+    session.quit().unwrap();
+    assert!(
+        ProductionSession::start_linked(
+            &Fixture::new("fixtures-refused").0,
+            MANIFEST_V2,
+            None,
+            Some(suite_hash),
+            Some(fixtures_hash)
+        )
+        .is_err(),
+        "a format 2 session cannot record a fixture tree"
+    );
+
+    // Format 3 without fixtures omits the field; with fixtures, it records it.
+    let without = Fixture::new("fixtures-format3-none");
+    fs::write(without.0.join("main.rs"), "A").unwrap();
+    let session = ProductionSession::start_linked(
+        &without.0,
+        manifest_v3.as_bytes(),
+        None,
+        Some(suite_hash),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        session.test_case_layout(),
+        crate::console::TestCaseLayout::Extended
+    );
+    assert!(
+        metadata_json(&without.0)
+            .get("test_case_fixtures_hash")
+            .is_none()
+    );
+    session.quit().unwrap();
+
+    let parent = Fixture::new("fixtures-format3");
+    fs::write(parent.0.join("main.rs"), "A").unwrap();
+    let session = ProductionSession::start_linked(
+        &parent.0,
+        manifest_v3.as_bytes(),
+        None,
+        Some(suite_hash),
+        Some(fixtures_hash),
+    )
+    .unwrap();
+    assert_eq!(session.packaged_fixtures_hash(), Some(fixtures_hash));
+    assert_eq!(
+        metadata_json(&parent.0)["test_case_fixtures_hash"],
+        serde_json::json!("2b".repeat(32))
+    );
+    session.quit().unwrap();
+    let resumed =
+        ProductionSession::resume(&parent.0, manifest_v3.as_bytes(), ResumeChoice::Resume).unwrap();
+    assert_eq!(resumed.packaged_fixtures_hash(), Some(fixtures_hash));
+    assert_eq!(
+        resumed.test_case_layout(),
+        crate::console::TestCaseLayout::Extended
+    );
+    let receipt = resumed.finalize("student-1").unwrap();
+    assert_eq!(receipt.manifest().test_case_suite_hash, Some(suite_hash));
+
+    let child = Fixture::new("fixtures-format3-child");
+    for (path, bytes) in receipt.final_workspace() {
+        fs::write(child.0.join(path.as_str()), bytes).unwrap();
+    }
+    let child_session = ProductionSession::start_revision_with_fixtures(
+        &parent.0,
+        &child.0,
+        manifest_v3.as_bytes(),
+        Some(fixtures_hash),
+    )
+    .unwrap();
+    assert_eq!(child_session.packaged_fixtures_hash(), Some(fixtures_hash));
+    assert_eq!(
+        child_session.metadata().test_case_suite_hash,
+        Some(suite_hash)
+    );
 }
 
 fn terminal_count(root: &Path, id: &SessionId) -> (u64, usize, bool) {

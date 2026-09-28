@@ -60,13 +60,16 @@ impl TestCasePicker {
     fn refresh(
         &mut self,
         workspace_root: &std::path::Path,
+        layout: crate::console::TestCaseLayout,
         packaged_suite_expected: bool,
     ) -> Result<(), Box<dyn Error>> {
         let selected = self
             .cases
             .get(self.selected)
             .map(|case| case.name().to_owned());
-        match TestCaseDirectory::open(workspace_root).and_then(|directory| directory.list_cases()) {
+        match TestCaseDirectory::open(workspace_root, layout)
+            .and_then(|directory| directory.list_cases())
+        {
             Ok(cases) => {
                 self.replace_cases(cases);
                 self.notice = None;
@@ -2023,6 +2026,7 @@ where
                 TestCasePickerKeyAction::Refresh => {
                     let _ = test_cases.refresh(
                         session.workspace().root(),
+                        session.test_case_layout(),
                         session.metadata().test_case_suite_hash.is_some(),
                     );
                 }
@@ -2063,6 +2067,7 @@ where
             session.clear_completion();
             let _ = test_cases.refresh(
                 session.workspace().root(),
+                session.test_case_layout(),
                 session.metadata().test_case_suite_hash.is_some(),
             );
             test_cases.open_from(view, focus);
@@ -2836,6 +2841,7 @@ fn activate_command_menu_entry(
             session.clear_completion();
             let _ = test_cases.refresh(
                 session.workspace().root(),
+                session.test_case_layout(),
                 session.metadata().test_case_suite_hash.is_some(),
             );
             test_cases.open_from(*view, *focus);
@@ -4857,7 +4863,9 @@ format = ["cargo", "fmt"]
         fs::create_dir_all(&root).unwrap();
         let mut picker = TestCasePicker::default();
 
-        picker.refresh(&root, false).unwrap();
+        picker
+            .refresh(&root, crate::console::TestCaseLayout::Paired, false)
+            .unwrap();
         picker.open();
 
         let state = MainViewState::new(
@@ -5094,7 +5102,9 @@ format = ["cargo", "fmt"]
 "#;
         let mut session = ProductionSession::start(&root, manifest).unwrap();
         let mut picker = TestCasePicker::default();
-        picker.refresh(&root, false).unwrap();
+        picker
+            .refresh(&root, crate::console::TestCaseLayout::Paired, false)
+            .unwrap();
         let case = picker.begin_selected().unwrap();
         fs::remove_file(parent.join("test-cases/sample.in")).unwrap();
 
@@ -5135,7 +5145,11 @@ format = ["cargo", "fmt"]
         fs::create_dir(parent.join("assignment.work")).unwrap();
         fs::write(parent.join("test-cases/sample.in"), b"input").unwrap();
         fs::write(parent.join("test-cases/sample.expected"), b"old").unwrap();
-        let directory = TestCaseDirectory::open(&parent.join("assignment.work")).unwrap();
+        let directory = TestCaseDirectory::open(
+            &parent.join("assignment.work"),
+            crate::console::TestCaseLayout::Paired,
+        )
+        .unwrap();
         let original = directory.list_cases().unwrap();
         let mut picker = TestCasePicker::default();
         picker.replace_cases(original.clone());

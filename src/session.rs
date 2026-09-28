@@ -110,6 +110,14 @@ pub struct SessionMetadata {
     pub starter_hash: Hash,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_case_suite_hash: Option<Hash>,
+    /// The packaged fixture-tree hash of a format 3 suite that has
+    /// `test-cases/files/`. It is local session state, fixed at startup from
+    /// the validated package (the suite hash already covers the tree), so a
+    /// run chooses its working directory and detects a changed deployed tree
+    /// from the package rather than from the disk. Omitted otherwise, so
+    /// format 1 and 2 metadata keep their exact bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_case_fixtures_hash: Option<Hash>,
     pub client_version: String,
     pub build_identity: String,
     pub elapsed_time: String,
@@ -805,6 +813,7 @@ pub struct ProductionSession {
     live_diagnostic_generation: Option<u64>,
     live_diagnostics: BTreeMap<DocumentId, LiveDocumentDiagnostics>,
     selected_live_diagnostic: Option<(DocumentId, usize)>,
+    test_case_layout: crate::console::TestCaseLayout,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -939,7 +948,7 @@ impl ProductionSession {
     }
 
     pub fn start(root: &Path, manifest_bytes: &[u8]) -> Result<Self> {
-        Self::start_linked(root, manifest_bytes, None, None)
+        Self::start_linked(root, manifest_bytes, None, None, None)
     }
 
     pub fn start_from_assignment(root: &Path, assignment: &ExtractedAssignment) -> Result<Self> {
@@ -948,6 +957,7 @@ impl ProductionSession {
             &assignment.manifest_bytes,
             None,
             assignment.test_cases.as_ref().map(|suite| suite.hash),
+            packaged_fixtures_hash(assignment),
         )
     }
 
@@ -956,9 +966,10 @@ impl ProductionSession {
         manifest_bytes: &[u8],
         link: Option<Vec<u8>>,
         test_case_suite_hash: Option<Hash>,
+        test_case_fixtures_hash: Option<Hash>,
     ) -> Result<Self> {
         let manifest = AssignmentManifest::parse(manifest_bytes)?;
-        require_test_case_suite_identity(&manifest, test_case_suite_hash)?;
+        require_test_case_suite_identity(&manifest, test_case_suite_hash, test_case_fixtures_hash)?;
         let pinned = PinnedWorkspaceRoot::open(root)?;
         if root.join(".rustrace").try_exists()? {
             return Err(
@@ -987,6 +998,7 @@ impl ProductionSession {
             manifest_hash: digest(manifest_bytes),
             starter_hash,
             test_case_suite_hash,
+            test_case_fixtures_hash,
             client_version: version.client_version.into(),
             build_identity: version.build_identity.into(),
             elapsed_time: "process-monotonic; offline intervals excluded/unknown".into(),
@@ -1037,6 +1049,9 @@ impl ProductionSession {
             live_diagnostic_generation: None,
             live_diagnostics: BTreeMap::new(),
             selected_live_diagnostic: None,
+            test_case_layout: crate::console::TestCaseLayout::for_format_version(
+                manifest.format_version,
+            ),
         };
         session.persist_baseline()?;
         Ok(session)
@@ -1062,7 +1077,11 @@ impl ProductionSession {
     ) -> Result<Self> {
         let manifest = AssignmentManifest::parse(manifest_bytes)?;
         let metadata: SessionMetadata = serde_json::from_slice(&read_initial_metadata(root)?)?;
-        require_test_case_suite_identity(&manifest, metadata.test_case_suite_hash)?;
+        require_test_case_suite_identity(
+            &manifest,
+            metadata.test_case_suite_hash,
+            metadata.test_case_fixtures_hash,
+        )?;
         if metadata.version != 1
             || metadata.manifest_hash != digest(manifest_bytes)
             || selected_test_case_suite_hash
@@ -1247,6 +1266,9 @@ impl ProductionSession {
             live_diagnostic_generation: None,
             live_diagnostics: BTreeMap::new(),
             selected_live_diagnostic: None,
+            test_case_layout: crate::console::TestCaseLayout::for_format_version(
+                manifest.format_version,
+            ),
         };
         if own_save_pending {
             session.effects.0.borrow().headroom(24 * 1024 * 1024)?;
@@ -1385,6 +1407,7 @@ impl ProductionSession {
             manifest_bytes,
             Some(link.clone()),
             test_case_suite_hash,
+            None,
         )?;
         owner.verify()?;
         // Preserve the existing complete-metadata abandonment marker contract.
@@ -1455,6 +1478,18 @@ impl ProductionSession {
     pub fn session_id(&self) -> &SessionId {
         &self.metadata.session_id
     }
+    /// Where this session's packaged cases live, from its assignment format.
+    pub(crate) fn test_case_layout(&self) -> crate::console::TestCaseLayout {
+        self.test_case_layout
+    }
+
+    /// The fixture-tree hash of the package this session started from, when
+    /// its format 3 suite has `files/`. A run from the fixture folder compares
+    /// the deployed tree with it before launch.
+    pub fn packaged_fixtures_hash(&self) -> Option<Hash> {
+        self.metadata.test_case_fixtures_hash
+    }
+
     pub fn metadata(&self) -> &SessionMetadata {
         &self.metadata
     }
@@ -2755,10 +2790,25 @@ impl ProductionSession {
     }
 }
 
+/// The fixture-tree hash a format 3 session records from its package.
+pub(crate) fn packaged_fixtures_hash(assignment: &ExtractedAssignment) -> Option<Hash> {
+    assignment
+        .test_cases
+        .as_ref()
+        .and_then(|suite| suite.fixtures.as_ref())
+        .map(|fixtures| fixtures.hash())
+}
+
 fn require_test_case_suite_identity(
     manifest: &AssignmentManifest,
     test_case_suite_hash: Option<Hash>,
+    test_case_fixtures_hash: Option<Hash>,
 ) -> Result<()> {
+    if test_case_fixtures_hash.is_some()
+        && (manifest.format_version != 3 || test_case_suite_hash.is_none())
+    {
+        return Err("only format_version = 3 sessions can record a packaged fixture tree".into());
+    }
     match (manifest.format_version, test_case_suite_hash) {
         (1, None) | (2 | 3, Some(_)) => Ok(()),
         (1, Some(_)) => {

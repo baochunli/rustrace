@@ -17,7 +17,6 @@ use rustrace_workspace::{
 };
 use std::{
     error::Error,
-    ffi::OsStr,
     fmt,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
@@ -84,18 +83,21 @@ pub fn run_work(args: &[String], output: &mut impl Write) -> Result<()> {
     }
     let manifest_bytes = extracted.manifest_bytes.clone();
     let test_case_suite_hash = extracted.test_cases.as_ref().map(|suite| suite.hash);
+    let test_case_fixtures_hash = crate::session::packaged_fixtures_hash(&extracted);
     let mut incomplete = None;
     let mut selected_metadata = None;
     if exists {
         match ProductionSession::read_metadata(&root) {
             Ok(metadata) => {
-                if !ProductionSession::selected_assignment_matches(
-                    &root,
-                    &metadata,
-                    &manifest_bytes,
-                    starter_hash,
-                    test_case_suite_hash,
-                )? {
+                if metadata.test_case_fixtures_hash != test_case_fixtures_hash
+                    || !ProductionSession::selected_assignment_matches(
+                        &root,
+                        &metadata,
+                        &manifest_bytes,
+                        starter_hash,
+                        test_case_suite_hash,
+                    )?
+                {
                     return Err("assignment manifest/starter/test-case-suite identity mismatch; selected session left unchanged".into());
                 }
                 selected_metadata = Some(metadata);
@@ -200,6 +202,7 @@ pub fn run_work(args: &[String], output: &mut impl Write) -> Result<()> {
     let identity_matches = if started_from_package {
         session.metadata().starter_hash == starter_hash
             && session.metadata().test_case_suite_hash == test_case_suite_hash
+            && session.metadata().test_case_fixtures_hash == test_case_fixtures_hash
     } else {
         selected_metadata.as_ref() == Some(session.metadata())
     };
@@ -224,7 +227,7 @@ pub fn run_work(args: &[String], output: &mut impl Write) -> Result<()> {
 }
 
 fn preflight_test_case_suite(workspace_root: &Path, suite: &ExtractedTestCaseSuite) -> Result<()> {
-    let sibling = test_case_sibling(workspace_root)?;
+    let sibling = test_case_sibling(workspace_root, suite)?;
     let Some(root) = open_existing_test_case_root(&sibling)? else {
         return Ok(());
     };
@@ -246,7 +249,7 @@ fn deploy_test_case_suite_with(
     mut before_managed_file: impl FnMut(usize, &WorkspacePath) -> Result<()>,
 ) -> Result<()> {
     preflight_test_case_suite(workspace_root, suite)?;
-    let sibling = test_case_sibling(workspace_root)?;
+    let sibling = test_case_sibling(workspace_root, suite)?;
     let (root, created_root) = match open_existing_test_case_root(&sibling)? {
         Some(root) => (root, false),
         None => (create_empty_directory_no_replace(&sibling)?, true),
@@ -466,17 +469,13 @@ fn for_each_managed_node(
     Ok(())
 }
 
-fn test_case_sibling(workspace_root: &Path) -> Result<PathBuf> {
-    if workspace_root.file_name() == Some(OsStr::new("test-cases")) {
-        return Err(
-            "the selected workspace cannot be the fixed sibling test-cases directory".into(),
-        );
-    }
-    let parent = workspace_root
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .ok_or("workspace has no parent for sibling test-cases")?;
-    Ok(parent.join("test-cases"))
+/// Formats 1 and 2 deploy to the shared sibling `test-cases/`; format 3
+/// deploys to the workspace's own `NAME.test-cases/`.
+fn test_case_sibling(workspace_root: &Path, suite: &ExtractedTestCaseSuite) -> Result<PathBuf> {
+    crate::console::test_case_folder(
+        workspace_root,
+        crate::console::TestCaseLayout::for_format_version(suite.format_version),
+    )
 }
 
 fn open_existing_test_case_root(path: &Path) -> Result<Option<PinnedWorkspaceRoot>> {
@@ -658,6 +657,7 @@ mod deployment_tests {
         )
         .unwrap();
         ExtractedTestCaseSuite {
+            format_version: 3,
             cases: vec![
                 ExtractedTestCase {
                     name: "count".to_owned(),
@@ -686,7 +686,11 @@ mod deployment_tests {
                 .unwrap(),
         );
 
-        let sibling = temp.path().join("test-cases");
+        let sibling = temp.path().join("lab2.test-cases");
+        assert!(
+            !temp.path().join("test-cases").exists(),
+            "format 3 never writes the shared format 2 folder"
+        );
         assert_eq!(fs::read(sibling.join("count.args")).unwrap(), b"-c\nfn\n");
         assert_eq!(fs::read(sibling.join("count.expected")).unwrap(), b"1\n");
         assert!(
@@ -743,13 +747,74 @@ mod deployment_tests {
     }
 
     #[test]
+    fn each_format3_workspace_gets_its_own_case_folder_beside_format2() {
+        let temp = TempRoot::new();
+        for name in ["lab2", "lab3"] {
+            let prepared = temp.path().join(format!("{name}.prepare"));
+            let workspace = temp.path().join(format!("{name}.work"));
+            prepare_workspace(&prepared);
+            drop(
+                publish_fresh_workspace_with(
+                    &prepared,
+                    &workspace,
+                    Some(&format3_suite()),
+                    |_, _| Ok(()),
+                )
+                .unwrap(),
+            );
+            assert!(
+                temp.path()
+                    .join(format!("{name}.test-cases/files"))
+                    .is_dir()
+            );
+        }
+        let prepared = temp.path().join("lab1.prepare");
+        prepare_workspace(&prepared);
+        drop(
+            publish_fresh_workspace_with(
+                &prepared,
+                &temp.path().join("lab1.work"),
+                Some(&suite()),
+                |_, _| Ok(()),
+            )
+            .unwrap(),
+        );
+        assert!(temp.path().join("test-cases/alpha.in").is_file());
+        assert!(!temp.path().join("lab1.test-cases").exists());
+        assert!(!temp.path().join("lab2.test-cases/alpha.in").exists());
+
+        // A workspace that another workspace would use as its case folder, or
+        // whose name Cargo would read as a template, is refused before it is
+        // published, and its prepared starter is removed.
+        for name in ["lab2.test-cases", "test-cases", "lab{2}.work", ".work"] {
+            let prepared = temp.path().join("refused.prepare");
+            prepare_workspace(&prepared);
+            let workspace = temp.path().join(name);
+            let existed = workspace.exists();
+            let error = publish_fresh_workspace_with(
+                &prepared,
+                &workspace,
+                Some(&format3_suite()),
+                |_, _| Ok(()),
+            )
+            .expect_err(name);
+            assert!(
+                error.to_string().contains("format 3 workspace"),
+                "{name}: {error}"
+            );
+            assert!(!prepared.exists(), "{name}");
+            assert_eq!(workspace.exists(), existed, "{name} was published");
+        }
+    }
+
+    #[test]
     fn failed_fixture_deployment_rolls_back_created_files_and_directories() {
         // Managed order: count.args, count.expected, stdin.in,
         // stdin.expected, files, files/empty, files/src, files/notes.txt,
         // files/src/lib.rs.
         for target in [6, 7, 9] {
             let temp = TempRoot::new();
-            let sibling = temp.path().join("test-cases");
+            let sibling = temp.path().join("lab2.test-cases");
             fs::create_dir(&sibling).unwrap();
             fs::write(sibling.join("stdin.in"), b"fn\n").unwrap();
             fs::write(sibling.join("unrelated.txt"), b"keep\n").unwrap();
@@ -888,6 +953,7 @@ mod deployment_tests {
 
     fn suite() -> ExtractedTestCaseSuite {
         ExtractedTestCaseSuite {
+            format_version: 2,
             cases: vec![
                 ExtractedTestCase::paired(
                     "alpha",
