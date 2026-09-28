@@ -36,7 +36,7 @@ pub use environment::{
     Requirement, SystemCommandRunner, ToolStatus, probe_environment,
 };
 
-const USAGE: &str = "Usage: rustrace --version [--verbose] | rustrace environment | rustrace update | rustrace update --check | rustrace doctor assignment.rta [--workspace DIR] | rustrace doctor --write-ghostty-keys | rustrace work ... | rustrace replay PATH | rustrace submit WORKSPACE --student-id ID [--allow-incomplete] [--output PATH] | rustrace verify PATH [--reference PATH] | rustrace scan DIRECTORY [--output review.csv] [--reference assignment.rta] | rustrace status WORKSPACE | rustrace privacy WORKSPACE | rustrace revise PARENT_WORKSPACE NEW_WORKSPACE assignment.rta | rustrace cleanup WORKSPACE [--confirm] [--destroy-provenance]";
+const USAGE: &str = "Usage: rustrace --version [--verbose] | rustrace environment | rustrace update | rustrace update --check | rustrace doctor assignment.rta [--workspace DIR] | rustrace doctor --write-ghostty-keys | rustrace work ... | rustrace replay PATH | rustrace submit WORKSPACE --student-id ID [--allow-incomplete] [--output PATH] | rustrace verify PATH [--reference PATH] | rustrace scan DIRECTORY [--output review.csv] [--reference assignment.rta] | rustrace status WORKSPACE | rustrace privacy WORKSPACE | rustrace revise PARENT_WORKSPACE NEW_WORKSPACE assignment.rta | rustrace cleanup WORKSPACE [--confirm] [--destroy-provenance] | rustrace set-aside WORKSPACE [--show N [--file PATH]]";
 
 /// Runs the deliberately narrow Phase 0 command surface.
 ///
@@ -123,13 +123,17 @@ where
             }
         };
     }
-    if matches!(command.as_deref(), Some("status" | "revise" | "cleanup")) {
+    if matches!(
+        command.as_deref(),
+        Some("status" | "revise" | "cleanup" | "set-aside")
+    ) {
         let command = command.expect("matched command");
         let args = args.map(|arg| arg.as_ref().to_owned()).collect::<Vec<_>>();
         let result = match command.as_str() {
             "status" => session::run_status(&args, output),
             "revise" => session::run_revise(&args, output),
             "cleanup" => session::run_cleanup(&args, output),
+            "set-aside" => session::run_set_aside(&args, output),
             _ => unreachable!(),
         };
         return match result {

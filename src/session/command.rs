@@ -100,7 +100,7 @@ pub(super) fn require_inactive_marker(
     let marker: CommandActivity =
         serde_json::from_slice(&owner.read_artifact("command-activity.json", METADATA_LIMIT)?)?;
     if marker.version != 1 || marker.session_id != metadata.session_id || marker.active {
-        return Err("unfinished command activity; inspect and use linked recovery; restart does not establish resolver or child cleanup".into());
+        return Err("unfinished command activity: a command is still marked as running, and restarting does not show that its programs stopped. Stop any program it may have left running and run the same command again; your code and recorded history are intact. If this message repeats, tell your course staff".into());
     }
     Ok(())
 }

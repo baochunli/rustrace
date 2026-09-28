@@ -228,6 +228,9 @@ which workspace artifacts to use.
 Disk changes to assignment files can be noticed when the TUI reconciles its
 workspace. Rustrace records the observed file facts and bounded recovery
 evidence, not the outside application or person that caused the change.
+`rustrace set-aside WORKSPACE` lists these set-aside outside versions and shows
+their contents on your computer. It only reads the retained evidence; it never
+adds that code to the recorded workspace.
 
 ## What `rustrace privacy` reports
 

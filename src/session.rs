@@ -37,6 +37,7 @@ mod diagnostics;
 mod finalization;
 mod privacy;
 mod retention;
+mod set_aside;
 
 pub use crate::console::{TestCase, TestCaseComparison, TestCaseMismatch, TestCaseOutcome};
 pub use bundle::{
@@ -48,6 +49,7 @@ pub use finalization::{
 pub(crate) use finalization::{ReadOnlyFinalizationReceipt, ReadOnlyFinalizationStatus};
 pub use privacy::run_privacy;
 pub use retention::{run_cleanup, run_revise, run_status};
+pub use set_aside::{SetAsideVersion, run_set_aside};
 
 #[cfg(test)]
 #[path = "session_clipboard_tests.rs"]
@@ -1141,7 +1143,7 @@ impl ProductionSession {
         // A stale activity marker proves, through the inherited writer lock we
         // now hold, that every process of the interrupted command has exited.
         if replay.controlled_command_pending() && !stale_command {
-            return Err("unfinished command evidence; inspect and use linked recovery; child death is not established by restart".into());
+            return Err("unfinished command evidence: the last session recorded a command that never finished, and Rustrace cannot confirm that the programs it started have stopped. Stop any program it may have left running (`lsof .rustrace/writer.lock` lists it, or quit it in Activity Monitor) and run the same command again. Your code and recorded history are intact. If this message repeats, tell your course staff; to keep working meanwhile, start a new workspace with `rustrace work ASSIGNMENT.rta --workspace NEW.work`".into());
         }
         let interrupted_command = replay.controlled_command_pending();
         let reclaim = if abandoned {
@@ -2360,7 +2362,7 @@ impl ProductionSession {
     }
 
     pub fn external_notice(&self) -> Option<&str> {
-        self.external_warning.then_some("External changes are not accepted.\nRustrace preserves recovery evidence.\nRestoring current contents, including unsaved edits.")
+        self.external_warning.then_some("External changes are not accepted.\nRustrace preserves recovery evidence.\nRestoring current contents, including unsaved edits.\nThe outside version is kept: run rustrace set-aside to view it.")
     }
 
     fn reconcile_canonical(&mut self, hook: &mut impl FnMut(&str) -> Result<()>) -> Result<bool> {

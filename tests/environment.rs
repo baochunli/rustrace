@@ -298,7 +298,7 @@ fn cli_rejects_unknown_commands() {
     assert_eq!(exit_code, 2);
     assert_eq!(
         output,
-        "Usage: rustrace --version [--verbose] | rustrace environment | rustrace update | rustrace update --check | rustrace doctor assignment.rta [--workspace DIR] | rustrace doctor --write-ghostty-keys | rustrace work ... | rustrace replay PATH | rustrace submit WORKSPACE --student-id ID [--allow-incomplete] [--output PATH] | rustrace verify PATH [--reference PATH] | rustrace scan DIRECTORY [--output review.csv] [--reference assignment.rta] | rustrace status WORKSPACE | rustrace privacy WORKSPACE | rustrace revise PARENT_WORKSPACE NEW_WORKSPACE assignment.rta | rustrace cleanup WORKSPACE [--confirm] [--destroy-provenance]\n"
+        "Usage: rustrace --version [--verbose] | rustrace environment | rustrace update | rustrace update --check | rustrace doctor assignment.rta [--workspace DIR] | rustrace doctor --write-ghostty-keys | rustrace work ... | rustrace replay PATH | rustrace submit WORKSPACE --student-id ID [--allow-incomplete] [--output PATH] | rustrace verify PATH [--reference PATH] | rustrace scan DIRECTORY [--output review.csv] [--reference assignment.rta] | rustrace status WORKSPACE | rustrace privacy WORKSPACE | rustrace revise PARENT_WORKSPACE NEW_WORKSPACE assignment.rta | rustrace cleanup WORKSPACE [--confirm] [--destroy-provenance] | rustrace set-aside WORKSPACE [--show N [--file PATH]]\n"
     );
 }
 
