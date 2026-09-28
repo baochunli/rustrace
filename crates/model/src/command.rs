@@ -522,12 +522,18 @@ pub fn test_case_args_blake3<T: AsRef<str>>(arguments: &[T]) -> Hash {
 }
 
 /// The recorded `--manifest-path` value of a fixture-directory Run: an
-/// absolute path to the workspace `Cargo.toml`.
+/// absolute, normalized path to the workspace `Cargo.toml`, with no empty,
+/// `.`, or `..` component.
 fn is_valid_run_manifest_path(path: &str) -> bool {
-    path.starts_with('/')
-        && path.ends_with("/Cargo.toml")
-        && path.len() <= MAX_STRING_BYTES
+    path.len() <= MAX_STRING_BYTES
         && !path.chars().any(char::is_control)
+        && path.strip_prefix('/').is_some_and(|relative| {
+            relative.ends_with("Cargo.toml")
+                && relative
+                    .split('/')
+                    .all(|component| !matches!(component, "" | "." | ".."))
+                && relative.rsplit('/').next() == Some("Cargo.toml")
+        })
 }
 
 /// The natural console Run tail, in fixed order:

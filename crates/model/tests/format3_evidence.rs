@@ -340,6 +340,18 @@ fn fixture_runs_record_one_absolute_manifest_path_in_a_fixed_slot() {
             json!([]),
         ),
         (
+            &["--locked", "--manifest-path", "/Cargo.toml"][..],
+            json!([]),
+        ),
+        (
+            &[
+                "--locked",
+                "--manifest-path",
+                "/home/{x}/lab..2.work/Cargo.toml",
+            ][..],
+            json!([]),
+        ),
+        (
             &[
                 "--release",
                 "--locked",
@@ -367,6 +379,34 @@ fn fixture_runs_record_one_absolute_manifest_path_in_a_fixed_slot() {
         ),
         (
             &["--locked", "--manifest-path", "/home/student/Cargo.lock"][..],
+            json!([]),
+        ),
+        (
+            &["--locked", "--manifest-path", "/../x/Cargo.toml"][..],
+            json!([]),
+        ),
+        (
+            &["--locked", "--manifest-path", "//Cargo.toml"][..],
+            json!([]),
+        ),
+        (
+            &[
+                "--locked",
+                "--manifest-path",
+                "/home/./lab2.work/Cargo.toml",
+            ][..],
+            json!([]),
+        ),
+        (
+            &["--locked", "--manifest-path", "/home/lab2.work//Cargo.toml"][..],
+            json!([]),
+        ),
+        (
+            &[
+                "--locked",
+                "--manifest-path",
+                "/home/lab2.work/NotCargo.toml",
+            ][..],
             json!([]),
         ),
         (
