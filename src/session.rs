@@ -1357,6 +1357,14 @@ impl ProductionSession {
         test_case_suite_hash: Option<Hash>,
         extract_fresh: impl FnOnce() -> Result<std::path::PathBuf>,
     ) -> Result<Self> {
+        // Abandonment predates format 3 and is no longer offered by the CLI;
+        // it would drop the packaged fixture tree, so refuse it outright.
+        if AssignmentManifest::parse(manifest_bytes)?.format_version == 3 {
+            return Err(
+                "format_version = 3 workspaces cannot be abandoned into a linked workspace; resume or revise them instead"
+                    .into(),
+            );
+        }
         let pinned = PinnedWorkspaceRoot::open(root)?;
         let mut owner = pinned.open_state_directory()?.lock_for_inspection()?;
         let mut evidence = preserved_evidence(&pinned, &owner)?;

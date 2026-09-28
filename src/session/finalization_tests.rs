@@ -232,6 +232,38 @@ fn format3_sessions_record_the_packaged_fixture_hash_and_format2_metadata_is_unc
     );
 }
 
+#[test]
+fn format3_workspaces_cannot_be_abandoned() {
+    let manifest_v3 = String::from_utf8(MANIFEST_V2.to_vec()).unwrap().replacen(
+        "format_version = 2",
+        "format_version = 3",
+        1,
+    );
+    let original = Fixture::new("format3-abandon-original");
+    fs::write(original.0.join("main.rs"), "A").unwrap();
+    let session = ProductionSession::start_linked(
+        &original.0,
+        manifest_v3.as_bytes(),
+        None,
+        Some(Hash::from_bytes([42; Hash::LENGTH])),
+        Some(Hash::from_bytes([43; Hash::LENGTH])),
+    )
+    .unwrap();
+    session.quit().unwrap();
+    let before = fs::read_dir(original.0.join(".rustrace")).unwrap().count();
+    let fresh = Fixture::new("format3-abandon-fresh");
+    fs::write(fresh.0.join("main.rs"), "A").unwrap();
+    let error = ProductionSession::abandon_into(&original.0, &fresh.0, manifest_v3.as_bytes())
+        .err()
+        .expect("format 3 abandonment is refused");
+    assert!(error.to_string().contains("format_version = 3"), "{error}");
+    assert!(!fresh.0.join(".rustrace").exists());
+    assert_eq!(
+        fs::read_dir(original.0.join(".rustrace")).unwrap().count(),
+        before
+    );
+}
+
 fn terminal_count(root: &Path, id: &SessionId) -> (u64, usize, bool) {
     let path = root.join(".rustrace").join(format!("{id}.sqlite"));
     let mut journal = Journal::open_read_only_no_follow(&path).unwrap();
