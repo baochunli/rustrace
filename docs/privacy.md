@@ -104,10 +104,10 @@ The complete version 1 event vocabulary is:
   are retained and never their values. Console routing is also recorded when
   present. For a version 3 assignment, the route of a console Run can also
   record the program's literal arguments, which also end the argument vector
-  after `--`; whether the program ran in the workspace or in
-  `test-cases/files/`, with the BLAKE3 fixture-tree hash of that folder; and
-  the packaged case name for a test-case run. A run in `test-cases/files/`
-  records the absolute path of the workspace `Cargo.toml` after
+  after `--`; whether the program ran in the workspace or in the `files/`
+  folder of the assignment's test-case folder, with the BLAKE3 fixture-tree
+  hash of that folder; and the packaged case name for a test-case run. A run
+  in `files/` records the absolute path of the workspace `Cargo.toml` after
   `--manifest-path`. Console Test filters and output-option spellings are part
   of the recorded argument vector. `--no-capture` and its `--nocapture` alias disable
   the Rust test harness's capture, not Rustrace's recording; `--show-output`
@@ -134,7 +134,7 @@ The complete version 1 event vocabulary is:
   expected-file limit. A version 3 comparison adds an `invocation` field with
   `args_blake3` (a BLAKE3 digest of the argument list), `stdin` (closed, or the
   BLAKE3 digest of the `NAME.in` bytes that were read), and, for a run in
-  `test-cases/files/`, `fixtures_blake3`. These are digests; the argument text
+  `files/`, `fixtures_blake3`. These are digests; the argument text
   itself is recorded in the command's argument vector and route. Version 2
   comparisons never carry `invocation`.
 - Session lifecycle: `session_started`, `session_resumed`, and `session_ended`
