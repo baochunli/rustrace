@@ -1732,6 +1732,7 @@ where
                         &mut test_cases,
                         &mut keybinds_scroll,
                         &mut update_menu,
+                        &mut console_line,
                     ) {
                         break;
                     }
@@ -2285,6 +2286,7 @@ where
                             &mut test_cases,
                             &mut keybinds_scroll,
                             &mut update_menu,
+                            &mut console_line,
                         ) {
                             break;
                         }
@@ -2760,14 +2762,33 @@ fn activate_command_menu_entry(
     test_cases: &mut TestCasePicker,
     keybinds_scroll: &mut Option<usize>,
     update_menu: &mut UpdateMenu,
+    console_line: &mut ConsoleLine,
 ) -> bool {
     let Some(action) = command_menu_action(index) else {
         status.replace("command selection is no longer available");
         return false;
     };
     match action {
+        // Run is exactly `cargo run` typed in the console, so the program
+        // reads its standard input from the console prompt.
+        CommandMenuAction::Run => {
+            *view = WorkView::Console;
+            *focus = WorkspaceFocus::Console;
+            status.replace(match session.start_console_command("cargo run") {
+                Ok(ConsoleStart::Started) => {
+                    console_line.take();
+                    String::from("console command preparation started")
+                }
+                Ok(ConsoleStart::OverwriteConfirmation { .. }) => {
+                    console_line.take();
+                    String::from("confirm overwrite; output remains untouched")
+                }
+                Err(_) => String::from(
+                    "Command unavailable; finish recovery/modal or check configured tools",
+                ),
+            });
+        }
         CommandMenuAction::Check
-        | CommandMenuAction::Run
         | CommandMenuAction::Clippy
         | CommandMenuAction::Format
         | CommandMenuAction::Doc => {
@@ -2775,7 +2796,6 @@ fn activate_command_menu_entry(
             *focus = WorkspaceFocus::Editor;
             let action = match action {
                 CommandMenuAction::Check => CargoAction::Check,
-                CommandMenuAction::Run => CargoAction::Run,
                 CommandMenuAction::Clippy => CargoAction::Clippy,
                 CommandMenuAction::Format => CargoAction::Format,
                 CommandMenuAction::Doc => CargoAction::Doc,
@@ -4928,7 +4948,8 @@ format = ["cargo", "fmt"]
             &mut focus,
             &mut picker,
             &mut keybinds,
-            &mut menu
+            &mut menu,
+            &mut ConsoleLine::default(),
         ));
         assert!(menu.open);
         assert!(!session.command_active());
@@ -4984,12 +5005,61 @@ format = ["cargo", "fmt"]
             &mut picker,
             &mut keybinds_scroll,
             &mut super::UpdateMenu::new(crate::update::UpdateState::default()),
+            &mut ConsoleLine::default(),
         ));
 
         assert!(!picker.is_open());
         assert_eq!(status.as_str(), "active command status");
         assert_eq!(view, WorkView::Console);
         assert_eq!(focus, WorkspaceFocus::Console);
+    }
+
+    fn activate_menu_run(
+        session: &mut ProductionSession,
+        view: &mut WorkView,
+        focus: &mut WorkspaceFocus,
+        console_line: &mut ConsoleLine,
+    ) -> StatusMessage {
+        let index = crate::tui::COMMAND_MENU_ENTRIES
+            .iter()
+            .position(|entry| *entry == "Run")
+            .unwrap();
+        let mut status: StatusMessage = "".into();
+        assert!(!activate_command_menu_entry(
+            session,
+            index,
+            &mut status,
+            view,
+            focus,
+            &mut TestCasePicker::default(),
+            &mut None,
+            &mut super::UpdateMenu::new(crate::update::UpdateState::default()),
+            console_line,
+        ));
+        status
+    }
+
+    #[test]
+    fn command_menu_run_while_a_command_is_active_keeps_the_console_line() {
+        let (_fixture, mut session) = ClipboardFixture::new("A");
+        session
+            .install_stalled_preparing_for_test(std::time::Duration::ZERO)
+            .unwrap();
+        let mut view = WorkView::Workspace;
+        let mut focus = WorkspaceFocus::Editor;
+        let mut console_line = ConsoleLine::default();
+        assert!(console_line.insert('Q'));
+
+        let status = activate_menu_run(&mut session, &mut view, &mut focus, &mut console_line);
+
+        assert_eq!(
+            status.as_str(),
+            "Command unavailable; finish recovery/modal or check configured tools"
+        );
+        assert_eq!(view, WorkView::Console);
+        assert_eq!(focus, WorkspaceFocus::Console);
+        assert!(!session.console_command_active());
+        assert_eq!(console_line.text(), "Q");
     }
 
     #[cfg(unix)]

@@ -171,6 +171,7 @@ assert challenge in {
     "delete-confirmations",
     "lifecycle-notices",
     "hangup",
+    "menu-run",
 }
 root = pathlib.Path(tempfile.mkdtemp(prefix="rustrace-console-pty-")).resolve()
 if challenge == "lifecycle-notices":
@@ -503,6 +504,104 @@ def process_exists(pid):
 try:
     wait_screen(" files", 25)
     os.write(master, b"\x1b[<0;4;3M\x1b[<0;4;3m")  # Select source below Cargo.toml.
+
+    if challenge == "menu-run":
+        # Leave a draft on the console line; menu Run must not send it as stdin.
+        send(b"\x1b[20~Q")
+        wait_screen("> Q")
+        send(b"\x1b")
+        wait_screen("│output")
+
+        # F7 Run is `cargo run` typed in the console: it opens and focuses the
+        # console, and the program reads the stdin prompt instead of EOF.
+        send(b"\x1b[18~")
+        wait_screen(" MENU ")
+        send(b"\x1b[B\r")  # Down to Run, Enter.
+        invocation_path = work / "target/console-invocation.json"
+        descendant_path = work / "target/console-descendant.json"
+        wait_for(
+            lambda: invocation_path.exists()
+            and descendant_path.exists()
+            and " CONSOLE " in rendered_screen()
+            and "│console" in rendered_screen()
+            and "ctrl-c stop  esc stop+close  ↵ send" in rendered_screen()
+            and "stdin> ▏" in rendered_screen(),
+            "menu Run waiting for input in the focused console",
+        )
+        assert "stdin> Q" not in rendered_screen(), rendered_screen()
+        assert_no_toast()
+
+        submitted = b"MENU_RUN_STDIN_LINE"
+        for character in submitted:
+            send(bytes([character]))
+            time.sleep(.01)
+        wait_screen("stdin> " + submitted.decode())
+        send(b"\r")
+        wait_for(lambda: (work / "target/console-line.json").exists(), "menu Run stdin line")
+        assert (work / "target/console-stdin.bin").read_bytes() == submitted + b"\n"
+        wait_screen("console-stdin-observed")
+        leader = json.loads(invocation_path.read_bytes())
+        descendant = json.loads(descendant_path.read_bytes())
+        assert leader["argv"] == ["run", "--locked"], leader
+
+        # A second Run while the program owns the runner keeps the busy toast.
+        send(b"\x1b[18~")
+        wait_screen(" MENU ")
+        send(b"\x1b[B\r")
+        wait_for(
+            lambda: "Command unavailable" in rendered_screen()
+            and " CONSOLE " in rendered_screen()
+            and "│console" in rendered_screen(),
+            "busy menu Run feedback in the console",
+        )
+        assert process_exists(leader["pid"]) and process_exists(descendant["pid"])
+        assert json.loads(invocation_path.read_bytes())["pid"] == leader["pid"]
+
+        send(b"\x03")  # Ctrl-C stops the program and keeps the console.
+        wait_for(
+            lambda: not json.loads((work / ".rustrace/command-activity.json").read_bytes())["active"]
+            and " CONSOLE " in rendered_screen()
+            and "│console" in rendered_screen(),
+            "Ctrl-C stopped menu Run and kept the console",
+        )
+        captures = [json.loads(path.read_bytes()) for path in (work / ".rustrace").glob("command-*-capture.json")]
+        assert len(captures) == 1, captures
+        assert captures[0]["execution"]["outcome"]["reason"] == "cancelled", captures
+
+        metadata = json.loads((work / ".rustrace/session.json").read_bytes())
+        database = work / ".rustrace" / f"{metadata['session_id']}.sqlite"
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+            events = [json.loads(row[0]) for row in connection.execute(
+                "SELECT payload FROM events ORDER BY sequence"
+            )]
+        starts = [
+            event["event"]["payload"]
+            for event in events
+            if event["event"]["type"] == "controlled_command_started"
+        ]
+        assert len(starts) == 1, starts
+        assert starts[0]["action"] == "run", starts[0]
+        assert starts[0]["argv"][-2:] == ["run", "--locked"], starts[0]
+        assert starts[0]["console"] == {
+            "stdin": {"kind": "submitted"},
+            "stdout": {"kind": "console"},
+        }, starts[0]
+
+        send(b"\x11")
+        deadline = time.monotonic() + 15
+        while proc.poll() is None and time.monotonic() < deadline:
+            read_once(.01)
+        assert proc.poll() is not None, "menu Run fixture did not quit"
+        while read_once(.01):
+            pass
+        assert proc.returncode == 0, repr(bytes(transcript[-8000:]))
+        assert b"TERMINAL_RESTORED_AFTER_COMMAND_REAP" in transcript
+        for artifact in (work / ".rustrace").iterdir():
+            if artifact.is_file() and artifact.stat().st_size <= 34 * 1024 * 1024:
+                assert submitted not in artifact.read_bytes(), artifact
+        success = True
+        print("80x24 menu Run used the console stdin prompt and a console route")
+        raise SystemExit(0)
 
     if challenge == "natural-output":
         (root / "natural-output-challenge").write_text("enabled")

@@ -56,6 +56,11 @@ fn menu_and_console_command_lifecycle_states_do_not_render_notice_toasts() {
 }
 
 #[test]
+fn menu_run_reads_stdin_from_the_console_prompt_on_a_console_route() {
+    run_fixture("menu-run");
+}
+
+#[test]
 fn natural_doc_check_and_run_console_output_preserves_program_indentation() {
     run_fixture("natural-output");
 }
