@@ -153,7 +153,8 @@ impl ConsoleCommandRoute {
     /// `NAME.in` when it has one and closed otherwise, stdout is captured for
     /// comparison, and a fixture hash selects the `test-cases/files/` working
     /// directory. The Run argv must then end with
-    /// `--locked [--manifest-path PATH] [-- ARG...]` to validate.
+    /// `--locked [--manifest-path ../../WORKSPACE_NAME/Cargo.toml] [-- ARG...]`
+    /// to validate.
     pub fn packaged_case(
         case: &str,
         has_input: bool,
@@ -521,19 +522,22 @@ pub fn test_case_args_blake3<T: AsRef<str>>(arguments: &[T]) -> Hash {
     Hash::from_bytes(*hasher.finalize().as_bytes())
 }
 
-/// The recorded `--manifest-path` value of a fixture-directory Run: an
-/// absolute, normalized path to the workspace `Cargo.toml`, with no empty,
-/// `.`, or `..` component.
+/// Maximum bytes in the workspace directory name of a recorded fixture Run.
+const MAX_RUN_WORKSPACE_NAME_BYTES: usize = 255;
+
+/// The recorded `--manifest-path` value of a fixture-directory Run, relative
+/// to the fixture folder `WORKSPACE_PARENT/NAME.test-cases/files`: exactly
+/// `../../WORKSPACE_NAME/Cargo.toml`. Only the workspace directory's own name
+/// is recorded, never its absolute location.
 fn is_valid_run_manifest_path(path: &str) -> bool {
-    path.len() <= MAX_STRING_BYTES
-        && !path.chars().any(char::is_control)
-        && path.strip_prefix('/').is_some_and(|relative| {
-            relative.ends_with("Cargo.toml")
-                && relative
-                    .split('/')
-                    .all(|component| !matches!(component, "" | "." | ".."))
-                && relative.rsplit('/').next() == Some("Cargo.toml")
-        })
+    matches!(
+        path.split('/').collect::<Vec<_>>().as_slice(),
+        ["..", "..", name, "Cargo.toml"]
+            if !name.is_empty()
+                && !matches!(*name, "." | "..")
+                && name.len() <= MAX_RUN_WORKSPACE_NAME_BYTES
+                && !name.chars().any(char::is_control)
+    )
 }
 
 /// The natural console Run tail, in fixed order:

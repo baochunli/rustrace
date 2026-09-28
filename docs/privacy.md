@@ -107,8 +107,8 @@ The complete version 1 event vocabulary is:
   after `--`; whether the program ran in the workspace or in the `files/`
   folder of the assignment's test-case folder, with the BLAKE3 fixture-tree
   hash of that folder; and the packaged case name for a test-case run. A run
-  in `files/` records the absolute path of the workspace `Cargo.toml` after
-  `--manifest-path`. Console Test filters and output-option spellings are part
+  in `files/` records `--manifest-path ../../WORKSPACE/Cargo.toml`, which
+  names only the workspace directory, not where it is on the computer. Console Test filters and output-option spellings are part
   of the recorded argument vector. `--no-capture` and its `--nocapture` alias disable
   the Rust test harness's capture, not Rustrace's recording; `--show-output`
   exposes successful-test output after tests finish. Rustrace records output

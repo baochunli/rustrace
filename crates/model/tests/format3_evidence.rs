@@ -67,7 +67,7 @@ fn decoded_start(bytes: &[u8]) -> ControlledCommandStarted {
 }
 
 const FIXTURES: &str = "4444444444444444444444444444444444444444444444444444444444444444";
-const MANIFEST_PATH: &str = "/home/student/lab2.work/Cargo.toml";
+const MANIFEST_PATH: &str = "../../lab2.work/Cargo.toml";
 
 fn fixtures() -> Value {
     json!({"kind":"fixtures","fixtures_blake3":FIXTURES})
@@ -329,26 +329,32 @@ fn run_arguments_are_bounded_like_packaged_args_files() {
 }
 
 #[test]
-fn fixture_runs_record_one_absolute_manifest_path_in_a_fixed_slot() {
+fn fixture_runs_record_one_relative_manifest_path_in_a_fixed_slot() {
     let route = |args: Value| {
         json!({"stdin":{"kind":"submitted"},"stdout":{"kind":"console"},
             "args":args,"working_directory":fixtures()})
     };
+    let longest = format!("../../{}/Cargo.toml", "n".repeat(255));
+    let too_long = format!("../../{}/Cargo.toml", "n".repeat(256));
     for (tail, args) in [
         (
             &["--locked", "--manifest-path", MANIFEST_PATH][..],
             json!([]),
         ),
         (
-            &["--locked", "--manifest-path", "/Cargo.toml"][..],
-            json!([]),
-        ),
-        (
             &[
                 "--locked",
                 "--manifest-path",
-                "/home/{x}/lab..2.work/Cargo.toml",
+                "../../Lab 2 (final).work/Cargo.toml",
             ][..],
+            json!([]),
+        ),
+        (
+            &["--locked", "--manifest-path", "../../lab2/Cargo.toml"][..],
+            json!([]),
+        ),
+        (
+            &["--locked", "--manifest-path", longest.as_str()][..],
             json!([]),
         ),
         (
@@ -374,43 +380,63 @@ fn fixture_runs_record_one_absolute_manifest_path_in_a_fixed_slot() {
             json!([]),
         ),
         (
+            &[
+                "--locked",
+                "--manifest-path",
+                "/home/student/lab2.work/Cargo.toml",
+            ][..],
+            json!([]),
+        ),
+        (
             &["--locked", "--manifest-path", "../lab2.work/Cargo.toml"][..],
             json!([]),
         ),
         (
-            &["--locked", "--manifest-path", "/home/student/Cargo.lock"][..],
-            json!([]),
-        ),
-        (
-            &["--locked", "--manifest-path", "/../x/Cargo.toml"][..],
-            json!([]),
-        ),
-        (
-            &["--locked", "--manifest-path", "//Cargo.toml"][..],
+            &[
+                "--locked",
+                "--manifest-path",
+                "../../../lab2.work/Cargo.toml",
+            ][..],
             json!([]),
         ),
         (
             &[
                 "--locked",
                 "--manifest-path",
-                "/home/./lab2.work/Cargo.toml",
+                "../../course/lab2.work/Cargo.toml",
             ][..],
             json!([]),
         ),
         (
-            &["--locked", "--manifest-path", "/home/lab2.work//Cargo.toml"][..],
+            &["--locked", "--manifest-path", "../../../Cargo.toml"][..],
             json!([]),
         ),
         (
-            &[
-                "--locked",
-                "--manifest-path",
-                "/home/lab2.work/NotCargo.toml",
-            ][..],
+            &["--locked", "--manifest-path", "../.././Cargo.toml"][..],
             json!([]),
         ),
         (
-            &["--locked", "--manifest-path", "/home/a\nb/Cargo.toml"][..],
+            &["--locked", "--manifest-path", "../..//Cargo.toml"][..],
+            json!([]),
+        ),
+        (
+            &["--locked", "--manifest-path", "../../lab2.work/Cargo.lock"][..],
+            json!([]),
+        ),
+        (
+            &["--locked", "--manifest-path", "../../lab2.work/Cargo.toml/"][..],
+            json!([]),
+        ),
+        (
+            &["--locked", "--manifest-path", "./../lab2.work/Cargo.toml"][..],
+            json!([]),
+        ),
+        (
+            &["--locked", "--manifest-path", "../../a\nb/Cargo.toml"][..],
+            json!([]),
+        ),
+        (
+            &["--locked", "--manifest-path", too_long.as_str()][..],
             json!([]),
         ),
         (

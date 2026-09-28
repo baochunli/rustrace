@@ -460,6 +460,14 @@ pub fn build_dir_from(
     workspace: &Path,
     working_directory: &Path,
 ) -> Result<PathBuf, PreparationError> {
+    let mut relative = workspace_from(workspace, working_directory)?;
+    relative.push("target");
+    Ok(relative)
+}
+
+/// `workspace` spelled relative to `working_directory`, lexically. Both must be
+/// absolute and normalized, and the result may not contain a brace.
+fn workspace_from(workspace: &Path, working_directory: &Path) -> Result<PathBuf, PreparationError> {
     validate_path(workspace)?;
     validate_path(working_directory)?;
     let workspace = workspace.components().collect::<Vec<_>>();
@@ -476,7 +484,6 @@ pub fn build_dir_from(
     for component in &workspace[common..] {
         relative.push(component.as_os_str());
     }
-    relative.push("target");
     let spelled = relative.to_str().ok_or(PreparationError::InvalidPath)?;
     if spelled.contains(['{', '}']) {
         return Err(PreparationError::InvalidPath);
@@ -485,22 +492,41 @@ pub fn build_dir_from(
 }
 
 impl PreparedCargoCommand {
-    /// Runs a prepared console Run from `directory` (a format 3 fixture
-    /// folder) while Cargo still builds `workspace` into `WORKSPACE/target`.
-    /// It appends `--manifest-path WORKSPACE/Cargo.toml` after `--locked`,
-    /// so call it before appending any `-- ARG...`, and it keeps the build
-    /// directory independent of `directory`.
+    /// Runs a prepared console Run from `directory`, a format 3 fixture folder
+    /// `WORKSPACE_PARENT/NAME.test-cases/files`, while Cargo still builds
+    /// `workspace` into `WORKSPACE/target`. It appends
+    /// `--manifest-path ../../WORKSPACE_NAME/Cargo.toml` after `--locked`, so
+    /// call it before appending any `-- ARG...`. The recorded argument vector
+    /// thus names only the workspace directory, never its absolute location.
     pub fn run_from_directory(
         &mut self,
         workspace: &Path,
         directory: &Path,
     ) -> Result<(), PreparationError> {
-        let build_dir = build_dir_from(workspace, directory)?;
+        let relative = workspace_from(workspace, directory)?;
+        let mut components = relative.components();
+        let fixture_sibling = matches!(
+            (
+                components.next(),
+                components.next(),
+                components.next(),
+                components.next()
+            ),
+            (
+                Some(Component::ParentDir),
+                Some(Component::ParentDir),
+                Some(Component::Normal(_)),
+                None
+            )
+        );
+        if !fixture_sibling {
+            return Err(PreparationError::InvalidPath);
+        }
         self.command
             .current_dir(directory)
-            .env("CARGO_BUILD_BUILD_DIR", build_dir)
+            .env("CARGO_BUILD_BUILD_DIR", relative.join("target"))
             .arg("--manifest-path")
-            .arg(workspace.join("Cargo.toml"));
+            .arg(relative.join("Cargo.toml"));
         Ok(())
     }
 }

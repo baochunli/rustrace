@@ -1277,7 +1277,7 @@ fn format3_route() -> (Value, Vec<&'static str>) {
         vec![
             "--locked",
             "--manifest-path",
-            "/work/lab.work/Cargo.toml",
+            "../../lab.work/Cargo.toml",
             "--",
             "-n",
             "fn main",
@@ -1454,7 +1454,7 @@ fn format2_comparisons_stay_strict_about_format3_route_additions() {
         (
             json!({"stdin":{"kind":"file","path":"sample.in"},"stdout":{"kind":"console"},
                 "working_directory":{"kind":"fixtures","fixtures_blake3":FIXTURES_HASH}}),
-            vec!["--locked", "--manifest-path", "/work/lab.work/Cargo.toml"],
+            vec!["--locked", "--manifest-path", "../../lab.work/Cargo.toml"],
         ),
     ] {
         let mut replay = through_format3_finish(route.clone(), &tail, 0);

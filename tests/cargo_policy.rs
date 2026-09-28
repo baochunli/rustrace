@@ -949,8 +949,23 @@ fn build_dir_is_the_workspace_target_spelled_from_the_working_directory() {
         .collect::<Vec<_>>();
     assert_eq!(
         args[args.len() - 3..],
-        ["--locked", "--manifest-path", "/workspace/Cargo.toml"]
+        ["--locked", "--manifest-path", "../../workspace/Cargo.toml"]
     );
+    let course = PathBuf::from("/course/lab2.work");
+    for directory in [
+        "/course/lab2.work/src",
+        "/other/x/files",
+        "/course/lab2.test-cases/files/deep",
+        "/course",
+    ] {
+        let mut other = prepare_console(&request, &tools(), &course).unwrap();
+        assert!(
+            other
+                .run_from_directory(&course, &PathBuf::from(directory))
+                .is_err(),
+            "{directory} is not a sibling case folder's files/"
+        );
+    }
     assert!(prepared.command.get_envs().any(|(name, value)| {
         name == "CARGO_BUILD_BUILD_DIR"
             && value == Some(std::ffi::OsStr::new("../../workspace/target"))
@@ -1038,6 +1053,16 @@ fn fixture_directory_run_builds_into_the_workspace_target() {
     let request = parse_console_command("cargo run").unwrap();
     let mut prepared = prepare_console(&request, &selected, &workspace).unwrap();
     prepared.run_from_directory(&workspace, &fixtures).unwrap();
+    let args = prepared
+        .command
+        .get_args()
+        .map(|arg| arg.to_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        args[args.len() - 2..],
+        ["--manifest-path", "../../lab2.work/Cargo.toml"],
+        "Cargo resolves the relative manifest from the fixture folder"
+    );
     let output = prepared.command.output().unwrap();
     assert!(
         output.status.success(),

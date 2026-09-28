@@ -1272,8 +1272,8 @@ fn format3_reference_verifies_arguments_closed_stdin_and_fixtures() {
         "the session records the packaged fixture tree at startup"
     );
     let original = stored_zip_entry(&fs::read(&bundle).unwrap(), "session.rprov");
-    let manifest_path = case.join("workspace/Cargo.toml");
-    let manifest_path = manifest_path.to_str().unwrap();
+    // Relative to the fixture folder `workspace.test-cases/files`.
+    let manifest_path = "../../workspace/Cargo.toml";
     let baseline = Format3Run {
         args: &["-n", "fn main"],
         fixtures: Some(packaged_fixtures),
