@@ -731,7 +731,27 @@ fn verify_compares_packaged_test_case_suite_identity_and_kind() {
     );
     assert!(unverified.issues.iter().any(|issue| {
         issue.kind == VerificationIssueKind::AssignmentReference
-            && issue.detail.contains("must be an .rta archive")
+            && issue.detail.contains(
+                "format_version = 2 references must be an .rta archive so packaged test cases can be validated",
+            )
+    }));
+
+    let manifest_v3 = String::from_utf8(MANIFEST_V2.to_vec()).unwrap().replacen(
+        "format_version = 2",
+        "format_version = 3",
+        1,
+    );
+    let plain = write_reference(&fixture.base.join("format-3"), manifest_v3.as_bytes(), b"A");
+    let unverified = verify_path(&bundle, Some(&plain));
+    assert_eq!(
+        unverified.assignment_reference,
+        AssignmentReferenceStatus::Unverified
+    );
+    assert!(unverified.issues.iter().any(|issue| {
+        issue.kind == VerificationIssueKind::AssignmentReference
+            && issue
+                .detail
+                .contains("format_version = 3 references must be an .rta archive")
     }));
 }
 
