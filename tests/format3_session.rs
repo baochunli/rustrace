@@ -98,6 +98,15 @@ fn tar(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
 /// A deployed format 3 workspace `lab.work` with its own `lab.test-cases/`,
 /// exactly as `rustrace work` leaves them, and the fake tools.
 fn format3_fixture(name: &str) -> (PathBuf, PathBuf) {
+    format3_fixture_with(name, |_| package_cases())
+}
+
+/// Like [`format3_fixture`], with the case-folder files `cases` returns for
+/// the fixture's parent directory name.
+fn format3_fixture_with(
+    name: &str,
+    cases: impl FnOnce(&str) -> Vec<(String, Vec<u8>)>,
+) -> (PathBuf, PathBuf) {
     let parent =
         std::env::temp_dir().join(format!("rustrace-format3-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&parent);
@@ -117,7 +126,7 @@ fn format3_fixture(name: &str) -> (PathBuf, PathBuf) {
         ("starter/Cargo.lock".to_owned(), b"fixture".to_vec()),
         ("starter/main.rs".to_owned(), Vec::new()),
     ];
-    let cases = package_cases();
+    let cases = cases(parent.file_name().unwrap().to_str().unwrap());
     entries.extend(
         cases
             .iter()
@@ -598,6 +607,88 @@ fn format3_runner_child() {
         issue.kind == VerificationIssueKind::AssignmentReference
             && issue.detail == "fixture tree mismatch for test case no-input"
     }));
+}
+
+#[test]
+fn format3_without_fixtures_parent() {
+    if child_root().is_some() {
+        return;
+    }
+    let (parent, root) = format3_fixture_with("without-fixtures", |parent| {
+        vec![
+            ("spaced.args".into(), b"x\ny z\n".to_vec()),
+            (
+                "spaced.expected".into(),
+                format!("cwd={parent}/lab.work\nargs=x|y z\nstdin=closed:\ndata=none\n")
+                    .into_bytes(),
+            ),
+        ]
+    });
+    run_child(&root, "format3_without_fixtures_child");
+    fs::remove_dir_all(parent).unwrap();
+}
+
+/// A format 3 package without `files/` runs its cases, and console Runs, in
+/// the workspace, and its evidence still verifies against the package.
+#[test]
+fn format3_without_fixtures_child() {
+    let Some(root) = child_root() else {
+        return;
+    };
+    let parent = root.parent().unwrap().to_owned();
+    let extracted = extracted(&parent);
+    assert!(extracted.test_cases.as_ref().unwrap().fixtures.is_none());
+    let mut session = ProductionSession::start_from_assignment(&root, &extracted).unwrap();
+    assert_eq!(session.packaged_fixtures_hash(), None);
+    // A stray `files/` on disk never moves the Run: the package decides.
+    fs::create_dir(parent.join("lab.test-cases/files")).unwrap();
+    assert_eq!(
+        run_case(&mut session, "spaced"),
+        (TestCaseOutcome::Pass, None)
+    );
+    // A workspace `.cargo` matters only for Runs from a fixture folder.
+    fs::create_dir(root.join(".cargo")).unwrap();
+    assert_eq!(
+        session.start_console_command("cargo run -- q").unwrap(),
+        ConsoleStart::Started
+    );
+    finish_console_run(&mut session);
+    fs::remove_dir(root.join(".cargo")).unwrap();
+    let invocation: Value =
+        serde_json::from_slice(&fs::read(root.join("target/invocation.json")).unwrap()).unwrap();
+    assert_eq!(invocation["working_directory"], root.to_str().unwrap());
+    session.save_all().unwrap();
+    let receipt = session.finalize("student-1").unwrap();
+    let bundle = parent.join("session.zip");
+    create_bundle(&receipt, &bundle).unwrap();
+
+    let events = journal_events(&root);
+    let starts = payloads(&events, "controlled_command_started");
+    assert_eq!(
+        starts[0]["console"],
+        json!({"stdin": {"kind": "closed"}, "stdout": {"kind": "console"},
+            "args": ["x", "y z"], "test_case": "spaced"})
+    );
+    assert_eq!(
+        starts[0]["argv"].as_array().unwrap()[4..],
+        ["run", "--locked", "--", "x", "y z"].map(Value::from)
+    );
+    assert_eq!(
+        starts[1]["console"],
+        json!({"stdin": {"kind": "submitted"}, "stdout": {"kind": "console"}, "args": ["q"]})
+    );
+    let comparisons = payloads(&events, "test_case_compared");
+    assert_eq!(
+        comparisons[0]["invocation"],
+        json!({"args_blake3": test_case_args_blake3(&["x", "y z"]).to_string(),
+            "stdin": {"kind": "closed"}})
+    );
+    let report = verify_path(&bundle, Some(&parent.join("lab.rta")));
+    assert!(report.is_clean(), "{report:#?}");
+    assert_eq!(
+        report.test_case_evidence,
+        Some(TestCaseEvidenceStatus::ReferenceVerified)
+    );
 }
 
 #[test]
