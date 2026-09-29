@@ -129,16 +129,23 @@ fn console_literal_grammar_rejects_shell_syntax_flags_and_malformed_routes() {
         "cargo run -- >out",
         "cargo run -- 2>err",
         "cargo run -- x <in",
+        // Quotes, backticks, and shell operators stay refused in arguments,
+        // and a control character anywhere.
         "cargo run -- 'quoted arg'",
         "cargo run -- \"quoted\"",
-        "cargo run -- *.txt",
-        "cargo run -- $HOME",
+        "cargo run -- it's",
+        "cargo run -- `date`",
         "cargo run -- a|b",
+        "cargo run -- a&b",
         "cargo run -- a;b",
-        "cargo run -- a\\ b",
-        "cargo run -- ~/file",
-        "cargo run -- {a,b}",
         "cargo run -- x\ty",
+        "cargo run -- x\u{7f}",
+        // Before `--` and in redirection paths, every shell character.
+        "cargo run! -- x",
+        "cargo run --release* -- x",
+        "cargo run -- a > *.txt",
+        "cargo run -- a < $IN",
+        "cargo run -- a > (out)",
         "cargo run --release --release -- x",
         "cargo run x -- y",
         "cargo run <",
@@ -270,6 +277,38 @@ fn console_run_arguments_are_literal_tokens_before_any_redirection() {
     }
     for input in ["cargo test -- --nocapture", "cargo check"] {
         assert!(parse_console_command(input).unwrap().args.is_empty());
+    }
+}
+
+#[test]
+fn console_run_arguments_pass_shell_characters_literally() {
+    for (input, args) in [
+        (
+            "cargo run -- fn(x) tests/grep.md",
+            vec!["fn(x)", "tests/grep.md"],
+        ),
+        ("cargo run -- a*b file", vec!["a*b", "file"]),
+        ("cargo run -- $HOME", vec!["$HOME"]),
+        (
+            "cargo run -- \\d+ [a-z]? ~/notes #tag !bang {a,b} *.txt",
+            vec![
+                "\\d+", "[a-z]?", "~/notes", "#tag", "!bang", "{a,b}", "*.txt",
+            ],
+        ),
+        ("cargo run -- a\\ b < in.txt", vec!["a\\", "b"]),
+    ] {
+        let parsed =
+            parse_console_command(input).unwrap_or_else(|error| panic!("{input}: {error}"));
+        assert_eq!(parsed.args, args, "{input}");
+        let prepared = prepare_console(&parsed, &tools(), &PathBuf::from("/workspace")).unwrap();
+        let passed = prepared
+            .command
+            .get_args()
+            .skip_while(|arg| *arg != "--")
+            .skip(1)
+            .map(|arg| arg.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(passed, args, "{input}: nothing expands them");
     }
 }
 

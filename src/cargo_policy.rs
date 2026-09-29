@@ -67,48 +67,91 @@ pub struct ConsoleCommand {
     pub stdout: Option<WorkspacePath>,
 }
 
+/// Characters that a shell would interpret. None may appear in the command
+/// words, options, or redirection paths of a console line.
+fn is_shell_character(character: char) -> bool {
+    matches!(
+        character,
+        '\'' | '"'
+            | '\\'
+            | '$'
+            | '`'
+            | '|'
+            | '&'
+            | ';'
+            | '*'
+            | '?'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '('
+            | ')'
+            | '!'
+            | '~'
+            | '#'
+    )
+}
+
+/// Characters refused inside a program argument after `--`. There is no
+/// shell, so wildcards, `$`, `~`, `\`, brackets, parentheses, braces, `!`, and
+/// `#` reach the program literally; quotes, backticks, and the operators
+/// `|`, `&`, `;`, `<`, and `>` would suggest shell behaviour that does not
+/// happen, so they are refused rather than passed on.
+fn is_refused_in_argument(character: char) -> bool {
+    matches!(character, '\'' | '"' | '`' | '|' | '&' | ';' | '<' | '>')
+}
+
+/// The token positions of a Run's program arguments: after `cargo run`, an
+/// optional `--release`, and `--`, up to the first `<` or `>` token.
+fn run_argument_tokens(tokens: &[&str]) -> std::ops::Range<usize> {
+    if tokens.get(..2) != Some(&["cargo", "run"][..]) {
+        return 0..0;
+    }
+    let mut index = 2;
+    if tokens.get(index) == Some(&"--release") {
+        index += 1;
+    }
+    if tokens.get(index) != Some(&"--") {
+        return 0..0;
+    }
+    let start = index + 1;
+    let end = tokens[start..]
+        .iter()
+        .position(|token| matches!(*token, "<" | ">"))
+        .map_or(tokens.len(), |offset| start + offset);
+    start..end
+}
+
 /// Parse the bounded literal console grammar before any effect.
 ///
 /// A Run is `cargo run [--release] [-- ARG...] [< IN] [> OUT]`. Tokens are
-/// separated by ASCII whitespace and taken literally: there are no quotes,
-/// escapes, wildcards, pipes, or variables, so an argument cannot contain a
-/// space. `--` must be followed by at least one argument. Arguments end at
-/// the first `<` or `>` token, so redirections always follow the arguments
-/// and are never passed to the program; an argument may not contain `<` or
-/// `>` at all, and a redirection before `--` is refused. The two
+/// separated by ASCII whitespace and taken literally: nothing is expanded,
+/// and there are no quotes or escapes, so an argument cannot contain a space.
+/// Program arguments may hold characters a shell would interpret, which the
+/// program receives unchanged, except quotes, backticks, `|`, `&`, `;`, `<`,
+/// and `>`; the rest of the line refuses every shell character. `--` must be
+/// followed by at least one argument. Arguments end at the first `<` or `>`
+/// token, so redirections always follow the arguments and are never passed to
+/// the program, and a redirection before `--` is refused. The two
 /// redirections may appear in either order, each at most once. Arguments
 /// obey the packaged `NAME.args` bounds: at most 64, each 1 to 1024 bytes.
 pub fn parse_console_command(input: &str) -> Result<ConsoleCommand, PreparationError> {
-    if input.is_empty()
-        || input.len() > 4096
-        || input.chars().any(|character| {
-            character.is_control()
-                || matches!(
-                    character,
-                    '\'' | '"'
-                        | '\\'
-                        | '$'
-                        | '`'
-                        | '|'
-                        | '&'
-                        | ';'
-                        | '*'
-                        | '?'
-                        | '['
-                        | ']'
-                        | '{'
-                        | '}'
-                        | '('
-                        | ')'
-                        | '!'
-                        | '~'
-                        | '#'
-                )
-        })
-    {
+    if input.is_empty() || input.len() > 4096 || input.chars().any(char::is_control) {
         return Err(PreparationError::UnsupportedCommand);
     }
     let tokens = input.split_ascii_whitespace().collect::<Vec<_>>();
+    let arguments = run_argument_tokens(&tokens);
+    for (index, token) in tokens.iter().enumerate() {
+        let refused = if arguments.contains(&index) {
+            token.chars().any(is_refused_in_argument)
+        } else {
+            token.chars().any(is_shell_character)
+        };
+        if refused {
+            return Err(PreparationError::UnsupportedCommand);
+        }
+    }
     let action = match tokens.as_slice() {
         ["cargo", "build"] => CargoAction::Build,
         ["cargo", "check"] => CargoAction::Check,

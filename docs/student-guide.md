@@ -837,20 +837,29 @@ argument per space-separated word, exactly as typed: `cargo run -- -n fn main`
 gives your program the three arguments `-n`, `fn`, and `main`. Words such as
 `--release` or a second `--` after the separator are arguments too. Give at
 least one argument after `--`; at most 64 are allowed, each up to 1024 bytes.
-Because there is no quoting, one argument cannot contain a space. The first
+
+The console is not a shell, so nothing in an argument is expanded or
+interpreted: characters such as `*`, `?`, `$`, `~`, `\`, `!`, `#`, brackets,
+parentheses, and braces reach your program unchanged. `cargo run -- a*b file`
+passes `a*b`, not a list of matching files; `cargo run -- $HOME` passes the
+five characters `$HOME`; and `cargo run -- fn(x) tests/grep.md` passes
+`fn(x)` and `tests/grep.md`. Quoting and pipes are not supported: an argument
+may not contain `'`, `"`, or a backtick, nor `|`, `&`, `;`, `<`, or `>`, and
+because there is no quoting, one argument cannot contain a space. The first
 word that is exactly `<` or `>` ends the arguments and starts the
 redirections, which therefore always come last: `cargo run -- a < in.txt`
-works, and `cargo run < in.txt -- a` is rejected. An argument may not contain
-`<` or `>`. A version 3 case's `NAME.args` file can hold arguments with spaces,
-which the console cannot type. Your program's arguments are recorded with the
-command; the lines you type as its standard input are not.
+works, and `cargo run < in.txt -- a` is rejected. A version 3 case's
+`NAME.args` file can hold any of these characters, and spaces, which the
+console cannot type. Your program's arguments are recorded with the command;
+the lines you type as its standard input are not.
 
 Redirections are allowed only for `cargo run`. Their paths are relative to a
 directory named `test-cases` that sits next to your workspace directory, or to
 the workspace's own test-case folder such as `lab2.test-cases` for a version 3
 assignment, and each may appear once. In a version 3 test-case folder, `> OUT`
-cannot replace `.rustrace-cases.json` or write into `files/`. Quotes, pipes,
-wildcards, and other shell characters are rejected. A line is limited to 4096
+cannot replace `.rustrace-cases.json` or write into `files/`. Outside a Run's
+arguments, including in redirection paths, quotes, pipes, wildcards, and other
+shell characters are rejected. A line is limited to 4096
 bytes, including surrounding spaces. Leading, trailing, and repeated ASCII
 spaces are allowed; tabs and newlines are rejected. If the output file already
 exists, the console asks before overwriting: Y or Enter overwrites, N or Esc

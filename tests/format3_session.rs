@@ -817,7 +817,8 @@ fn console_arguments_in_a_workspace_run_parent() {
 }
 
 /// Lab 1 style (no fixture tree): `cargo run -- ARG...` records its
-/// arguments and still runs in the workspace.
+/// arguments, passes `(`, `)`, and `$` literally, and still runs in the
+/// workspace.
 #[test]
 fn console_arguments_in_a_workspace_run_child() {
     let Some(root) = child_root() else {
@@ -828,7 +829,7 @@ fn console_arguments_in_a_workspace_run_child() {
     let mut session = ProductionSession::start(&root, manifest.as_bytes()).unwrap();
     assert_eq!(
         session
-            .start_console_command("cargo run -- -n fn=main < input.txt")
+            .start_console_command("cargo run -- -n fn(x)=$HOME < input.txt")
             .unwrap(),
         ConsoleStart::Started
     );
@@ -837,12 +838,12 @@ fn console_arguments_in_a_workspace_run_child() {
     let invocation: Value =
         serde_json::from_slice(&fs::read(root.join("target/invocation.json")).unwrap()).unwrap();
     assert_eq!(invocation["working_directory"], root.to_str().unwrap());
-    assert_eq!(invocation["program_args"], json!(["-n", "fn=main"]));
+    assert_eq!(invocation["program_args"], json!(["-n", "fn(x)=$HOME"]));
     for line in [
         "cargo run -- a < in.txt extra",
         "cargo run < input.txt -- a",
         "cargo run -- 'quoted'",
-        "cargo run -- *.rs",
+        "cargo run -- a;b",
     ] {
         assert!(session.start_console_command(line).is_err(), "{line}");
     }
@@ -853,17 +854,17 @@ fn console_arguments_in_a_workspace_run_child() {
     assert_eq!(
         starts[0]["console"],
         json!({"stdin": {"kind": "file", "path": "input.txt"},
-            "stdout": {"kind": "console"}, "args": ["-n", "fn=main"]})
+            "stdout": {"kind": "console"}, "args": ["-n", "fn(x)=$HOME"]})
     );
     assert_eq!(
         starts[0]["argv"].as_array().unwrap()[4..],
-        ["run", "--locked", "--", "-n", "fn=main"].map(Value::from)
+        ["run", "--locked", "--", "-n", "fn(x)=$HOME"].map(Value::from)
     );
     let workspace_name = root.file_name().unwrap().to_str().unwrap();
     assert_eq!(
         stdout_of(&events, &starts[0]["command_id"]),
         format!(
-            "cwd={}/{workspace_name}\nargs=-n|fn=main\nstdin=file:typed\n\ndata=none\n",
+            "cwd={}/{workspace_name}\nargs=-n|fn(x)=$HOME\nstdin=file:typed\n\ndata=none\n",
             root.parent()
                 .unwrap()
                 .file_name()
