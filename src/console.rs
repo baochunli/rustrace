@@ -504,7 +504,6 @@ impl TestCaseDirectory {
 
     /// Lists live cases for one assignment format. Format 2 lists complete
     /// `.in`/`.expected` pairs exactly as [`Self::list_cases`] does.
-    #[allow(dead_code)] // The picker selects the format 3 layout in T10.51.
     pub(crate) fn list_cases_for(&self, layout: TestCaseLayout) -> Result<Vec<TestCase>> {
         match layout {
             TestCaseLayout::Paired => self.list_cases(),

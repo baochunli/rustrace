@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run a format 3 packaged case and console Runs end to end in a real workspace.
 
-The F4 picker still lists only cases with a `.in` (T10.51 lists the rest), so
-this drives the `echo` case through it: its arguments, hashed input, and the
+The F4 picker lists every case with a `.expected`, including `quiet`, which
+has no `.in`, and runs the `echo` case: its arguments, hashed input, and the
 fixture working directory. The console runs `cargo run -- ARG...` from the
 fixture folder, a changed fixture tree shows a warning toast, and a workspace
 `.cargo` is refused.
@@ -130,7 +130,7 @@ entries = [
     ("test-cases/echo.in", b"alpha\n"),
     ("test-cases/echo.expected", expected),
     ("test-cases/quiet.args", b"--quiet\n"),
-    ("test-cases/quiet.expected", b"not listed until T10.51\n"),
+    ("test-cases/quiet.expected", b"cwd=lab.test-cases/files\nargs=--quiet\nstdin=closed:\ndata=" + data),
     ("test-cases/files/data.txt", data),
 ]
 package = root / "lab.rta"
@@ -303,7 +303,7 @@ try:
         lambda: all(value in rendered_screen() for value in ["Test cases", "echo", "Run all"]),
         "picker",
     )
-    assert "quiet" not in rendered_screen(), "the picker lists only .in cases until T10.51"
+    assert "quiet" in rendered_screen(), "the picker lists a case without .in"
     send(b"\r")
     wait_for(
         lambda: len(runs()) == 1

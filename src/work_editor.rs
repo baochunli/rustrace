@@ -69,7 +69,7 @@ impl TestCasePicker {
             .get(self.selected)
             .map(|case| case.name().to_owned());
         match TestCaseDirectory::open(workspace_root, layout, suite)
-            .and_then(|directory| directory.list_cases())
+            .and_then(|directory| directory.list_cases_for(layout))
         {
             Ok(cases) => {
                 self.replace_cases(cases);
