@@ -311,8 +311,11 @@ fn start_test_case_sequence(
             Ok(()) => {
                 picker.note_started(case);
                 // A format 3 case whose fixture files differ still runs.
+                // Without a new warning, an earlier one no longer applies.
                 if let Some(warning) = session.take_run_warning() {
                     status.replace(warning);
+                } else if crate::console::is_fixtures_changed_warning(status) {
+                    status.clear();
                 }
                 return;
             }
@@ -5210,6 +5213,62 @@ format = ["cargo", "fmt"]
             "{}",
             rows[0].text()
         );
+        session.quit().unwrap();
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_case_started_without_a_warning_clears_an_earlier_fixtures_warning() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = std::env::temp_dir().join(format!(
+            "rustrace-picker-stale-warning-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        let root = parent.join("assignment.work");
+        fs::create_dir_all(parent.join("test-cases")).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(parent.join("test-cases/sample.in"), b"input\n").unwrap();
+        fs::write(parent.join("test-cases/sample.expected"), b"output\n").unwrap();
+        let manifest = br#"format_version = 1
+course_id = "course"
+assignment_id = "stale-warning"
+assignment_version = "v1"
+title = "Stale warning"
+toolchain = "1.98.1"
+edition = "2024"
+allowed_paths = ["*.rs"]
+[commands]
+check = ["cargo", "check"]
+test = ["cargo", "test"]
+run = ["cargo", "run"]
+clippy = ["cargo", "clippy"]
+format = ["cargo", "fmt"]
+"#;
+        let mut session = ProductionSession::start(&root, manifest).unwrap();
+        let mut picker = TestCasePicker::default();
+        picker
+            .refresh(&root, crate::console::TestCaseLayout::Paired, None)
+            .unwrap();
+        let case = picker.begin_selected().unwrap();
+        let mut status: StatusMessage =
+            crate::console::fixtures_changed_warning("lab2.test-cases/files", true)
+                .as_str()
+                .into();
+
+        start_test_case_sequence(&mut session, &mut picker, &mut status, case);
+
+        assert!(session.command_active());
+        assert_eq!(status.as_str(), "", "the earlier warning no longer applies");
+        session.cancel_command();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while session.command_active() && std::time::Instant::now() < until {
+            let _ = session.poll_command();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!session.command_active());
         session.quit().unwrap();
         fs::remove_dir_all(parent).unwrap();
     }
