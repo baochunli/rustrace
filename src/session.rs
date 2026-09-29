@@ -30,6 +30,11 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 type Files = BTreeMap<WorkspacePath, Vec<u8>>;
 const ARTIFACT_LIMIT: usize = 34 * 1024 * 1024;
 const METADATA_LIMIT: usize = 1024 * 1024;
+/// Files a read-only state inspection accepts. Besides the journal, the state
+/// directory holds one toolchain observation per launch and, after a submit
+/// that stopped partway, up to one captured file per checkpoint; the storage
+/// budget, not this count, bounds the bytes read.
+const STATE_INSPECTION_FILES: usize = 65_536;
 
 mod bundle;
 mod command;
@@ -2921,7 +2926,10 @@ fn preserved_evidence(
     root: &PinnedWorkspaceRoot,
     owner: &PinnedStateInspection,
 ) -> Result<serde_json::Value> {
-    let inventory = owner.inventory(SessionBudgets::default().storage_bytes, 1024)?;
+    let inventory = owner.inventory(
+        SessionBudgets::default().storage_bytes,
+        STATE_INSPECTION_FILES,
+    )?;
     let read = |name: &str| -> Result<Option<Vec<u8>>> {
         if inventory
             .iter()

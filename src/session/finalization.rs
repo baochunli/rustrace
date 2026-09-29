@@ -1663,6 +1663,81 @@ fn load_revision_seed(
     }))
 }
 
+/// One validated toolchain observation, reduced to what export selection needs.
+#[derive(Clone, Debug)]
+pub(super) struct RuntimeObservation {
+    pub(super) sequence: u64,
+    event_hash: Hash,
+    name: String,
+    byte_length: u64,
+    blake3: Hash,
+    report_digest: Hash,
+}
+
+impl RuntimeObservation {
+    pub(super) fn new(
+        name: String,
+        bytes: &[u8],
+        observation: &RuntimeToolchainMetadata,
+    ) -> Result<Self> {
+        Ok(Self {
+            sequence: observation.sequence,
+            event_hash: observation.event_hash,
+            name,
+            byte_length: bytes.len() as u64,
+            blake3: rprov_raw_blake3(bytes),
+            report_digest: rprov_raw_blake3(&serde_json::to_vec(&observation.report)?),
+        })
+    }
+
+    pub(super) fn byte_length(&self) -> u64 {
+        self.byte_length
+    }
+
+    pub(super) fn blake3(&self) -> Hash {
+        self.blake3
+    }
+}
+
+/// Every `rustrace work` start records one toolchain observation, but a
+/// segment exports at most `limit`. Up to the limit every observation is kept,
+/// so those bundles keep every byte. Beyond it the export keeps the first
+/// observation, each one whose report differs from the observation before it,
+/// and the last, which sets the producer; if those still exceed the limit, the
+/// first and the most recent are kept. The event stream still records every
+/// launch, and verify needs no observation per launch.
+pub(super) fn select_runtime_observations(
+    mut observations: Vec<RuntimeObservation>,
+    limit: usize,
+) -> Vec<RuntimeObservation> {
+    observations.sort_by(|left, right| {
+        left.sequence
+            .cmp(&right.sequence)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    if observations.len() <= limit {
+        return observations;
+    }
+    let last = observations.len() - 1;
+    let mut selected = observations
+        .iter()
+        .enumerate()
+        .filter(|(index, observation)| {
+            *index == 0
+                || *index == last
+                || observation.report_digest != observations[index - 1].report_digest
+        })
+        .map(|(_, observation)| observation.clone())
+        .collect::<Vec<_>>();
+    if selected.len() > limit {
+        debug_assert!(limit >= 2, "the first and the last must both fit");
+        let recent = selected.split_off(selected.len() - (limit - 1));
+        selected.truncate(1);
+        selected.extend(recent);
+    }
+    selected
+}
+
 fn capture_runtime_metadata(
     owner: &PinnedJournalFile,
     state_directory: &Path,
@@ -1672,6 +1747,7 @@ fn capture_runtime_metadata(
 ) -> Result<CapturedRuntimeMetadata> {
     owner.verify()?;
     let mut observations = Vec::new();
+    let mut latest: Option<(u64, String, ToolchainReport)> = None;
     for entry in fs::read_dir(state_directory)? {
         let entry = entry?;
         let name = entry
@@ -1692,34 +1768,29 @@ fn capture_runtime_metadata(
         {
             return Err("runtime metadata owner/assignment identity mismatch".into());
         }
-        if observations.len() == MAX_RPROV_METADATA_PER_SEGMENT {
-            return Err("runtime metadata exceeds the segment item limit".into());
+        observations.push(RuntimeObservation::new(name.clone(), &bytes, &observation)?);
+        if latest.as_ref().is_none_or(|(sequence, latest_name, _)| {
+            (observation.sequence, &name) > (*sequence, latest_name)
+        }) {
+            latest = Some((observation.sequence, name, observation.report));
         }
-        observations.push((observation, name, bytes));
     }
     owner.verify()?;
-    observations.sort_by_key(|(observation, _, _)| observation.sequence);
-    let selected_report = observations
-        .last()
-        .map(|(observation, _, _)| &observation.report);
-    let producer = producer(metadata, selected_report);
+    let producer = producer(metadata, latest.as_ref().map(|(_, _, report)| report));
     let mut by_entry = BTreeMap::new();
-    for (observation, name, bytes) in observations {
-        let digest = rprov_raw_blake3(&bytes);
-        let archive_entry = format!("segments/{ordinal:04}/metadata/{digest}.json");
-        by_entry
-            .entry(archive_entry)
-            .or_insert((observation, name, bytes.len() as u64, digest));
+    for observation in select_runtime_observations(observations, MAX_RPROV_METADATA_PER_SEGMENT) {
+        let archive_entry = format!("segments/{ordinal:04}/metadata/{}.json", observation.blake3);
+        by_entry.entry(archive_entry).or_insert(observation);
     }
     let mut refs = Vec::with_capacity(by_entry.len());
     let mut inventory = Vec::with_capacity(by_entry.len());
     let mut payloads = Vec::with_capacity(by_entry.len());
-    for (entry, (observation, name, byte_length, digest)) in by_entry {
+    for (entry, observation) in by_entry {
         refs.push(RprovMetadataRef {
             format_version: 1,
             entry: entry.clone(),
-            byte_length,
-            blake3: digest,
+            byte_length: observation.byte_length,
+            blake3: observation.blake3,
             owner: RecordedEventRef {
                 session_id: metadata.session_id.clone(),
                 sequence: observation.sequence,
@@ -1728,15 +1799,15 @@ fn capture_runtime_metadata(
         });
         inventory.push(RprovInventoryEntry {
             path: entry.clone(),
-            byte_length,
-            blake3: digest,
+            byte_length: observation.byte_length,
+            blake3: observation.blake3,
             kind: RprovEntryKind::RuntimeMetadata,
         });
         payloads.push(FinalizationPayload {
             entry,
-            path: state_directory.join(name),
-            byte_length,
-            blake3: digest,
+            path: state_directory.join(observation.name),
+            byte_length: observation.byte_length,
+            blake3: observation.blake3,
         });
     }
     Ok(CapturedRuntimeMetadata {

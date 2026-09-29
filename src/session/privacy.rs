@@ -3,6 +3,7 @@
 use super::{
     FinalizationPayload, METADATA_LIMIT, ProductionSession, ReadOnlyFinalizationStatus, Result,
     SessionBudgets, SessionMetadata, digest,
+    finalization::{RuntimeObservation, select_runtime_observations},
 };
 use crate::{display, toolchain::RuntimeToolchainMetadata};
 use rustrace_journal::{
@@ -12,9 +13,10 @@ use rustrace_journal::{
 use rustrace_model::{
     DecodeOutcome, DecodePolicy, EditorTransaction, Event, EventEnvelope, Hash,
     MAX_RPROV_CHECKPOINTS_PER_SEGMENT, MAX_RPROV_EVENTS, MAX_RPROV_MANIFEST_BYTES,
-    MAX_RPROV_METADATA_ENTRY_BYTES, RprovEntryKind, RprovInitialWorkspace, RprovInventoryEntry,
-    RprovKnown, RprovManifest, SessionId, decode_envelope, decode_rprov_manifest, encode_envelope,
-    encode_rprov_manifest, rprov_raw_blake3,
+    MAX_RPROV_METADATA_ENTRY_BYTES, MAX_RPROV_METADATA_PER_SEGMENT, RprovEntryKind,
+    RprovInitialWorkspace, RprovInventoryEntry, RprovKnown, RprovManifest, SessionId,
+    decode_envelope, decode_rprov_manifest, encode_envelope, encode_rprov_manifest,
+    rprov_raw_blake3,
 };
 use rustrace_replay::ReplayEngine;
 use rustrace_workspace::hash::{
@@ -436,7 +438,10 @@ fn capture_preview(root: &Path, metadata: &SessionMetadata) -> Result<PreviewCap
     let state = pinned.open_existing_state_directory()?;
     let mut inspection = lock_for_privacy_inspection(state)?;
     let captured = (|| -> Result<PreviewCapture> {
-        let inventory = inspection.inventory(SessionBudgets::default().storage_bytes, 1024)?;
+        let inventory = inspection.inventory(
+            SessionBudgets::default().storage_bytes,
+            super::STATE_INSPECTION_FILES,
+        )?;
         let manifest_bytes = inspection.read_artifact("manifest.toml", METADATA_LIMIT)?;
         if digest(&manifest_bytes) != metadata.manifest_hash {
             return Err("assignment manifest changed during privacy inspection".into());
@@ -512,7 +517,7 @@ fn capture_preview(root: &Path, metadata: &SessionMetadata) -> Result<PreviewCap
             .map(|event| (event.sequence, event.event_hash))
             .collect::<BTreeMap<_, _>>();
 
-        let mut metadata_by_digest = BTreeMap::new();
+        let mut observations = Vec::new();
         for (name, length, _) in &inventory {
             if !name.starts_with("toolchain-") || !name.ends_with(".json") {
                 continue;
@@ -527,9 +532,15 @@ fn capture_preview(root: &Path, metadata: &SessionMetadata) -> Result<PreviewCap
             {
                 return Err("runtime metadata differs from the durable prefix".into());
             }
+            observations.push(RuntimeObservation::new(name.clone(), &bytes, &observation)?);
+        }
+        // The preview counts exactly the observations finalization exports.
+        let mut metadata_by_digest = BTreeMap::new();
+        for observation in select_runtime_observations(observations, MAX_RPROV_METADATA_PER_SEGMENT)
+        {
             metadata_by_digest
-                .entry(rprov_raw_blake3(&bytes))
-                .or_insert(*length);
+                .entry(observation.blake3())
+                .or_insert(observation.byte_length());
         }
 
         let mut evidence_names = BTreeSet::new();

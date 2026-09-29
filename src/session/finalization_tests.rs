@@ -1075,3 +1075,85 @@ fn limit_counts_are_grouped_by_thousands() {
         assert_eq!(crate::display::grouped(value), text);
     }
 }
+
+fn toolchain_observation(
+    sequence: u64,
+    toolchain: &str,
+) -> super::finalization::RuntimeObservation {
+    let observation = crate::toolchain::RuntimeToolchainMetadata {
+        version: 1,
+        session_id: SessionId::new("session-launches").unwrap(),
+        manifest_hash: Hash::from_bytes([3; Hash::LENGTH]),
+        sequence,
+        event_hash: Hash::from_bytes([4; Hash::LENGTH]),
+        report: crate::toolchain::ToolchainReport {
+            assignment_pin: Some("1.98.1".to_owned()),
+            selected_toolchain: Some(toolchain.to_owned()),
+            working_directory: PathBuf::from("assignment"),
+            probes: Vec::new(),
+        },
+    };
+    let bytes = serde_json::to_vec(&observation).unwrap();
+    super::finalization::RuntimeObservation::new(
+        format!("toolchain-{sequence:020}.json"),
+        &bytes,
+        &observation,
+    )
+    .unwrap()
+}
+
+fn selected_sequences(
+    observations: Vec<super::finalization::RuntimeObservation>,
+    limit: usize,
+) -> Vec<u64> {
+    super::finalization::select_runtime_observations(observations, limit)
+        .into_iter()
+        .map(|observation| observation.sequence)
+        .collect()
+}
+
+#[test]
+fn runtime_observations_keep_first_changes_and_last_within_the_limit() {
+    // Within the limit nothing is dropped, so those bundles keep every byte.
+    let few = (1..=4)
+        .rev()
+        .map(|sequence| toolchain_observation(sequence * 10, "stable"))
+        .collect();
+    assert_eq!(selected_sequences(few, 4), [10, 20, 30, 40]);
+
+    // Unchanged launches beyond the limit keep the first and the last, which
+    // sets the producer.
+    let same = (1..=500)
+        .map(|sequence| toolchain_observation(sequence, "stable"))
+        .collect();
+    assert_eq!(selected_sequences(same, 64), [1, 500]);
+
+    // Each change is kept with the observation that starts it.
+    let changing = (1..=100)
+        .map(|sequence| {
+            toolchain_observation(
+                sequence,
+                if (40..60).contains(&sequence) {
+                    "beta"
+                } else {
+                    "stable"
+                },
+            )
+        })
+        .collect();
+    assert_eq!(selected_sequences(changing, 8), [1, 40, 60, 100]);
+
+    // More changes than the limit keep the first and the most recent ones.
+    let alternating = (1..=100)
+        .map(|sequence| {
+            toolchain_observation(sequence, if sequence % 2 == 0 { "beta" } else { "stable" })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        selected_sequences(alternating.clone(), 5),
+        [1, 97, 98, 99, 100]
+    );
+    let mut shuffled = alternating;
+    shuffled.reverse();
+    assert_eq!(selected_sequences(shuffled, 5), [1, 97, 98, 99, 100]);
+}

@@ -456,3 +456,70 @@ fn a_marker_that_claims_a_missing_capture_still_blocks_submit() {
         .to_string();
     assert!(error.contains("INCOMPLETE RECOVERY"), "{error}");
 }
+
+#[test]
+fn five_hundred_toolchain_observations_still_submit_and_verify() {
+    let (fixture, mut session) = Fixture::started("bundle-500-observations");
+    for _ in 0..500 {
+        session.execute(EditorCommand::Insert('x')).unwrap();
+    }
+    let metadata = session.metadata().clone();
+    session.quit().unwrap();
+    let journal_path = fixture
+        .workspace
+        .join(format!(".rustrace/{}.sqlite", metadata.session_id));
+    let mut journal = Journal::open_read_only_no_follow(&journal_path).unwrap();
+    let mut events = Vec::new();
+    while events.len() < 500 {
+        events.extend(
+            journal
+                .read_events(&metadata.session_id, events.len() as u64 + 1, 256)
+                .unwrap(),
+        );
+    }
+    drop(journal);
+    // One observation per recorded launch; the tools change at 200 and 300.
+    for event in events.iter().take(500) {
+        let observation = crate::toolchain::RuntimeToolchainMetadata {
+            version: 1,
+            session_id: metadata.session_id.clone(),
+            manifest_hash: metadata.manifest_hash,
+            sequence: event.sequence,
+            event_hash: event.event_hash,
+            report: crate::toolchain::ToolchainReport {
+                assignment_pin: Some("1.98.1".to_owned()),
+                selected_toolchain: Some(
+                    if (200..300).contains(&event.sequence) {
+                        "beta"
+                    } else {
+                        "stable"
+                    }
+                    .to_owned(),
+                ),
+                working_directory: fixture.workspace.clone(),
+                probes: Vec::new(),
+            },
+        };
+        fs::write(
+            fixture
+                .workspace
+                .join(format!(".rustrace/toolchain-{:020}.json", event.sequence)),
+            serde_json::to_vec(&observation).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let destination = fixture.base.join("observations.zip");
+    let bundle =
+        submit_finalized_workspace(&fixture.workspace, "student-1", Some(destination.as_path()))
+            .unwrap();
+    assert!(crate::verify::verify_path(&bundle.path, None).is_clean());
+    let imported = import_rprov(Cursor::new(fs::read(&bundle.path).unwrap())).unwrap();
+    let mut owners = imported.manifest().segments[0]
+        .metadata
+        .iter()
+        .map(|metadata| metadata.owner.sequence)
+        .collect::<Vec<_>>();
+    owners.sort_unstable();
+    assert_eq!(owners, [1, 200, 300, 500]);
+}
