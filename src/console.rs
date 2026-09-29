@@ -381,14 +381,16 @@ impl TestCase {
         &self.name
     }
 
-    /// Whether the case has a `NAME.in`; without one it runs with stdin closed.
-    #[allow(dead_code)] // Read by the format 3 runner and picker (T10.50/T10.51).
+    /// Whether the listing saw a `NAME.in`. Runs and the picker check the
+    /// file again rather than trusting this.
+    #[cfg(test)]
     pub(crate) fn has_input(&self) -> bool {
         self.has_input
     }
 
-    /// The case's program arguments, or `None` when its `NAME.args` is invalid.
-    #[allow(dead_code)] // Read by the format 3 runner and picker (T10.50/T10.51).
+    /// The listed program arguments, or `None` when `NAME.args` was invalid.
+    /// Runs and the picker read the file again rather than trusting this.
+    #[cfg(test)]
     pub(crate) fn args(&self) -> Option<&[String]> {
         self.args.as_deref()
     }
@@ -504,7 +506,6 @@ impl TestCaseDirectory {
 
     /// Lists live cases for one assignment format. Format 2 lists complete
     /// `.in`/`.expected` pairs exactly as [`Self::list_cases`] does.
-    #[allow(dead_code)] // The picker selects the format 3 layout in T10.51.
     pub(crate) fn list_cases_for(&self, layout: TestCaseLayout) -> Result<Vec<TestCase>> {
         match layout {
             TestCaseLayout::Paired => self.list_cases(),
@@ -575,10 +576,45 @@ impl TestCaseDirectory {
         Ok(parse_test_case_args(&bytes).map_err(|error| format!("test-case arguments {error}"))?)
     }
 
-    /// The deployed fixture root that a format 3 case runs from.
-    #[allow(dead_code)] // Shown with each case's fixture files in T10.51.
-    pub(crate) fn fixtures_path(&self) -> PathBuf {
-        self.root.path().join(FIXTURE_ROOT)
+    /// The fixture folder as students see it, `NAME.test-cases/files`, for
+    /// messages and the picker.
+    pub(crate) fn fixtures_display(&self) -> String {
+        let folder = self
+            .root
+            .path()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        crate::display::label(&format!("{folder}/{FIXTURE_ROOT}"), 300)
+    }
+
+    /// A format 3 case's arguments, checked as a Run checks them: an absent
+    /// `NAME.args` means none, and a present one must be an unaliased regular
+    /// file, reached without following links, that parses.
+    pub(crate) fn case_args(&self, case: &TestCase) -> Result<Vec<String>> {
+        if external_regular_file_exists_in(&self.root, &case.args_path())? {
+            self.read_args(case)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The size of a format 3 case's `NAME.in`, or `None` without one, for
+    /// the picker. It applies the checks a Run makes before reading the
+    /// input, without reading it: a present `NAME.in` must be an unaliased
+    /// regular file, reached without following links, within the case-file
+    /// limit. The Run reads the file again, so a later change is judged then.
+    pub(crate) fn input_len(&self, case: &TestCase) -> Result<Option<u64>> {
+        if !external_regular_file_exists_in(&self.root, &case.input_path())? {
+            return Ok(None);
+        }
+        let opened = self.open_input(&case.input_path())?;
+        let len = opened.file().metadata()?.len();
+        self.root.verify_binding()?;
+        if len > MAX_TEST_CASE_FILE_BYTES {
+            return Err("test input exceeds the 1048576-byte limit".into());
+        }
+        Ok(Some(len))
     }
 
     /// Opens the deployed `files/` folder by descriptor, or `None` when it is
@@ -597,13 +633,7 @@ impl TestCaseDirectory {
     /// warns and records the deployed hash.
     pub(crate) fn pin_fixtures(&self, packaged: Hash) -> Result<PinnedFixtures> {
         self.reject_cargo_configuration()?;
-        let folder = self
-            .root
-            .path()
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let display = crate::display::label(&format!("{folder}/{FIXTURE_ROOT}"), 300);
+        let display = self.fixtures_display();
         let root = self.open_fixture_root()?.ok_or_else(|| {
             format!(
                 "the fixture folder {display} is missing; quit and resume the workspace to deploy it again"
@@ -622,11 +652,7 @@ impl TestCaseDirectory {
     /// on disk now. `NAME.in` is read into memory (at most the 1 MiB case-file
     /// limit) so the program receives exactly the bytes that were hashed.
     pub(crate) fn read_extended_case(&self, case: &TestCase) -> Result<ExtendedCaseFiles> {
-        let args = if external_regular_file_exists_in(&self.root, &case.args_path())? {
-            self.read_args(case)?
-        } else {
-            Vec::new()
-        };
+        let args = self.case_args(case)?;
         let input = if external_regular_file_exists_in(&self.root, &case.input_path())? {
             Some(self.read_input_with_blake3(case)?)
         } else {
@@ -641,23 +667,19 @@ impl TestCaseDirectory {
         Ok(read_deployed_fixture_tree(&self.root)?)
     }
 
-    /// The deployed tree's hash, or `None` when `files/` is absent.
-    #[allow(dead_code)] // Shown by the picker in T10.51.
-    pub(crate) fn fixture_tree_hash(&self) -> Result<Option<Hash>> {
-        Ok(self.fixture_tree()?.map(|tree| tree.hash()))
-    }
-
-    /// Compares the deployed `files/` tree with the packaged fixture-tree
-    /// hash that the session recorded at startup, so a run can warn when a
-    /// student's copy differs. An unreadable tree (for example one holding a
-    /// symlink) is an error rather than a difference. Runs use
-    /// [`Self::pin_fixtures`], which also keeps the folder open.
-    #[allow(dead_code)] // Shown by the picker in T10.51.
-    pub(crate) fn check_fixture_tree(&self, packaged: Option<Hash>) -> Result<FixtureTreeCheck> {
-        Ok(FixtureTreeCheck::classify(
-            packaged,
-            self.fixture_tree_hash()?,
-        ))
+    /// Reads the deployed `files/` tree once and compares it with the
+    /// packaged fixture-tree hash that the session recorded at startup, so
+    /// the picker's file list and its changed-files warning describe the same
+    /// tree. An unreadable tree (for example one holding a symlink) is an
+    /// error rather than a difference. Runs use [`Self::pin_fixtures`], which
+    /// also keeps the folder open.
+    pub(crate) fn check_fixture_tree(
+        &self,
+        packaged: Option<Hash>,
+    ) -> Result<(FixtureTreeCheck, Option<FixtureTree>)> {
+        let tree = self.fixture_tree()?;
+        let check = FixtureTreeCheck::classify(packaged, tree.as_ref().map(FixtureTree::hash));
+        Ok((check, tree))
     }
 
     /// Refuses a `.cargo` entry in the case folder or its `files/`. Cargo
@@ -1544,7 +1566,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn fixture_tree_hash_reads_the_deployed_tree_or_reports_its_absence() {
+    fn fixture_tree_check_reads_the_deployed_tree_once_or_reports_its_absence() {
         let parent = fixture("fixture-hash");
         let cases_root = own_case_folder(&parent);
         fs::write(cases_root.join("case.expected"), b"").unwrap();
@@ -1554,8 +1576,8 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(directory.fixture_tree_hash().unwrap(), None);
-        assert_eq!(directory.fixtures_path(), cases_root.join("files"));
+        assert_eq!(directory.check_fixture_tree(None).unwrap().1, None);
+        assert_eq!(directory.fixtures_display(), "assignment.test-cases/files");
 
         fs::create_dir_all(cases_root.join("files/src")).unwrap();
         fs::write(cases_root.join("files/src/lib.rs"), b"fn a() {}\n").unwrap();
@@ -1568,22 +1590,31 @@ mod tests {
         )
         .unwrap()
         .hash();
-        assert_eq!(directory.fixture_tree_hash().unwrap(), Some(expected));
-
+        let (check, tree) = directory.check_fixture_tree(Some(expected)).unwrap();
         assert_eq!(
-            directory.check_fixture_tree(Some(expected)).unwrap(),
+            check,
             FixtureTreeCheck::Matches {
                 fixtures_blake3: expected
             }
         );
+        let tree = tree.unwrap();
+        assert_eq!(tree.hash(), expected);
         assert_eq!(
-            directory.check_fixture_tree(None).unwrap(),
+            tree.files()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/lib.rs"]
+        );
+        assert_eq!(
+            directory.check_fixture_tree(None).unwrap().0,
             FixtureTreeCheck::NotPackaged { deployed: true }
         );
         fs::write(cases_root.join("files/src/lib.rs"), b"edited\n").unwrap();
-        let edited = directory.fixture_tree_hash().unwrap();
+        let (check, tree) = directory.check_fixture_tree(Some(expected)).unwrap();
+        let edited = tree.map(|tree| tree.hash());
+        assert_ne!(edited, Some(expected));
         assert_eq!(
-            directory.check_fixture_tree(Some(expected)).unwrap(),
+            check,
             FixtureTreeCheck::Differs {
                 packaged: expected,
                 deployed: edited
@@ -1592,19 +1623,21 @@ mod tests {
         fs::remove_dir_all(cases_root.join("files")).unwrap();
         assert_eq!(
             directory.check_fixture_tree(Some(expected)).unwrap(),
-            FixtureTreeCheck::Differs {
-                packaged: expected,
-                deployed: None
-            }
+            (
+                FixtureTreeCheck::Differs {
+                    packaged: expected,
+                    deployed: None
+                },
+                None
+            )
         );
         assert_eq!(
-            directory.check_fixture_tree(None).unwrap(),
+            directory.check_fixture_tree(None).unwrap().0,
             FixtureTreeCheck::NotPackaged { deployed: false }
         );
         fs::create_dir_all(cases_root.join("files/src")).unwrap();
 
         symlink("../../outside", cases_root.join("files/src/escape")).unwrap();
-        assert!(directory.fixture_tree_hash().is_err());
         assert!(directory.check_fixture_tree(Some(expected)).is_err());
         fs::remove_dir_all(parent).unwrap();
     }

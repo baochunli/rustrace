@@ -32,8 +32,9 @@ use rustrace::tui::{
     FindPanelField, FindPanelState, JournalHealth, KEYBIND_ROWS, MIN_TERMINAL_HEIGHT,
     MIN_TERMINAL_WIDTH, MainLayout, MainView, MainViewState, ModeBarKind, ModeBarState, MouseState,
     OBVIOUS_EDITOR_KEYBIND_ROWS, OutputRow, PaneResizeState, RecordingState, ShellInput,
-    ShellModal, ShellState, TerminalOperations, TerminalSession, TestCasePickerRow,
-    TestCasePickerState, ToastKind, ToastState, WorkspaceInput, command_menu_action,
+    ShellModal, ShellState, TerminalOperations, TerminalSession, TestCaseArguments, TestCaseDetail,
+    TestCaseFixtures, TestCaseInput, TestCasePickerRow, TestCasePickerState, TestCaseRunResult,
+    TestCaseSelection, ToastKind, ToastState, WorkspaceInput, command_menu_action,
     editor_context_menu_key_action, files_context_menu_key_action, main_layout,
     mouse_input_for_event, primary_modifier_text, primary_modifier_text_with_ghostty,
 };
@@ -2683,6 +2684,241 @@ fn test_case_picker_is_a_dimmed_scrolling_modal_at_80x24_and_larger() {
                 .contains(Modifier::DIM)
         );
     }
+}
+
+fn format3_picker(result: Option<TestCaseRunResult>, changed: bool) -> TestCasePickerState {
+    let rows = vec![
+        TestCasePickerRow::new(
+            "echo",
+            match &result {
+                None => "—".to_owned(),
+                Some(TestCaseRunResult::Pass) => "PASS".to_owned(),
+                Some(TestCaseRunResult::Fail { line, .. }) => format!("FAIL line {line}"),
+                Some(TestCaseRunResult::Error(_)) => "ERROR".to_owned(),
+            },
+        ),
+        TestCasePickerRow::new("quiet", "—"),
+        TestCasePickerRow::new("recursive", "—"),
+    ];
+    let files = [
+        "data.txt",
+        "tests/grep.md",
+        "tests/recursive/grep.md",
+        "tests/recursive/nested/deeper.md",
+        "tests/recursive/notes.txt",
+        "tests/unicode.md",
+        "tests/words.txt",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    TestCasePickerState::new(rows, 0, None).with_detail(TestCaseDetail {
+        selection: TestCaseSelection::Case {
+            arguments: TestCaseArguments::Listed(vec![
+                "-n".to_owned(),
+                "two words".to_owned(),
+                " padded ".to_owned(),
+                "rtl\u{202e}txt".to_owned(),
+                "zero\u{200b}width".to_owned(),
+                "no\u{a0}break".to_owned(),
+                "fn\\(x\\)".to_owned(),
+                "tests/grep.md".to_owned(),
+            ]),
+            input: TestCaseInput::Closed,
+            result,
+        },
+        fixtures: TestCaseFixtures::Files {
+            folder: "lab2.test-cases/files".to_owned(),
+            files,
+            changed,
+        },
+    })
+}
+
+/// The rows between the picker frame's side borders.
+fn picker_panel(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let start = line.find('│')?;
+            let end = line.rfind('│')?;
+            (start < end).then(|| line[start..end + '│'.len_utf8()].to_owned())
+        })
+        .collect()
+}
+
+#[test]
+fn format3_picker_shows_arguments_input_fixtures_and_result_at_80x24() {
+    let before = view_state(RecordingState::Active, JournalHealth::Healthy)
+        .with_test_case_picker(format3_picker(None, false));
+    let terminal = render(80, 24, &before);
+    assert_eq!(
+        picker_panel(&rendered_lines(&terminal)),
+        [
+            "│Test cases                                                                │",
+            "│                                                                          │",
+            "│echo                                                                     —│",
+            "│quiet                                                                    —│",
+            "│recursive                                                                —│",
+            "│Run all                                                                   │",
+            "│                                                                          │",
+            "│Arguments  «-n» «two words» « padded » «rtl\\u{202e}txt»                   │",
+            "│           «zero\\u{200b}width» «no\\u{a0}break» «fn\\(x\\)» «tests/grep.md»  │",
+            "│Input      no input (stdin closed)                                        │",
+            "│Runs in    lab2.test-cases/files (7 files)                                │",
+            "│Files      data.txt                                                       │",
+            "│           tests/grep.md                                                  │",
+            "│           tests/recursive/grep.md                                        │",
+            "│           tests/recursive/nested/deeper.md                               │",
+            "│           tests/recursive/notes.txt                                      │",
+            "│           tests/unicode.md                                               │",
+            "│           tests/words.txt                                                │",
+            "│Result     not run yet                                                    │",
+            "│ ↑↓ select · ↵/double-click run · r refresh · esc close                   │",
+        ]
+    );
+    // The invisible and bidirectional characters never reach the terminal.
+    assert!(!terminal.backend().buffer().content().iter().any(|cell| {
+        cell.symbol()
+            .chars()
+            .any(|character| matches!(character, '\u{202e}' | '\u{200b}' | '\u{a0}'))
+    }));
+
+    let after = view_state(RecordingState::Active, JournalHealth::Healthy).with_test_case_picker(
+        format3_picker(
+            Some(TestCaseRunResult::Fail {
+                line: 2,
+                expected_len: 13,
+                expected_preview: "tests/grep.md".to_owned(),
+                actual_len: 0,
+                actual_preview: String::new(),
+            }),
+            true,
+        ),
+    );
+    let terminal = render(80, 24, &after);
+    let lines = rendered_lines(&terminal);
+    assert_eq!(
+        picker_panel(&lines)[9..19],
+        [
+            "│Input      no input (stdin closed)                                        │",
+            "│Runs in    lab2.test-cases/files (7 files)                                │",
+            "│           changed from the package; a run with them will not verify      │",
+            "│Files      data.txt                                                       │",
+            "│           tests/grep.md                                                  │",
+            "│           tests/recursive/grep.md                                        │",
+            "│           … and 4 more                                                   │",
+            "│Result     FAIL at line 2                                                 │",
+            "│           expected (13 bytes) \"tests/grep.md\"                            │",
+            "│           got (0 bytes) \"\"                                               │",
+        ]
+    );
+    let buffer = terminal.backend().buffer();
+    let cell_at = |needle: &str| {
+        let y = lines.iter().position(|line| line.contains(needle)).unwrap();
+        let x = lines[y][..lines[y].find(needle).unwrap()].chars().count();
+        buffer.cell((x as u16, y as u16)).unwrap().clone()
+    };
+    assert_eq!(cell_at("changed from").fg, Palette::terminal().yellow);
+    assert_eq!(cell_at("FAIL at line").fg, Palette::terminal().red);
+    assert_eq!(cell_at("echo").bg, Palette::terminal().accent);
+}
+
+#[test]
+fn format3_picker_run_all_and_many_cases_keep_selection_and_detail_visible() {
+    let rows = (0..40)
+        .map(|index| TestCasePickerRow::new(format!("case-{index:02}"), "—"))
+        .collect::<Vec<_>>();
+    let detail = TestCaseDetail {
+        selection: TestCaseSelection::RunAll {
+            cases: 40,
+            passed: 30,
+            failed: 5,
+            errors: 1,
+        },
+        fixtures: TestCaseFixtures::Files {
+            folder: "lab2.test-cases/files".to_owned(),
+            files: (0..20)
+                .map(|index| format!("tests/{index:02}.md"))
+                .collect(),
+            changed: true,
+        },
+    };
+    let state = view_state(RecordingState::Active, JournalHealth::Healthy)
+        .with_test_case_picker(TestCasePickerState::new(rows, 40, None).with_detail(detail));
+    for (width, height) in [(80, 24), (120, 40)] {
+        let editor = editor();
+        let area = Rect::new(0, 0, width, height);
+        let mut buffer = Buffer::empty(area);
+        let hits = MainView::new(&state, &editor, &Viewport::default(), &[])
+            .with_palette(Palette::terminal())
+            .render_with_hit_map(area, &mut buffer);
+        let screen = buffer_lines(&buffer).join("\n");
+        assert!(screen.contains("Run all"), "{width}x{height}: {screen}");
+        assert!(
+            screen.contains("Runs in    lab2.test-cases/files (20 files)"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("changed from the package; runs with them will not verify"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Results    40 cases: 30 PASS, 5 FAIL, 1 ERROR, 4 not run yet"),
+            "{screen}"
+        );
+        assert!(screen.contains("… and "), "{screen}");
+        assert!(hits.test_case_rows.iter().any(|(_, index)| *index == 40));
+        assert!(!hits.test_case_scrollbar_thumb.is_empty());
+        let selected = hits
+            .test_case_rows
+            .iter()
+            .find(|(_, index)| *index == 40)
+            .unwrap()
+            .0;
+        assert_eq!(
+            buffer.cell((selected.x, selected.y)).unwrap().bg,
+            Palette::terminal().accent
+        );
+    }
+}
+
+#[test]
+fn format2_picker_renders_without_a_detail() {
+    let state = view_state(RecordingState::Active, JournalHealth::Healthy).with_test_case_picker(
+        TestCasePickerState::new(
+            vec![
+                TestCasePickerRow::new("echo", "PASS"),
+                TestCasePickerRow::new("quiet", "—"),
+            ],
+            0,
+            None,
+        ),
+    );
+    assert_eq!(
+        picker_panel(&rendered_lines(&render(80, 24, &state))),
+        [
+            "│Test cases                                                        │",
+            "│                                                                  │",
+            "│echo                                                          PASS│",
+            "│quiet                                                            —│",
+            "│Run all                                                           │",
+            "│                                                                  │",
+            "│                                                                  │",
+            "│                                                                  │",
+            "│                                                                  │",
+            "│                                                                  │",
+            "│                                                                  │",
+            "│                                                                  │",
+            "│                                                                  │",
+            "│                                                                  │",
+            "│                                                                  │",
+            "│                                                                  │",
+            "│                                                                  │",
+            "│                                                                  │",
+            "│                                                                  │",
+            "│ ↑↓ select · ↵/double-click run · r refresh · esc close           │",
+        ]
+    );
 }
 
 #[test]

@@ -5,6 +5,7 @@ mod editor;
 mod mouse;
 pub mod shell;
 mod terminal;
+mod test_case_detail;
 pub mod theme;
 mod workspace;
 
@@ -49,6 +50,10 @@ pub use mouse::{
 #[cfg(test)]
 pub(crate) use terminal::osc52_clipboard_sequence;
 pub use terminal::{CrosstermTerminalOperations, TerminalOperations, TerminalSession};
+pub use test_case_detail::{
+    TestCaseArguments, TestCaseDetail, TestCaseFixtures, TestCaseInput, TestCaseRunResult,
+    TestCaseSelection,
+};
 pub(crate) use workspace::FormatterDocumentState;
 pub(crate) use workspace::workspace_input_for_event_with_keyboard_enhancement;
 pub use workspace::{
@@ -833,6 +838,7 @@ pub struct TestCasePickerState {
     rows: Vec<TestCasePickerRow>,
     selected: usize,
     notice: Option<String>,
+    detail: Option<TestCaseDetail>,
 }
 
 impl TestCasePickerState {
@@ -842,7 +848,15 @@ impl TestCasePickerState {
             rows,
             selected,
             notice,
+            detail: None,
         }
+    }
+
+    /// Shows what the selected row runs with under the list, as a format 3
+    /// picker does. Without a detail the picker renders as in formats 1 and 2.
+    pub fn with_detail(mut self, detail: TestCaseDetail) -> Self {
+        self.detail = Some(detail);
+        self
     }
 }
 
@@ -2426,8 +2440,14 @@ where
         hits: &mut HitMap,
     ) {
         self.dim(area, buffer);
-        let width = area.width.saturating_sub(4).min(68);
-        let height = area.height.saturating_sub(2).min(22);
+        // A format 3 detail gets a larger panel; formats 1 and 2 keep theirs.
+        let detail = picker
+            .detail
+            .as_ref()
+            .filter(|_| picker.notice.is_none() && !picker.rows.is_empty());
+        let (width, height) = if detail.is_some() { (96, 34) } else { (68, 22) };
+        let width = area.width.saturating_sub(4).min(width);
+        let height = area.height.saturating_sub(2).min(height);
         let panel = centered(area, width, height);
         hits.overlay = panel;
         self.render_overlay_frame(panel, "", buffer);
@@ -2482,6 +2502,27 @@ where
             body
         };
         let total = picker.rows.len() + 1;
+        // The list keeps about two fifths of the body, and at least three
+        // rows; the detail starts after one blank row.
+        let (list, detail_area) = match detail {
+            Some(detail) => {
+                let list_height = (total as u16)
+                    .min((list.height * 2 / 5).max(3))
+                    .min(list.height);
+                let detail_top = list.y + list_height + 1;
+                let detail_area = Rect::new(
+                    list.x,
+                    detail_top,
+                    list.width,
+                    list.bottom().saturating_sub(detail_top),
+                );
+                (
+                    Rect::new(list.x, list.y, list.width, list_height),
+                    Some((detail, detail_area)),
+                )
+            }
+            None => (list, None),
+        };
         let visible = usize::from(list.height).max(1);
         let start = picker
             .selected
@@ -2552,6 +2593,9 @@ where
                 );
             }
         }
+        if let Some((detail, detail_area)) = detail_area {
+            self.render_test_case_detail(detail_area, detail, buffer);
+        }
         put_text(
             buffer,
             inner.x,
@@ -2563,6 +2607,41 @@ where
                 .bg(self.palette.panel_bg)
                 .add_modifier(Modifier::DIM),
         );
+    }
+
+    fn render_test_case_detail(&self, area: Rect, detail: &TestCaseDetail, buffer: &mut Buffer) {
+        let label_style = Style::default()
+            .fg(self.palette.overlay1)
+            .bg(self.palette.panel_bg);
+        let label_width = test_case_detail::LABEL_WIDTH.min(area.width);
+        let rows = test_case_detail::detail_rows(
+            detail,
+            usize::from(area.width),
+            usize::from(area.height),
+        );
+        for (row, y) in rows.iter().zip(area.y..area.bottom()) {
+            put_text(buffer, area.x, y, label_width, row.label, label_style);
+            let style = Style::default().bg(self.palette.panel_bg);
+            let style = match row.tone {
+                test_case_detail::DetailTone::Plain => style.fg(self.palette.text),
+                test_case_detail::DetailTone::Muted => style.fg(self.palette.overlay1),
+                test_case_detail::DetailTone::Warning => style.fg(self.palette.yellow),
+                test_case_detail::DetailTone::Pass => {
+                    style.fg(self.palette.green).add_modifier(Modifier::BOLD)
+                }
+                test_case_detail::DetailTone::Fail => {
+                    style.fg(self.palette.red).add_modifier(Modifier::BOLD)
+                }
+            };
+            put_text(
+                buffer,
+                area.x + label_width,
+                y,
+                area.width.saturating_sub(label_width),
+                &row.text,
+                style,
+            );
+        }
     }
 
     fn render_file_prompt(

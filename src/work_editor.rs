@@ -46,6 +46,93 @@ struct TestCasePicker {
     visible_output_case: Option<crate::session::TestCase>,
     notice: Option<String>,
     origin: Option<(WorkView, WorkspaceFocus)>,
+    /// Format 3 only: what each listed case runs with.
+    details: Option<TestCasePickerDetails>,
+}
+
+/// What a format 3 picker shows under its list, read from the case folder
+/// when the list is refreshed.
+#[derive(Clone, Debug)]
+struct TestCasePickerDetails {
+    cases: BTreeMap<String, (TestCaseArguments, TestCaseInput)>,
+    fixtures: TestCaseFixtures,
+}
+
+impl TestCasePickerDetails {
+    /// Checks each case's `NAME.args` and `NAME.in` as a Run would, not as
+    /// the listing saw them: the listing skips a symlink, a hard-linked file,
+    /// a FIFO or a directory, which a Run refuses.
+    fn read(
+        directory: &TestCaseDirectory,
+        cases: &[crate::session::TestCase],
+        workspace_root: &std::path::Path,
+        packaged_fixtures: Option<rustrace_model::Hash>,
+    ) -> Self {
+        let reason =
+            |error: Box<dyn Error>| crate::display::label_fmt(format_args!("{error}"), 256);
+        let cases = cases
+            .iter()
+            .map(|case| {
+                let arguments = match directory.case_args(case) {
+                    Ok(arguments) => TestCaseArguments::Listed(arguments),
+                    Err(error) => TestCaseArguments::Invalid(reason(error)),
+                };
+                let input = match directory.input_len(case) {
+                    Ok(None) => TestCaseInput::Closed,
+                    Ok(Some(bytes)) => TestCaseInput::File {
+                        name: case.input_path().to_string(),
+                        bytes,
+                    },
+                    Err(error) => TestCaseInput::Invalid(reason(error)),
+                };
+                (case.name().to_owned(), (arguments, input))
+            })
+            .collect();
+        Self {
+            cases,
+            fixtures: Self::read_fixtures(directory, workspace_root, packaged_fixtures),
+        }
+    }
+
+    /// Where the session's runs start and, for a fixture folder, its files
+    /// as they are now. The folder is read only when the package has one,
+    /// after the `.cargo` checks that refuse a Run from it.
+    fn read_fixtures(
+        directory: &TestCaseDirectory,
+        workspace_root: &std::path::Path,
+        packaged_fixtures: Option<rustrace_model::Hash>,
+    ) -> TestCaseFixtures {
+        if packaged_fixtures.is_none() {
+            let workspace = workspace_root
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            return TestCaseFixtures::Workspace {
+                workspace: crate::display::label(&workspace, 256),
+            };
+        }
+        let folder = directory.fixtures_display();
+        if let Err(error) = crate::session::reject_workspace_cargo_configuration(workspace_root)
+            .and_then(|()| directory.reject_cargo_configuration())
+        {
+            return TestCaseFixtures::Refused {
+                folder,
+                reason: crate::display::label_fmt(format_args!("{error}"), 256),
+            };
+        }
+        match directory.check_fixture_tree(packaged_fixtures) {
+            Ok((check, Some(tree))) => TestCaseFixtures::Files {
+                folder,
+                files: tree.files().map(|(path, _)| path.to_string()).collect(),
+                changed: !matches!(check, crate::console::FixtureTreeCheck::Matches { .. }),
+            },
+            Ok((_, None)) => TestCaseFixtures::Missing { folder },
+            Err(error) => TestCaseFixtures::Unreadable {
+                folder,
+                reason: crate::display::label_fmt(format_args!("{error}"), 256),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,22 +144,40 @@ enum TestCasePickerKeyAction {
 }
 
 impl TestCasePicker {
+    /// Lists the session's cases again and, for format 3, reads what each
+    /// runs with.
+    fn refresh_for(&mut self, session: &crate::session::ProductionSession) {
+        let _ = self.refresh(
+            session.workspace().root(),
+            session.test_case_layout(),
+            session.metadata().test_case_suite_hash,
+            session.packaged_fixtures_hash(),
+        );
+    }
+
     fn refresh(
         &mut self,
         workspace_root: &std::path::Path,
         layout: crate::console::TestCaseLayout,
         suite: Option<rustrace_model::Hash>,
+        packaged_fixtures: Option<rustrace_model::Hash>,
     ) -> Result<(), Box<dyn Error>> {
         let packaged_suite_expected = suite.is_some();
         let selected = self
             .cases
             .get(self.selected)
             .map(|case| case.name().to_owned());
-        match TestCaseDirectory::open(workspace_root, layout, suite)
-            .and_then(|directory| directory.list_cases())
-        {
-            Ok(cases) => {
+        self.details = None;
+        match TestCaseDirectory::open(workspace_root, layout, suite).and_then(|directory| {
+            let cases = directory.list_cases_for(layout)?;
+            let details = (layout == crate::console::TestCaseLayout::Extended).then(|| {
+                TestCasePickerDetails::read(&directory, &cases, workspace_root, packaged_fixtures)
+            });
+            Ok((cases, details))
+        }) {
+            Ok((cases, details)) => {
                 self.replace_cases(cases);
+                self.details = details;
                 self.notice = None;
             }
             Err(error)
@@ -94,6 +199,26 @@ impl TestCasePicker {
             .unwrap_or(0)
             .min(self.cases.len());
         Ok(())
+    }
+
+    /// Reads a format 3 fixture folder again when the picker reopens after
+    /// a run, since a program can change the files it runs with. The case
+    /// list and any queue are left alone.
+    fn refresh_fixtures(&mut self, session: &crate::session::ProductionSession) {
+        let Some(details) = self.details.as_mut() else {
+            return;
+        };
+        if let Ok(directory) = TestCaseDirectory::open(
+            session.workspace().root(),
+            session.test_case_layout(),
+            session.metadata().test_case_suite_hash,
+        ) {
+            details.fixtures = TestCasePickerDetails::read_fixtures(
+                &directory,
+                session.workspace().root(),
+                session.packaged_fixtures_hash(),
+            );
+        }
     }
 
     fn replace_cases(&mut self, cases: Vec<crate::session::TestCase>) {
@@ -236,7 +361,65 @@ impl TestCasePicker {
     }
 
     fn view_state(&self) -> TestCasePickerState {
-        TestCasePickerState::new(self.rows(), self.selected, self.notice.clone())
+        let state = TestCasePickerState::new(self.rows(), self.selected, self.notice.clone());
+        match self.detail() {
+            Some(detail) => state.with_detail(detail),
+            None => state,
+        }
+    }
+
+    /// What the selected row runs with, for a format 3 picker.
+    fn detail(&self) -> Option<TestCaseDetail> {
+        let details = self.details.as_ref()?;
+        let selection = match self.cases.get(self.selected) {
+            Some(case) => {
+                let (arguments, input) = details.cases.get(case.name())?.clone();
+                let result = self
+                    .results
+                    .get(case.name())
+                    .map(|result| match &result.outcome {
+                        crate::session::TestCaseOutcome::Pass => TestCaseRunResult::Pass,
+                        crate::session::TestCaseOutcome::Fail(mismatch) => {
+                            TestCaseRunResult::Fail {
+                                line: mismatch.line,
+                                expected_len: mismatch.expected_len,
+                                expected_preview: mismatch.expected_preview.clone(),
+                                actual_len: mismatch.actual_len,
+                                actual_preview: mismatch.actual_preview.clone(),
+                            }
+                        }
+                        crate::session::TestCaseOutcome::Error(reason) => {
+                            TestCaseRunResult::Error(reason.clone())
+                        }
+                    });
+                TestCaseSelection::Case {
+                    arguments,
+                    input,
+                    result,
+                }
+            }
+            None => {
+                let (mut passed, mut failed, mut errors) = (0, 0, 0);
+                for case in &self.cases {
+                    match self.results.get(case.name()).map(|result| &result.outcome) {
+                        Some(crate::session::TestCaseOutcome::Pass) => passed += 1,
+                        Some(crate::session::TestCaseOutcome::Fail(_)) => failed += 1,
+                        Some(crate::session::TestCaseOutcome::Error(_)) => errors += 1,
+                        None => {}
+                    }
+                }
+                TestCaseSelection::RunAll {
+                    cases: self.cases.len(),
+                    passed,
+                    failed,
+                    errors,
+                }
+            }
+        };
+        Some(TestCaseDetail {
+            selection,
+            fixtures: details.fixtures.clone(),
+        })
     }
 }
 
@@ -841,6 +1024,9 @@ where
             }
             if let Some(next) = next {
                 start_test_case_sequence(session, &mut test_cases, &mut status, next);
+            }
+            if test_cases.is_open() {
+                test_cases.refresh_fixtures(session);
             }
             session.set_command_modal(test_cases.is_open());
             true
@@ -2045,13 +2231,7 @@ where
                         start_test_case_sequence(session, &mut test_cases, &mut status, case);
                     }
                 }
-                TestCasePickerKeyAction::Refresh => {
-                    let _ = test_cases.refresh(
-                        session.workspace().root(),
-                        session.test_case_layout(),
-                        session.metadata().test_case_suite_hash,
-                    );
-                }
+                TestCasePickerKeyAction::Refresh => test_cases.refresh_for(session),
             }
             continue;
         }
@@ -2087,11 +2267,7 @@ where
             && matches!(&event, Event::Key(key) if key.kind == KeyEventKind::Press && key.modifiers.is_empty() && key.code == KeyCode::F(4))
         {
             session.clear_completion();
-            let _ = test_cases.refresh(
-                session.workspace().root(),
-                session.test_case_layout(),
-                session.metadata().test_case_suite_hash,
-            );
+            test_cases.refresh_for(session);
             test_cases.open_from(view, focus);
             status.clear();
             continue;
@@ -2864,11 +3040,7 @@ fn activate_command_menu_entry(
         }
         CommandMenuAction::TestCases if !session.command_active() => {
             session.clear_completion();
-            let _ = test_cases.refresh(
-                session.workspace().root(),
-                session.test_case_layout(),
-                session.metadata().test_case_suite_hash,
-            );
+            test_cases.refresh_for(session);
             test_cases.open_from(*view, *focus);
             status.clear();
         }
@@ -4904,6 +5076,299 @@ format = ["cargo", "fmt"]
 
     #[cfg(unix)]
     #[test]
+    fn format3_picker_lists_cases_without_input_and_shows_what_each_runs_with() {
+        use crate::console::{CASE_FOLDER_MARKER, CaseFolderMarker, TestCaseLayout};
+        use crate::tui::{
+            TestCaseArguments, TestCaseDetail, TestCaseFixtures, TestCaseInput, TestCaseSelection,
+        };
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = std::env::temp_dir().join(format!(
+            "rustrace-picker-format3-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        let root = parent.join("assignment.work");
+        let cases = parent.join("assignment.test-cases");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(cases.join("files/tests")).unwrap();
+        let suite = rustrace_model::Hash::from_bytes([7; 32]);
+        fs::write(
+            cases.join(CASE_FOLDER_MARKER),
+            CaseFolderMarker::new("assignment.work", suite).encode(),
+        )
+        .unwrap();
+        fs::write(cases.join("echo.args"), b"-i\ntwo words\n").unwrap();
+        fs::write(cases.join("echo.in"), b"alpha\n").unwrap();
+        fs::write(cases.join("echo.expected"), b"alpha\n").unwrap();
+        fs::write(cases.join("quiet.args"), b"--quiet\n").unwrap();
+        fs::write(cases.join("quiet.expected"), b"").unwrap();
+        fs::write(cases.join("broken.args"), b"\n").unwrap();
+        fs::write(cases.join("broken.expected"), b"").unwrap();
+        fs::write(cases.join("files/data.txt"), b"fixture data\n").unwrap();
+        fs::write(cases.join("files/tests/grep.md"), b"# grep\n").unwrap();
+        let packaged = rustrace_workspace::fixture_tree::FixtureTree::from_parts(
+            [],
+            [
+                (
+                    WorkspacePath::new("data.txt").unwrap(),
+                    b"fixture data\n".to_vec(),
+                ),
+                (
+                    WorkspacePath::new("tests/grep.md").unwrap(),
+                    b"# grep\n".to_vec(),
+                ),
+            ],
+        )
+        .unwrap()
+        .hash();
+        let files = TestCaseFixtures::Files {
+            folder: "assignment.test-cases/files".to_owned(),
+            files: vec!["data.txt".to_owned(), "tests/grep.md".to_owned()],
+            changed: false,
+        };
+        let mut picker = TestCasePicker::default();
+        picker
+            .refresh(&root, TestCaseLayout::Extended, Some(suite), Some(packaged))
+            .unwrap();
+        assert_eq!(
+            picker
+                .cases
+                .iter()
+                .map(|case| case.name())
+                .collect::<Vec<_>>(),
+            ["broken", "echo", "quiet"]
+        );
+
+        let detail = |picker: &mut TestCasePicker, index| {
+            picker.select(index);
+            picker.detail().unwrap()
+        };
+        assert_eq!(
+            detail(&mut picker, 1),
+            TestCaseDetail {
+                selection: TestCaseSelection::Case {
+                    arguments: TestCaseArguments::Listed(vec!["-i".into(), "two words".into()]),
+                    input: TestCaseInput::File {
+                        name: "echo.in".into(),
+                        bytes: 6,
+                    },
+                    result: None,
+                },
+                fixtures: files.clone(),
+            }
+        );
+        assert_eq!(
+            detail(&mut picker, 2).selection,
+            TestCaseSelection::Case {
+                arguments: TestCaseArguments::Listed(vec!["--quiet".into()]),
+                input: TestCaseInput::Closed,
+                result: None,
+            }
+        );
+        assert_eq!(
+            detail(&mut picker, 0).selection,
+            TestCaseSelection::Case {
+                arguments: TestCaseArguments::Invalid("test-case arguments line 1 is empty".into()),
+                input: TestCaseInput::Closed,
+                result: None,
+            }
+        );
+        picker.record_completed(crate::session::TestCaseComparison {
+            case: picker.cases[1].clone(),
+            outcome: crate::session::TestCaseOutcome::Pass,
+            expected_blake3: None,
+            actual_blake3: None,
+        });
+        assert_eq!(
+            detail(&mut picker, 3).selection,
+            TestCaseSelection::RunAll {
+                cases: 3,
+                passed: 1,
+                failed: 0,
+                errors: 0,
+            }
+        );
+        assert_eq!(
+            picker.view_state(),
+            crate::tui::TestCasePickerState::new(picker.rows(), 3, None)
+                .with_detail(picker.detail().unwrap())
+        );
+
+        // The selection survives a refresh, and a changed fixture shows.
+        fs::write(cases.join("files/data.txt"), b"student edit\n").unwrap();
+        picker.select(1);
+        picker
+            .refresh(&root, TestCaseLayout::Extended, Some(suite), Some(packaged))
+            .unwrap();
+        assert_eq!(picker.selected, 1);
+        assert_eq!(
+            picker.detail().unwrap().fixtures,
+            TestCaseFixtures::Files {
+                folder: "assignment.test-cases/files".to_owned(),
+                files: vec!["data.txt".to_owned(), "tests/grep.md".to_owned()],
+                changed: true,
+            }
+        );
+        fs::remove_dir_all(cases.join("files")).unwrap();
+        picker
+            .refresh(&root, TestCaseLayout::Extended, Some(suite), Some(packaged))
+            .unwrap();
+        assert_eq!(
+            picker.detail().unwrap().fixtures,
+            TestCaseFixtures::Missing {
+                folder: "assignment.test-cases/files".to_owned()
+            }
+        );
+        picker
+            .refresh(&root, TestCaseLayout::Extended, Some(suite), None)
+            .unwrap();
+        assert_eq!(
+            picker.detail().unwrap().fixtures,
+            TestCaseFixtures::Workspace {
+                workspace: "assignment.work".to_owned()
+            }
+        );
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn format3_picker_says_a_case_cannot_start_when_a_run_would_refuse_its_files() {
+        use crate::console::{CASE_FOLDER_MARKER, CaseFolderMarker, TestCaseLayout};
+        use crate::tui::{TestCaseArguments, TestCaseFixtures, TestCaseInput, TestCaseSelection};
+        use std::os::unix::ffi::OsStrExt;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = std::env::temp_dir().join(format!(
+            "rustrace-picker-refused-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        let root = parent.join("assignment.work");
+        let cases = parent.join("assignment.test-cases");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(cases.join("files")).unwrap();
+        let suite = rustrace_model::Hash::from_bytes([7; 32]);
+        fs::write(
+            cases.join(CASE_FOLDER_MARKER),
+            CaseFolderMarker::new("assignment.work", suite).encode(),
+        )
+        .unwrap();
+        for name in ["big", "directory", "fifo", "hard", "link"] {
+            fs::write(cases.join(format!("{name}.expected")), b"").unwrap();
+        }
+        fs::write(parent.join("outside.txt"), b"outside\n").unwrap();
+        std::os::unix::fs::symlink("../outside.txt", cases.join("link.in")).unwrap();
+        fs::write(parent.join("shared.args"), b"-x\n").unwrap();
+        fs::hard_link(parent.join("shared.args"), cases.join("hard.args")).unwrap();
+        fs::create_dir(cases.join("directory.args")).unwrap();
+        let fifo = std::ffi::CString::new(cases.join("fifo.in").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        fs::File::create(cases.join("big.in"))
+            .unwrap()
+            .set_len(1024 * 1024 + 1)
+            .unwrap();
+        let packaged = rustrace_workspace::fixture_tree::FixtureTree::from_parts([], [])
+            .unwrap()
+            .hash();
+
+        let mut picker = TestCasePicker::default();
+        picker
+            .refresh(&root, TestCaseLayout::Extended, Some(suite), Some(packaged))
+            .unwrap();
+        let selections = (0..picker.cases.len())
+            .map(|index| {
+                picker.select(index);
+                let TestCaseSelection::Case {
+                    arguments, input, ..
+                } = picker.detail().unwrap().selection
+                else {
+                    panic!("a case row has a case detail");
+                };
+                (picker.cases[index].name().to_owned(), arguments, input)
+            })
+            .collect::<Vec<_>>();
+        let invalid = |reason: &str| reason.to_owned();
+        assert_eq!(
+            selections,
+            [
+                (
+                    "big".to_owned(),
+                    TestCaseArguments::Listed(Vec::new()),
+                    TestCaseInput::Invalid(invalid("test input exceeds the 1048576-byte limit")),
+                ),
+                (
+                    "directory".to_owned(),
+                    TestCaseArguments::Invalid(invalid(
+                        "workspace path `directory.args` is a directory, not a regular file"
+                    )),
+                    TestCaseInput::Closed,
+                ),
+                (
+                    "fifo".to_owned(),
+                    TestCaseArguments::Listed(Vec::new()),
+                    TestCaseInput::Invalid(invalid(
+                        "workspace path `fifo.in` is a FIFO, not a regular file"
+                    )),
+                ),
+                (
+                    "hard".to_owned(),
+                    TestCaseArguments::Invalid(invalid(
+                        "workspace path `hard.args` has multiple hard links and is not safe for external routing"
+                    )),
+                    TestCaseInput::Closed,
+                ),
+                (
+                    "link".to_owned(),
+                    TestCaseArguments::Listed(Vec::new()),
+                    TestCaseInput::Invalid(invalid(
+                        "workspace path `link.in` is a symlink, not a regular file"
+                    )),
+                ),
+            ]
+        );
+        assert_eq!(
+            picker.detail().unwrap().fixtures,
+            TestCaseFixtures::Files {
+                folder: "assignment.test-cases/files".to_owned(),
+                files: Vec::new(),
+                changed: false,
+            }
+        );
+
+        // A `.cargo` in the case folder, `files/` or the workspace refuses
+        // every Run from the fixture folder, and the picker says so first.
+        for (at, reason) in [
+            (
+                cases.join(".cargo"),
+                "remove `.cargo` from the test-case folder: Cargo would read it as configuration",
+            ),
+            (
+                cases.join("files/.cargo"),
+                "remove `files/.cargo` from the test-case folder: Cargo would read it as configuration",
+            ),
+            (
+                root.join(".cargo"),
+                "remove `.cargo` from the workspace: Cargo would read it for commands run in the workspace but not for a Run from the test-case fixture folder",
+            ),
+        ] {
+            fs::create_dir(&at).unwrap();
+            picker
+                .refresh(&root, TestCaseLayout::Extended, Some(suite), Some(packaged))
+                .unwrap();
+            assert_eq!(
+                picker.detail().unwrap().fixtures,
+                TestCaseFixtures::Refused {
+                    folder: "assignment.test-cases/files".to_owned(),
+                    reason: reason.to_owned(),
+                }
+            );
+            fs::remove_dir(&at).unwrap();
+        }
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn absent_v1_sibling_directory_reaches_the_live_picker_test_backend() {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let parent = std::env::temp_dir().join(format!(
@@ -4916,7 +5381,7 @@ format = ["cargo", "fmt"]
         let mut picker = TestCasePicker::default();
 
         picker
-            .refresh(&root, crate::console::TestCaseLayout::Paired, None)
+            .refresh(&root, crate::console::TestCaseLayout::Paired, None, None)
             .unwrap();
         picker.open();
 
@@ -5186,7 +5651,7 @@ format = ["cargo", "fmt"]
         let mut session = ProductionSession::start(&root, manifest).unwrap();
         let mut picker = TestCasePicker::default();
         picker
-            .refresh(&root, crate::console::TestCaseLayout::Paired, None)
+            .refresh(&root, crate::console::TestCaseLayout::Paired, None, None)
             .unwrap();
         let case = picker.begin_selected().unwrap();
         fs::remove_file(parent.join("test-cases/sample.in")).unwrap();
@@ -5250,7 +5715,7 @@ format = ["cargo", "fmt"]
         let mut session = ProductionSession::start(&root, manifest).unwrap();
         let mut picker = TestCasePicker::default();
         picker
-            .refresh(&root, crate::console::TestCaseLayout::Paired, None)
+            .refresh(&root, crate::console::TestCaseLayout::Paired, None, None)
             .unwrap();
         let case = picker.begin_selected().unwrap();
         let mut status: StatusMessage =
