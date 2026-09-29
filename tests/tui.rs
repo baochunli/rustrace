@@ -2802,11 +2802,11 @@ fn format3_picker_shows_arguments_input_fixtures_and_result_at_80x24() {
         [
             "│Input      no input (stdin closed)                                        │",
             "│Runs in    lab2.test-cases/files (7 files)                                │",
-            "│           changed from the package; a run with them will not verify      │",
+            "│           changed from the package; a run is reported to your instructor │",
+            "│           and won't match the package's case                             │",
             "│Files      data.txt                                                       │",
             "│           tests/grep.md                                                  │",
-            "│           tests/recursive/grep.md                                        │",
-            "│           … and 4 more                                                   │",
+            "│           … and 5 more                                                   │",
             "│Result     FAIL at line 2                                                 │",
             "│           expected (13 bytes) \"tests/grep.md\"                            │",
             "│           got (0 bytes) \"\"                                               │",
@@ -2859,7 +2859,7 @@ fn format3_picker_run_all_and_many_cases_keep_selection_and_detail_visible() {
             "{screen}"
         );
         assert!(
-            screen.contains("changed from the package; runs with them will not verify"),
+            screen.contains("changed from the package; runs are reported to your instructor"),
             "{screen}"
         );
         assert!(

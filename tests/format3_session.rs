@@ -402,7 +402,7 @@ fn format3_runner_child() {
     assert_eq!(
         warning.as_deref(),
         Some(
-            "warning: the files in lab.test-cases/files differ from the assignment package; the case runs with them as they are and will not verify against the package. To restore them, remove the files you changed or added, then quit and resume the workspace"
+            "warning: the files in lab.test-cases/files differ from the assignment package; the case runs with them as they are; the run won't match the package's case, and it is reported to your instructor. To restore them, remove the files you changed or added, then quit and resume the workspace"
         )
     );
     assert_eq!(

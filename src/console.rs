@@ -311,7 +311,8 @@ impl PinnedFixtures {
 
     /// The student-facing warning for a deployed tree that differs from the
     /// package, or `None` when it matches. A packaged case run then records
-    /// the deployed hash and no longer verifies against the package.
+    /// the deployed hash, no longer matches the package's case, and is
+    /// reported to the instructor as `TEST_FILES_MODIFIED`.
     pub fn warning(&self, test_case: bool) -> Option<String> {
         matches!(self.check, FixtureTreeCheck::Differs { .. })
             .then(|| fixtures_changed_warning(&self.display, test_case))
@@ -325,7 +326,7 @@ const FIXTURES_CHANGED_DIFFER: &str = " differ from the assignment package; ";
 /// keeps "warning" and none of the words that make a toast an error.
 pub(crate) fn fixtures_changed_warning(folder: &str, test_case: bool) -> String {
     let consequence = if test_case {
-        "the case runs with them as they are and will not verify against the package"
+        "the case runs with them as they are; the run won't match the package's case, and it is reported to your instructor"
     } else {
         "your program runs with them as they are"
     };
@@ -1693,7 +1694,7 @@ mod tests {
         let warning = changed.warning(true).unwrap();
         assert_eq!(
             warning,
-            "warning: the files in assignment.test-cases/files differ from the assignment package; the case runs with them as they are and will not verify against the package. To restore them, remove the files you changed or added, then quit and resume the workspace"
+            "warning: the files in assignment.test-cases/files differ from the assignment package; the case runs with them as they are; the run won't match the package's case, and it is reported to your instructor. To restore them, remove the files you changed or added, then quit and resume the workspace"
         );
         assert!(
             changed

@@ -8,7 +8,8 @@
 //! Arguments  «-n» «fn main» «tests/grep.md»
 //! Input      no input (stdin closed)
 //! Runs in    lab2.test-cases/files (3 files)
-//!            changed from the package; a run with them will not verify
+//!            changed from the package; a run is reported to your instructor
+//!            and won't match the package's case
 //! Files      tests/grep.md
 //!            … and 2 more
 //! Result     FAIL at line 2
@@ -453,16 +454,24 @@ fn fixture_sections(fixtures: &TestCaseFixtures, width: usize, run_all: bool) ->
                 DetailTone::Plain,
             )];
             if *changed {
+                // The first row carries what matters most when rows are short.
                 let consequence = if run_all {
-                    "changed from the package; runs with them will not verify"
+                    [
+                        "changed from the package; runs are reported to your instructor",
+                        "and won't match the package's cases",
+                    ]
                 } else {
-                    "changed from the package; a run with them will not verify"
+                    [
+                        "changed from the package; a run is reported to your instructor",
+                        "and won't match the package's case",
+                    ]
                 };
-                sections.push(Section::fixed(
+                sections.push(Section::lines(
                     3,
                     "",
-                    consequence.to_owned(),
-                    DetailTone::Warning,
+                    consequence
+                        .map(|line| (line.to_owned(), DetailTone::Warning))
+                        .into(),
                 ));
             }
             sections.push(files_section(files.clone(), width));
@@ -810,7 +819,7 @@ mod tests {
                 "           «argument-8» «argument-9» «argument-10» … 40 arguments",
                 "Input      no input (stdin closed)",
                 "Runs in    lab.test-cases/files (30 files)",
-                "           changed from the package; a run with them will not verify",
+                "           changed from the package; a run is reported to your instructor",
                 "Files      tests/00.md … and 29 more",
                 "Result     FAIL at line 5",
                 "           expected (3 bytes) \"abc\"",
@@ -824,7 +833,7 @@ mod tests {
             vec![
                 "Arguments  «argument-0» «argument-1» «argument-2» … 40 arguments",
                 "Runs in    lab.test-cases/files (30 files)",
-                "           changed from the package; a run with them will not verify",
+                "           changed from the package; a run is reported to your instructor",
                 "Result     FAIL at line 5",
             ]
         );
@@ -839,8 +848,13 @@ mod tests {
         };
         let rows = texts(&detail_rows(&few_arguments, 74, 10));
         assert_eq!(rows.len(), 10, "{rows:#?}");
-        assert_eq!(rows[4], "Files      tests/00.md");
-        assert_eq!(rows[8], "           … and 26 more");
+        assert_eq!(
+            rows[3],
+            "           changed from the package; a run is reported to your instructor"
+        );
+        assert_eq!(rows[4], "           and won't match the package's case");
+        assert_eq!(rows[5], "Files      tests/00.md");
+        assert_eq!(rows[8], "           … and 27 more");
         assert_eq!(rows[9], "Result     not run yet");
     }
 
