@@ -209,16 +209,46 @@ pub fn run_status(args: &[String], output: &mut impl Write) -> Result<()> {
     };
     let revision = read_revision_link(&root, metadata.parent_evidence.as_ref())?;
     match ProductionSession::inspect_finalization_read_only(&root)? {
-        ReadOnlyFinalizationStatus::Unfinished => {
+        ReadOnlyFinalizationStatus::Unfinished {
+            last_submit_failure,
+        } => {
             writeln!(
                 output,
                 "UNFINISHED session {} at {safe_root}",
                 metadata.session_id
             )?;
+            if let Some(reason) = last_submit_failure {
+                writeln!(
+                    output,
+                    "Unfinished (last submit failed: {})",
+                    display::label(&reason, 4096)
+                )?;
+                writeln!(
+                    output,
+                    "That submit stopped before capturing anything, so no work is lost. Running `rustrace submit` again retries it, and says what to do if it stops again."
+                )?;
+            }
             writeln!(
                 output,
                 "This attempt remains mutable; its journal, checkpoints, evidence, and captures are preserved."
             )?;
+            match super::inspect_unfinished_usage(&root, &metadata) {
+                Ok(Some(usage)) => {
+                    let earlier = super::inspect_earlier_attempts(&root, &metadata);
+                    for line in usage.status_lines(super::UsageLimits::PACKAGE, earlier) {
+                        writeln!(output, "{line}")?;
+                    }
+                }
+                Ok(None) => writeln!(
+                    output,
+                    "Recorded checkpoints, events, and launches: unknown while a Rustrace session is open on this workspace"
+                )?,
+                Err(error) => writeln!(
+                    output,
+                    "Recorded checkpoints, events, and launches: unavailable ({})",
+                    display::label_fmt(format_args!("{error}"), 1024)
+                )?,
+            }
             write_revision_status(output, &metadata.session_id, revision.as_ref(), None)?;
         }
         ReadOnlyFinalizationStatus::Prepared { session_id } => {

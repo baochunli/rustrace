@@ -3258,3 +3258,66 @@ fn decode_hex(value: &str) -> Vec<u8> {
         })
         .collect()
 }
+
+#[test]
+fn aggregate_count_limits_fit_together_in_one_canonical_manifest() {
+    // One segment at its own checkpoint limit and a linked child whose
+    // checkpoints fill the aggregate archive-entry limit, both carrying the
+    // widest source-link kind up to the aggregate source-link limit, must still
+    // fit the JSON value, JSON array, and manifest byte limits. Each checkpoint
+    // costs 16 JSON values (reference and inventory entry) and each internal
+    // paste link 17, so this is the densest manifest the count limits allow.
+    let mut manifest = linear_manifest(2);
+    set_checkpoint_lengths(
+        &mut manifest,
+        0,
+        &vec![1; MAX_RPROV_CHECKPOINTS_PER_SEGMENT],
+    );
+    let other_entries = manifest.inventory.len() - manifest.segments[1].checkpoints.len();
+    let child_checkpoints = MAX_RPROV_ARCHIVE_ENTRIES - 1 - other_entries;
+    assert!(child_checkpoints <= MAX_RPROV_CHECKPOINTS_PER_SEGMENT);
+    set_checkpoint_lengths(&mut manifest, 1, &vec![1; child_checkpoints]);
+    assert_eq!(manifest.inventory.len() + 1, MAX_RPROV_ARCHIVE_ENTRIES);
+
+    let links_per_segment = MAX_RPROV_SOURCE_LINKS / 2;
+    assert!(links_per_segment <= MAX_RPROV_SOURCE_LINKS_PER_SEGMENT);
+    for index in 0..2 {
+        let segment = &mut manifest.segments[index];
+        let pasted = links_per_segment as u64 * 2 + 1;
+        segment.inclusive_event_count = segment.inclusive_event_count.max(pasted);
+        segment.source_links = (0..links_per_segment as u64)
+            .map(|offset| RprovSourceLink::InternalPaste {
+                paste_event: RecordedEventRef {
+                    session_id: segment.session_id.clone(),
+                    sequence: offset * 2 + 3,
+                    event_hash: indexed_hash(1_000_000 + index as u64 * 10_000 + offset),
+                },
+                copied_event: RecordedEventRef {
+                    session_id: segment.session_id.clone(),
+                    sequence: offset * 2 + 2,
+                    event_hash: indexed_hash(2_000_000 + index as u64 * 10_000 + offset),
+                },
+                document_id: DocumentId::new("source-doc").unwrap(),
+                path: WorkspacePath::new("src/main.rs").unwrap(),
+                version: offset + 1,
+                content_hash: indexed_hash(3_000_000 + offset),
+                start_byte: offset,
+                end_byte: offset + 64,
+            })
+            .collect();
+    }
+    manifest.aggregate_event_count = manifest
+        .segments
+        .iter()
+        .map(|segment| segment.inclusive_event_count)
+        .sum();
+
+    manifest.validate().unwrap();
+    let encoded = encode_rprov_manifest(&manifest).unwrap();
+    assert!(
+        encoded.len() < MAX_RPROV_MANIFEST_BYTES / 2,
+        "{} manifest bytes leave too little margin under {MAX_RPROV_MANIFEST_BYTES}",
+        encoded.len()
+    );
+    assert_eq!(decode_rprov_manifest(&encoded).unwrap(), manifest);
+}

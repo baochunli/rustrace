@@ -238,3 +238,52 @@ fn reopen_preflights_sidecar_links_before_sqlite_can_touch_them() {
     );
     assert_eq!(fs::read(sentinel).unwrap(), b"untouched");
 }
+
+#[test]
+fn a_brief_inspection_lock_is_waited_out_but_real_contention_is_named() {
+    let root = Root::new();
+    let pinned = PinnedWorkspaceRoot::open(root.path()).unwrap();
+    let id = SessionId::new("brief").unwrap();
+    let mut owner = pinned
+        .open_state_directory()
+        .unwrap()
+        .create_journal_file(&id)
+        .unwrap();
+
+    // An immediate open reports the holder as contention, not another error.
+    let Err(busy) = pinned
+        .open_state_directory()
+        .unwrap()
+        .open_journal_file_if_idle(&id)
+    else {
+        panic!("the writer lock is held");
+    };
+    assert!(busy.is_writer_contention(), "{busy}");
+    assert!(
+        busy.to_string()
+            .contains("held by another open Rustrace session")
+    );
+
+    // A waiting open succeeds once a brief holder, such as `rustrace status`,
+    // releases the lock.
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        owner.release_ownership().unwrap();
+    });
+    let mut next = pinned
+        .open_state_directory()
+        .unwrap()
+        .open_journal_file(&id)
+        .expect("a lock released within the retry window is acquired");
+    releaser.join().unwrap();
+    next.release_ownership().unwrap();
+
+    let Err(other) = pinned
+        .open_state_directory()
+        .unwrap()
+        .open_journal_file(&SessionId::new("absent").unwrap())
+    else {
+        panic!("no such journal");
+    };
+    assert!(!other.is_writer_contention(), "{other}");
+}

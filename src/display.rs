@@ -49,6 +49,19 @@ pub struct DisplayText {
     pub truncated: bool,
 }
 
+/// A count with comma thousands separators, as in "8,192".
+pub fn grouped(value: u64) -> String {
+    let digits = value.to_string();
+    let mut result = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            result.push(',');
+        }
+        result.push(digit);
+    }
+    result
+}
+
 /// Plain single-line labels: no ANSI interpretation, including safe SGR.
 pub fn label(value: &str, max_bytes: usize) -> String {
     parse(

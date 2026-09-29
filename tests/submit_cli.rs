@@ -430,3 +430,95 @@ fn submit_cli_refuses_allow_incomplete_for_raw_only_capture() {
     assert!(text.contains("no bundle was created"), "{text}");
     assert!(!text.contains("INCOMPLETE RECOVERY EXPORT"), "{text}");
 }
+
+// Assignment text whose toolchain name discovery rejects without host tools,
+// so each launch records its observation quickly and deterministically.
+const OFFLINE_TOOLCHAIN_MANIFEST: &[u8] = br#"format_version = 1
+course_id = "course"
+assignment_id = "assignment"
+assignment_version = "v1"
+title = "Bundle CLI"
+toolchain = "invalid name"
+edition = "2024"
+allowed_paths = ["**"]
+[commands]
+check = ["cargo", "check"]
+test = ["cargo", "test"]
+run = ["cargo", "run"]
+clippy = ["cargo", "clippy"]
+format = ["cargo", "fmt"]
+"#;
+
+#[test]
+fn submit_cli_exports_bounded_runtime_metadata_after_more_launches_than_its_limit() {
+    let test_home = test_home::TestHome::new(false);
+    let fixture = Fixture::new("submit-cli-launches");
+    ProductionSession::start(&fixture.workspace, OFFLINE_TOOLCHAIN_MANIFEST)
+        .unwrap()
+        .quit()
+        .unwrap();
+    let launches = rustrace_model::MAX_RPROV_METADATA_PER_SEGMENT + 6;
+    let mut sequences = Vec::new();
+    for _ in 0..launches {
+        let mut session = ProductionSession::resume(
+            &fixture.workspace,
+            OFFLINE_TOOLCHAIN_MANIFEST,
+            rustrace::session::ResumeChoice::Resume,
+        )
+        .unwrap();
+        sequences.push(session.health().unwrap().events);
+        session.discover_toolchain().unwrap();
+        session.quit().unwrap();
+    }
+
+    let privacy = test_home
+        .command(env!("CARGO_BIN_EXE_rustrace"))
+        .arg("privacy")
+        .arg(&fixture.workspace)
+        .output()
+        .unwrap();
+    let privacy_text = String::from_utf8(privacy.stdout).unwrap();
+    assert!(privacy.status.success(), "{privacy_text}");
+    assert!(
+        privacy_text.contains("Runtime metadata: 2 entries"),
+        "{privacy_text}"
+    );
+
+    let destination = fixture.base.join("launches.zip");
+    let output = test_home
+        .command(env!("CARGO_BIN_EXE_rustrace"))
+        .arg("submit")
+        .arg(&fixture.workspace)
+        .args(["--student-id", "student-1", "--output"])
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let imported = import_rprov(Cursor::new(fs::read(&destination).unwrap())).unwrap();
+    let mut owners = imported.manifest().segments[0]
+        .metadata
+        .iter()
+        .map(|metadata| metadata.owner.sequence)
+        .collect::<Vec<_>>();
+    owners.sort_unstable();
+    // Every launch recorded the same tools, so the first and the last remain.
+    assert_eq!(owners, [sequences[0], *sequences.last().unwrap()]);
+    let report = verify_path(&destination, None);
+    assert!(report.is_clean(), "{report:?}");
+    let verified = test_home
+        .command(env!("CARGO_BIN_EXE_rustrace"))
+        .arg("verify")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stdout)
+    );
+}

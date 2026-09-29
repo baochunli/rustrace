@@ -759,3 +759,42 @@ fn concurrent_checkpoint_appends_cannot_fork_the_chain() {
 fn _assert_stored_checkpoint_is_public(_: StoredCheckpoint) {}
 
 fn _assert_owner_wire_type(_: WorkspaceCheckpoint, _: DocumentHash) {}
+
+#[test]
+fn checkpoint_totals_count_stored_canonical_bytes_without_decoding() {
+    let id = session_id("totals");
+    let (_temp, mut journal) = create_journal("totals", &id);
+    assert_eq!(
+        journal.checkpoint_totals(&id).unwrap(),
+        rustrace_journal::CheckpointTotals {
+            count: 0,
+            encoded_bytes: 0
+        }
+    );
+    let initial = snapshot(&id, 1, "initial");
+    let initial_event = journal.append_checkpoint(&id, 10, None, &initial).unwrap();
+    journal
+        .append_event(
+            &id,
+            &focused_event(&id, 2, initial_event.event_hash, "doc-lib"),
+        )
+        .unwrap();
+    let later = snapshot(&id, 3, "later");
+    journal.append_checkpoint(&id, 30, None, &later).unwrap();
+
+    let expected = [&initial, &later]
+        .into_iter()
+        .map(|snapshot| encode_checkpoint(snapshot).unwrap().len() as u64)
+        .sum();
+    assert_eq!(
+        journal.checkpoint_totals(&id).unwrap(),
+        rustrace_journal::CheckpointTotals {
+            count: 2,
+            encoded_bytes: expected
+        }
+    );
+    assert!(matches!(
+        journal.checkpoint_totals(&session_id("absent")),
+        Err(JournalError::SessionNotFound { .. })
+    ));
+}

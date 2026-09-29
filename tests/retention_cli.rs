@@ -223,6 +223,38 @@ fn status_distinguishes_unfinished_incomplete_and_finalized_receipts() {
         "{text}"
     );
 
+    // A submit that stopped before its immutable capture left only a reason:
+    // the attempt is still unfinished, and the next submit retries it.
+    let failed = Fixture::new("retention-status-failed-submit");
+    let session = ProductionSession::start(&failed.workspace, MANIFEST).unwrap();
+    let failed_id = session.session_id().clone();
+    session.quit().unwrap();
+    fs::write(
+        failed
+            .workspace
+            .join(".rustrace/finalization-incomplete.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "label": "INCOMPLETE RECOVERY",
+            "reason": "interrupted before immutable capture",
+            "session_id": failed_id,
+            "capture_available": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = run(&[Path::new("status"), &failed.workspace]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains(&format!("UNFINISHED session {failed_id}"))
+            && text
+                .contains("Unfinished (last submit failed: interrupted before immutable capture)")
+            && text.contains("Running `rustrace submit` again retries it"),
+        "{text}"
+    );
+    assert!(!text.contains("INCOMPLETE RECOVERY"), "{text}");
+
     let incomplete = Fixture::new("retention-status-incomplete");
     let session = ProductionSession::start(&incomplete.workspace, MANIFEST).unwrap();
     let incomplete_id = session.session_id().clone();
@@ -234,11 +266,19 @@ fn status_distinguishes_unfinished_incomplete_and_finalized_receipts() {
         serde_json::to_vec(&serde_json::json!({
             "version": 1,
             "label": "INCOMPLETE RECOVERY",
-            "reason": "interrupted before immutable capture",
+            "reason": "interrupted after immutable capture",
             "session_id": incomplete_id,
-            "capture_available": false
+            "capture_available": true
         }))
         .unwrap(),
+    )
+    .unwrap();
+    // Only a capture artifact makes the marker a real incomplete recovery.
+    fs::write(
+        incomplete
+            .workspace
+            .join(".rustrace/finalization-recovery-capture.json"),
+        b"{}",
     )
     .unwrap();
     let output = run(&[Path::new("status"), &incomplete.workspace]);
@@ -246,7 +286,7 @@ fn status_distinguishes_unfinished_incomplete_and_finalized_receipts() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("INCOMPLETE RECOVERY"), "{text}");
     assert!(
-        text.contains("interrupted before immutable capture"),
+        text.contains("interrupted after immutable capture"),
         "{text}"
     );
 
@@ -669,4 +709,60 @@ fn append_tar_entry(archive: &mut Vec<u8>, path: &str, contents: &[u8], kind: u8
 fn write_octal(field: &mut [u8], value: u64) {
     let encoded = format!("{:0width$o}\0", value, width = field.len() - 1);
     field.copy_from_slice(encoded.as_bytes());
+}
+
+#[test]
+fn status_counts_checkpoints_events_and_launches_only_when_no_session_is_open() {
+    let (fixture, mut session) = Fixture::started("retention-status-counts");
+    session
+        .execute(rustrace::tui::EditorCommand::Insert('B'))
+        .unwrap();
+    session.capture_boundary().unwrap();
+    let id = session.session_id().clone();
+
+    // A live session holds the journal, so status never opens it.
+    let output = run(&[Path::new("status"), &fixture.workspace]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("UNFINISHED session")
+            && text.contains(
+                "Recorded checkpoints, events, and launches: unknown while a Rustrace session is open on this workspace"
+            ),
+        "{text}"
+    );
+    session.quit().unwrap();
+
+    let mut journal =
+        Journal::open_read_only_no_follow(fixture.workspace.join(format!(".rustrace/{id}.sqlite")))
+            .unwrap();
+    let checkpoints = journal.checkpoint_totals(&id).unwrap().count;
+    let events = journal.verify_session_chain(&id).unwrap().event_count;
+    drop(journal);
+    let (checkpoints, events) = (checkpoints as i64, events as i64);
+    let output = run(&[Path::new("status"), &fixture.workspace]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        // Room leaves out what submit itself adds: one checkpoint and up to
+        // three events.
+        text.contains(&format!(
+            "Checkpoints: {checkpoints} recorded; room for {} more before `rustrace submit` stops",
+            rustrace::display::grouped((8_191 - checkpoints) as u64)
+        )) && text.contains(&format!(
+            "Events: {events} recorded; room for {} more before `rustrace submit` stops",
+            rustrace::display::grouped((999_997 - events) as u64)
+        )) && text.contains("Launches: 0 recorded; a submission keeps at most 64")
+            && !text.contains("Warning:"),
+        "{text}"
+    );
+    // Reading the counts changed nothing: the session still resumes.
+    ProductionSession::resume(
+        &fixture.workspace,
+        MANIFEST,
+        rustrace::session::ResumeChoice::Resume,
+    )
+    .unwrap()
+    .quit()
+    .unwrap();
 }

@@ -2,7 +2,7 @@
 
 use super::{
     FinalizationReceipt, FinalizationStatus, IncompleteFinalization, METADATA_LIMIT,
-    ProductionSession, Result, ResumeChoice, process_probe,
+    ProductionSession, Result, ResumeChoice, finalization::FinalizationLimits, process_probe,
 };
 use rustrace_model::{
     Hash, RPROV_FORMAT_VERSION_V1, RPROV_RECORD_HEADER_BYTES, RprovContainerHeader, RprovManifest,
@@ -224,7 +224,26 @@ pub fn submit_finalized_workspace(
     student_id: &str,
     destination: Option<&Path>,
 ) -> Result<BundleOutput> {
-    submit_workspace(workspace, student_id, destination, false).map(|(bundle, _)| bundle)
+    submit_workspace(
+        workspace,
+        student_id,
+        destination,
+        false,
+        FinalizationLimits::PACKAGE,
+    )
+    .map(|(bundle, _)| bundle)
+}
+
+/// Submits under lowered finalization limits, reaching an over-limit journal
+/// without recording thousands of checkpoints.
+#[cfg(test)]
+pub(super) fn submit_with_limits(
+    workspace: &Path,
+    student_id: &str,
+    destination: Option<&Path>,
+    limits: FinalizationLimits,
+) -> Result<BundleOutput> {
+    submit_workspace(workspace, student_id, destination, false, limits).map(|(bundle, _)| bundle)
 }
 
 fn submit_workspace(
@@ -232,6 +251,7 @@ fn submit_workspace(
     student_id: &str,
     destination: Option<&Path>,
     allow_incomplete: bool,
+    limits: FinalizationLimits,
 ) -> Result<(BundleOutput, Option<(String, String)>)> {
     validate_student_id(student_id)?;
     let mut status = ProductionSession::recover_finalization_if_started(workspace)
@@ -246,12 +266,19 @@ fn submit_workspace(
             ProductionSession::resume(workspace, &manifest, ResumeChoice::Resume)
         })()
         .map_err(submit_resume_error)?;
-        status = Some(match session.finalize(student_id) {
+        status = Some(match session.finalize_with_limits(student_id, limits) {
             Ok(receipt) => FinalizationStatus::Finalized(Box::new(receipt)),
-            Err(finalize_error) => match ProductionSession::recover_finalization(workspace) {
-                Ok(incomplete @ FinalizationStatus::Incomplete(_)) => incomplete,
-                Ok(FinalizationStatus::Finalized(_)) | Err(_) => return Err(finalize_error),
-            },
+            Err(finalize_error) => {
+                match ProductionSession::recover_finalization_if_started(workspace) {
+                    // Nothing immutable was captured: the attempt stays
+                    // unfinished and the next submit retries it.
+                    Ok(None) => return Err(failed_before_capture(finalize_error).into()),
+                    Ok(Some(incomplete @ FinalizationStatus::Incomplete(_))) => incomplete,
+                    Ok(Some(FinalizationStatus::Finalized(_))) | Err(_) => {
+                        return Err(finalize_error);
+                    }
+                }
+            }
         });
     }
 
@@ -310,6 +337,19 @@ fn submit_workspace(
     }
 }
 
+pub(super) fn failed_before_capture(error: Box<dyn std::error::Error>) -> String {
+    let remedy = match error.downcast_ref::<super::finalization::FinalizationLimitExceeded>() {
+        Some(limit) if limit.raised_by_updates() => {
+            "Run `rustrace update` and submit again; if it stops here again, tell your course staff"
+        }
+        Some(_) => "Tell your course staff: updating Rustrace does not raise this limit",
+        None => "Fix the cause above and run the same submit command again",
+    };
+    format!(
+        "{error}; no bundle was created. Nothing was captured, so this attempt is still unfinished and your code and recorded history are intact. {remedy}"
+    )
+}
+
 fn submit_resume_error(error: impl std::fmt::Display) -> String {
     format!(
         "startup/session cannot resume: {error}; original preserved. Your code and recorded history are intact: fix the cause above and run the same command again; --inspect shows the preserved views. If it still cannot resume, start a new workspace with `rustrace work ASSIGNMENT.rta --workspace NEW.work` and tell your course staff; this workspace stays preserved for inspection"
@@ -350,11 +390,13 @@ pub fn run_submit(args: &[String], output: &mut impl Write) -> Result<()> {
     let student_id = student_id.ok_or(
         "Usage: rustrace submit WORKSPACE --student-id ID [--allow-incomplete] [--output PATH]",
     )?;
+    announce_large_package(Path::new(workspace), output)?;
     let (bundle, incomplete) = submit_workspace(
         Path::new(workspace),
         student_id,
         destination,
         allow_incomplete,
+        FinalizationLimits::PACKAGE,
     )?;
     let is_incomplete = incomplete.is_some();
     if let Some((label, reason)) = incomplete {
@@ -372,6 +414,36 @@ pub fn run_submit(args: &[String], output: &mut impl Write) -> Result<()> {
             "local artifact only; this does not mean a successful LMS hand-in"
         }
     )?;
+    Ok(())
+}
+
+/// Checkpoints above which packaging takes long enough to say so first.
+const LARGE_PACKAGE_CHECKPOINTS: u64 = 1_024;
+
+/// One line before a long silent capture: each checkpoint is written and
+/// synced as its own file, which takes a minute or two near the limit.
+fn announce_large_package(workspace: &Path, output: &mut impl Write) -> Result<()> {
+    let Ok(metadata) = ProductionSession::read_metadata(workspace) else {
+        return Ok(());
+    };
+    if !matches!(
+        ProductionSession::inspect_finalization_read_only(workspace),
+        Ok(super::ReadOnlyFinalizationStatus::Unfinished { .. })
+    ) {
+        return Ok(());
+    }
+    if let Ok(Some(usage)) = super::inspect_unfinished_usage(workspace, &metadata) {
+        // Submitting records one more boundary checkpoint first.
+        let checkpoints = usage.checkpoints + 1;
+        if checkpoints > LARGE_PACKAGE_CHECKPOINTS {
+            writeln!(
+                output,
+                "Packaging {} checkpoints; this can take a minute or two...",
+                crate::display::grouped(checkpoints)
+            )?;
+            output.flush()?;
+        }
+    }
     Ok(())
 }
 

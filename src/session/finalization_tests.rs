@@ -1018,3 +1018,187 @@ fn review3_missing_parent_evidence_retains_parent_segments_and_exact_gaps() {
     );
     assert_eq!(terminal_count(&child.0, &child_id).1, 0);
 }
+
+#[test]
+fn over_limit_finalization_names_the_count_and_stays_retryable() {
+    let (fixture, session) = Fixture::started("finalization-over-limit-text");
+    let id = session.session_id().clone();
+    let error = session
+        .finalize_with_checkpoint_limit("student-1", 1)
+        .unwrap_err()
+        .to_string();
+    // The genesis checkpoint plus the boundary finalization records first.
+    assert_eq!(
+        error,
+        "this attempt has 2 checkpoints, more than the 1 one submission can hold"
+    );
+    for name in [
+        "finalization-recovery-capture.json",
+        "finalization-recovery-events.jsonl",
+        "finalization-prefix.jsonl",
+        "finalization-prepared.json",
+    ] {
+        assert!(!state_artifact(&fixture.0, name).exists(), "{name}");
+    }
+    match ProductionSession::inspect_finalization_read_only(&fixture.0).unwrap() {
+        ReadOnlyFinalizationStatus::Unfinished {
+            last_submit_failure: Some(reason),
+        } => assert_eq!(reason, error),
+        other => panic!("a pre-capture failure must stay unfinished: {other:?}"),
+    }
+    assert!(
+        ProductionSession::recover_finalization_if_started(&fixture.0)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(terminal_count(&fixture.0, &id).1, 0);
+
+    let resumed = ProductionSession::resume(&fixture.0, MANIFEST, ResumeChoice::Resume).unwrap();
+    let receipt = resumed.finalize("student-1").unwrap();
+    assert_eq!(receipt.manifest().latest_session_id, id);
+    assert!(matches!(
+        ProductionSession::inspect_finalization_read_only(&fixture.0).unwrap(),
+        ReadOnlyFinalizationStatus::Finalized(_)
+    ));
+}
+
+#[test]
+fn limit_counts_are_grouped_by_thousands() {
+    for (value, text) in [
+        (0, "0"),
+        (999, "999"),
+        (1_000, "1,000"),
+        (8_192, "8,192"),
+        (1_000_000, "1,000,000"),
+        (u64::MAX, "18,446,744,073,709,551,615"),
+    ] {
+        assert_eq!(crate::display::grouped(value), text);
+    }
+}
+
+fn toolchain_observation(
+    sequence: u64,
+    toolchain: &str,
+) -> super::finalization::RuntimeObservation {
+    let observation = crate::toolchain::RuntimeToolchainMetadata {
+        version: 1,
+        session_id: SessionId::new("session-launches").unwrap(),
+        manifest_hash: Hash::from_bytes([3; Hash::LENGTH]),
+        sequence,
+        event_hash: Hash::from_bytes([4; Hash::LENGTH]),
+        report: crate::toolchain::ToolchainReport {
+            assignment_pin: Some("1.98.1".to_owned()),
+            selected_toolchain: Some(toolchain.to_owned()),
+            working_directory: PathBuf::from("assignment"),
+            probes: Vec::new(),
+        },
+    };
+    let bytes = serde_json::to_vec(&observation).unwrap();
+    super::finalization::RuntimeObservation::new(
+        format!("toolchain-{sequence:020}.json"),
+        &bytes,
+        &observation,
+    )
+    .unwrap()
+}
+
+fn selected_sequences(
+    observations: Vec<super::finalization::RuntimeObservation>,
+    limit: usize,
+) -> Vec<u64> {
+    super::finalization::select_runtime_observations(observations, limit)
+        .into_iter()
+        .map(|observation| observation.sequence)
+        .collect()
+}
+
+#[test]
+fn runtime_observations_keep_first_changes_and_last_within_the_limit() {
+    // Within the limit nothing is dropped, so those bundles keep every byte.
+    let few = (1..=4)
+        .rev()
+        .map(|sequence| toolchain_observation(sequence * 10, "stable"))
+        .collect();
+    assert_eq!(selected_sequences(few, 4), [10, 20, 30, 40]);
+
+    // Unchanged launches beyond the limit keep the first and the last, which
+    // sets the producer.
+    let same = (1..=500)
+        .map(|sequence| toolchain_observation(sequence, "stable"))
+        .collect();
+    assert_eq!(selected_sequences(same, 64), [1, 500]);
+
+    // Each change is kept with the observation that starts it.
+    let changing = (1..=100)
+        .map(|sequence| {
+            toolchain_observation(
+                sequence,
+                if (40..60).contains(&sequence) {
+                    "beta"
+                } else {
+                    "stable"
+                },
+            )
+        })
+        .collect();
+    assert_eq!(selected_sequences(changing, 8), [1, 40, 60, 100]);
+
+    // More changes than the limit keep the first and the most recent ones.
+    let alternating = (1..=100)
+        .map(|sequence| {
+            toolchain_observation(sequence, if sequence % 2 == 0 { "beta" } else { "stable" })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        selected_sequences(alternating.clone(), 5),
+        [1, 97, 98, 99, 100]
+    );
+    let mut shuffled = alternating;
+    shuffled.reverse();
+    assert_eq!(selected_sequences(shuffled, 5), [1, 97, 98, 99, 100]);
+}
+
+#[test]
+fn streamed_capture_exports_every_checkpoint_exactly_across_pages() {
+    let (fixture, mut session) = Fixture::started("finalization-streamed-capture");
+    // More than two listing pages of checkpoints.
+    for character in "BCDEFGHIJKLMNOPQRST".chars() {
+        session.execute(EditorCommand::Insert(character)).unwrap();
+        session.capture_boundary().unwrap();
+    }
+    let id = session.session_id().clone();
+    let receipt = session.finalize("student-1").unwrap();
+    let mut journal =
+        Journal::open_read_only_no_follow(state_artifact(&fixture.0, &format!("{id}.sqlite")))
+            .unwrap();
+    let totals = journal.checkpoint_totals(&id).unwrap();
+    let references = &receipt.manifest().segments[0].checkpoints;
+    assert!(totals.count > 2 * rustrace_journal::MAX_CHECKPOINTS_PER_READ as u64);
+    assert_eq!(references.len() as u64, totals.count);
+    let mut exported_bytes = 0;
+    for (index, reference) in references.iter().enumerate() {
+        let stored = journal
+            .load_checkpoint(&id, reference.owner.sequence)
+            .unwrap()
+            .unwrap();
+        let bytes = receipt.read_payload(&reference.entry).unwrap();
+        assert_eq!(bytes, encode_checkpoint(&stored.snapshot).unwrap());
+        assert_eq!(reference.owner.event_hash, stored.owning_event.event_hash);
+        assert_eq!(reference.workspace_hash, stored.snapshot.workspace_hash());
+        let expected_role = if index == 0 {
+            rustrace_model::RprovCheckpointRole::Initial
+        } else if index + 1 == references.len() {
+            rustrace_model::RprovCheckpointRole::Final
+        } else {
+            rustrace_model::RprovCheckpointRole::Accepted
+        };
+        assert_eq!(reference.role, expected_role);
+        exported_bytes += bytes.len() as u64;
+    }
+    assert_eq!(exported_bytes, totals.encoded_bytes);
+    assert!(
+        references
+            .windows(2)
+            .all(|pair| pair[0].owner.sequence < pair[1].owner.sequence)
+    );
+}

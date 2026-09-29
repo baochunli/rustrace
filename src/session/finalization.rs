@@ -11,25 +11,28 @@ use super::{
 };
 use crate::toolchain::{RuntimeToolchainMetadata, ToolchainReport};
 use rustrace_journal::{
-    CheckpointSnapshot, Journal, MAX_CHECKPOINTS_PER_READ, MAX_EVENTS_PER_READ, StoredCheckpoint,
-    decode_checkpoint, encode_checkpoint,
+    CheckpointSnapshot, CheckpointTotals, Journal, MAX_CHECKPOINTS_PER_READ, MAX_EVENTS_PER_READ,
+    MAX_JOURNAL_SEQUENCE, StoredCheckpoint, decode_checkpoint, encode_checkpoint,
 };
 use rustrace_model::{
     DecodeOutcome, DecodePolicy, EditOrigin, Event, EventEnvelope, Hash, MAX_IDENTIFIER_BYTES,
-    MAX_RPROV_CHECKPOINTS_PER_SEGMENT, MAX_RPROV_EVENTS, MAX_RPROV_EVIDENCE_PER_SEGMENT,
-    MAX_RPROV_EVIDENCE_USAGES, MAX_RPROV_EVIDENCE_USAGES_PER_ARTIFACT,
-    MAX_RPROV_INITIAL_FILE_BYTES, MAX_RPROV_INITIAL_FILES, MAX_RPROV_INITIAL_WORKSPACE_BYTES,
-    MAX_RPROV_MANIFEST_BYTES, MAX_RPROV_METADATA_ENTRY_BYTES, MAX_RPROV_METADATA_PER_SEGMENT,
-    MAX_RPROV_SEGMENT_EVENTS_BYTES, MAX_RPROV_SEGMENTS, MAX_RPROV_SOURCE_LINKS_PER_SEGMENT,
-    RPROV_FORMAT_VERSION_V1, RecordedEventRef, RprovAssignmentManifestIdentity, RprovCheckpointRef,
-    RprovCheckpointRole, RprovEntryKind, RprovEventStreamCompleteness, RprovEventStreamRef,
-    RprovEvidenceKind, RprovEvidenceRef, RprovInitialWorkspace, RprovInitialWorkspaceFile,
-    RprovInterAttemptTime, RprovInventoryEntry, RprovKnown, RprovLegacyPasteVerification,
-    RprovManifest, RprovMetadataRef, RprovPackageState, RprovParentLink, RprovProducer,
-    RprovRecoveryGap, RprovSegment, RprovSegmentTime, RprovSourceLink,
-    RprovSubmittedSourceComparison, RprovToolVersion, RprovUnavailableAssurance, SessionId,
-    WorkspacePath, decode_envelope, decode_rprov_manifest, encode_envelope, encode_rprov_manifest,
-    rprov_raw_blake3, validate_rprov_event_stream, validate_rprov_payload,
+    MAX_RPROV_ARCHIVE_ENTRIES, MAX_RPROV_CHECKPOINT_BYTES, MAX_RPROV_CHECKPOINTS_PER_SEGMENT,
+    MAX_RPROV_EVENTS, MAX_RPROV_EVENTS_BYTES, MAX_RPROV_EVIDENCE_BYTES,
+    MAX_RPROV_EVIDENCE_PER_SEGMENT, MAX_RPROV_EVIDENCE_USAGES,
+    MAX_RPROV_EVIDENCE_USAGES_PER_ARTIFACT, MAX_RPROV_INITIAL_FILE_BYTES, MAX_RPROV_INITIAL_FILES,
+    MAX_RPROV_INITIAL_WORKSPACE_BYTES, MAX_RPROV_MANIFEST_BYTES, MAX_RPROV_METADATA_BYTES,
+    MAX_RPROV_METADATA_ENTRY_BYTES, MAX_RPROV_METADATA_PER_SEGMENT,
+    MAX_RPROV_SEGMENT_CHECKPOINT_BYTES, MAX_RPROV_SEGMENT_EVENTS_BYTES, MAX_RPROV_SEGMENTS,
+    MAX_RPROV_SOURCE_LINKS, MAX_RPROV_SOURCE_LINKS_PER_SEGMENT, RPROV_FORMAT_VERSION_V1,
+    RecordedEventRef, RprovAssignmentManifestIdentity, RprovCheckpointRef, RprovCheckpointRole,
+    RprovEntryKind, RprovEventStreamCompleteness, RprovEventStreamRef, RprovEvidenceKind,
+    RprovEvidenceRef, RprovInitialWorkspace, RprovInitialWorkspaceFile, RprovInterAttemptTime,
+    RprovInventoryEntry, RprovKnown, RprovLegacyPasteVerification, RprovManifest, RprovMetadataRef,
+    RprovPackageState, RprovParentLink, RprovProducer, RprovRecoveryGap, RprovSegment,
+    RprovSegmentTime, RprovSourceLink, RprovSubmittedSourceComparison, RprovToolVersion,
+    RprovUnavailableAssurance, SessionId, WorkspacePath, decode_envelope, decode_rprov_manifest,
+    encode_envelope, encode_rprov_manifest, rprov_raw_blake3, validate_rprov_event_stream,
+    validate_rprov_payload,
 };
 use rustrace_replay::ReplayEngine;
 use rustrace_workspace::hash::{
@@ -55,6 +58,298 @@ const RECOVERY_CAPTURE: &str = "finalization-recovery-capture.json";
 const RECOVERY_EVENTS: &str = "finalization-recovery-events.jsonl";
 const FINALIZATION_METADATA_LIMIT: usize = MAX_RPROV_MANIFEST_BYTES;
 const INCOMPLETE_REASON_BYTES: usize = 4096;
+/// Any of these makes the finalization immutable: the journal can no longer
+/// resume, and a failure marker next to one is a real incomplete recovery.
+/// Without them, a failure marker only records why the last submit stopped.
+pub(super) const CAPTURE_ARTIFACTS: [&str; 5] = [
+    RECEIPT_MARKER,
+    PREPARED_MARKER,
+    RECOVERY_CAPTURE,
+    PREFIX_EVENTS,
+    COMPLETE_EVENTS,
+];
+
+/// A count the `.rprov` format caps, found over its limit before anything was
+/// captured. The attempt stays unfinished and resumable, so a build with a
+/// larger limit can finalize the same journal.
+#[derive(Debug)]
+pub(super) struct FinalizationLimitExceeded {
+    what: &'static str,
+    count: u64,
+    limit: u64,
+    /// The count includes the earlier attempts a linked revision carries.
+    with_earlier_attempts: bool,
+    /// One of the limits Rustrace has raised as sessions grew (checkpoints
+    /// and packaged files). A newer release may raise it again, so updating
+    /// may let the same journal submit; for the others it cannot.
+    raised_by_updates: bool,
+}
+
+impl FinalizationLimitExceeded {
+    fn check(what: &'static str, count: u64, limit: u64) -> Result<()> {
+        Self::check_with(what, count, limit, false, false)
+    }
+
+    pub(super) fn check_with(
+        what: &'static str,
+        count: u64,
+        limit: u64,
+        with_earlier_attempts: bool,
+        raised_by_updates: bool,
+    ) -> Result<()> {
+        if count > limit {
+            return Err(Box::new(Self {
+                what,
+                count,
+                limit,
+                with_earlier_attempts,
+                raised_by_updates,
+            }));
+        }
+        Ok(())
+    }
+
+    pub(super) fn raised_by_updates(&self) -> bool {
+        self.raised_by_updates
+    }
+}
+
+impl std::fmt::Display for FinalizationLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} {} {}, more than the {} one submission can hold",
+            if self.with_earlier_attempts {
+                "this attempt and its earlier attempts together have"
+            } else {
+                "this attempt has"
+            },
+            crate::display::grouped(self.count),
+            self.what,
+            crate::display::grouped(self.limit)
+        )
+    }
+}
+
+/// Package-wide sums over the segments of one finalized receipt: what a
+/// linked revision adds its own segment to.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ChainTotals {
+    pub(crate) segments: u64,
+    /// Inventory entries, not counting `manifest.json` or the outer ZIP.
+    pub(crate) entries: u64,
+    pub(crate) events: u64,
+    pub(crate) event_bytes: u64,
+    pub(crate) checkpoint_bytes: u64,
+    pub(crate) metadata_bytes: u64,
+    pub(crate) evidence_bytes: u64,
+    pub(crate) evidence_usages: u64,
+    pub(crate) source_links: u64,
+}
+
+impl ChainTotals {
+    fn of_manifest(manifest: &RprovManifest) -> Self {
+        let mut totals = Self {
+            segments: manifest.segments.len() as u64,
+            entries: manifest.inventory.len() as u64,
+            ..Self::default()
+        };
+        for segment in &manifest.segments {
+            totals.events = totals.events.saturating_add(segment.inclusive_event_count);
+            totals.event_bytes = totals
+                .event_bytes
+                .saturating_add(segment.events.byte_length);
+            for checkpoint in &segment.checkpoints {
+                totals.checkpoint_bytes = totals
+                    .checkpoint_bytes
+                    .saturating_add(checkpoint.byte_length);
+            }
+            for metadata in &segment.metadata {
+                totals.metadata_bytes = totals.metadata_bytes.saturating_add(metadata.byte_length);
+            }
+            for evidence in &segment.evidence {
+                totals.evidence_bytes = totals.evidence_bytes.saturating_add(evidence.byte_length);
+                totals.evidence_usages = totals
+                    .evidence_usages
+                    .saturating_add(evidence.usages.len() as u64);
+            }
+            totals.source_links = totals
+                .source_links
+                .saturating_add(segment.source_links.len() as u64);
+        }
+        totals
+    }
+
+    fn plus(self, other: Self) -> Self {
+        Self {
+            segments: self.segments.saturating_add(other.segments),
+            entries: self.entries.saturating_add(other.entries),
+            events: self.events.saturating_add(other.events),
+            event_bytes: self.event_bytes.saturating_add(other.event_bytes),
+            checkpoint_bytes: self.checkpoint_bytes.saturating_add(other.checkpoint_bytes),
+            metadata_bytes: self.metadata_bytes.saturating_add(other.metadata_bytes),
+            evidence_bytes: self.evidence_bytes.saturating_add(other.evidence_bytes),
+            evidence_usages: self.evidence_usages.saturating_add(other.evidence_usages),
+            source_links: self.source_links.saturating_add(other.source_links),
+        }
+    }
+}
+
+/// The package totals of the finalized parent a revision child continues,
+/// or `None` when its link or receipt cannot be read (finalization then
+/// reports that damage after the capture, as before).
+pub(super) fn earlier_attempt_totals(
+    link_bytes: &[u8],
+    metadata: &SessionMetadata,
+) -> Option<ChainTotals> {
+    let link = revision_link(link_bytes, metadata)?;
+    match ProductionSession::inspect_finalization_read_only(&link.parent_root).ok()? {
+        ReadOnlyFinalizationStatus::Finalized(parent)
+            if parent.latest_session_id == link.parent_session_id =>
+        {
+            Some(parent.chain)
+        }
+        _ => None,
+    }
+}
+
+/// The same totals for status and the startup warning, read from the
+/// parent's receipt-bound manifest alone: the manifest must match the
+/// receipt's digest, but the parent's event stream is not re-validated just
+/// to size a warning. Finalization still runs the full check.
+pub(super) fn earlier_attempt_totals_for_display(
+    link_bytes: &[u8],
+    metadata: &SessionMetadata,
+) -> Option<ChainTotals> {
+    let link = revision_link(link_bytes, metadata)?;
+    let state = PinnedWorkspaceRoot::open(&link.parent_root)
+        .ok()?
+        .open_existing_state_directory()
+        .ok()?;
+    let marker: FinalReceiptMarker =
+        serde_json::from_slice(&state.read_artifact(RECEIPT_MARKER, METADATA_LIMIT).ok()?).ok()?;
+    if marker.version != 1
+        || marker.label != "FINALIZATION RECEIPT"
+        || marker.binding.session_id != link.parent_session_id
+    {
+        return None;
+    }
+    let manifest_bytes = state
+        .read_artifact(PREPARED_MANIFEST, MAX_RPROV_MANIFEST_BYTES)
+        .ok()?;
+    if rprov_raw_blake3(&manifest_bytes) != marker.binding.manifest_blake3 {
+        return None;
+    }
+    let manifest = decode_rprov_manifest(&manifest_bytes).ok()?;
+    (manifest.latest_session_id == link.parent_session_id)
+        .then(|| ChainTotals::of_manifest(&manifest))
+}
+
+fn revision_link(link_bytes: &[u8], metadata: &SessionMetadata) -> Option<RevisionLink> {
+    if metadata.parent_evidence != Some(digest(link_bytes)) {
+        return None;
+    }
+    let link: RevisionLink = serde_json::from_slice(link_bytes).ok()?;
+    (link.version == 1 && link.kind == "finalized_revision").then_some(link)
+}
+
+/// Checks one submission's package-wide limits before anything is captured,
+/// so a linked revision over them stays unfinished instead of stranding its
+/// capture. `outer_files` are the source files the LMS ZIP carries beside the
+/// `.rprov`; the importer counts them against the same entry limit.
+fn check_package_totals(
+    earlier: ChainTotals,
+    own: ChainTotals,
+    outer_files: u64,
+    maximum_files: u64,
+) -> Result<()> {
+    let chained = earlier.segments > 0;
+    let total = earlier.plus(own);
+    let check = |what, count, limit, raised| {
+        FinalizationLimitExceeded::check_with(what, count, limit, chained, raised)
+    };
+    check("attempts", total.segments, MAX_RPROV_SEGMENTS as u64, false)?;
+    // manifest.json and session.rprov are the two entries beside the inventory.
+    check(
+        "packaged files",
+        total.entries.saturating_add(outer_files).saturating_add(2),
+        maximum_files,
+        true,
+    )?;
+    check("recorded events", total.events, MAX_RPROV_EVENTS, false)?;
+    check(
+        "bytes of recorded events",
+        total.event_bytes,
+        MAX_RPROV_EVENTS_BYTES,
+        false,
+    )?;
+    check(
+        "bytes of checkpoints",
+        total.checkpoint_bytes,
+        MAX_RPROV_CHECKPOINT_BYTES,
+        false,
+    )?;
+    check(
+        "bytes of toolchain observations",
+        total.metadata_bytes,
+        MAX_RPROV_METADATA_BYTES,
+        false,
+    )?;
+    check(
+        "bytes of outside-change evidence",
+        total.evidence_bytes,
+        MAX_RPROV_EVIDENCE_BYTES,
+        false,
+    )?;
+    check(
+        "recorded outside-change observations",
+        total.evidence_usages,
+        MAX_RPROV_EVIDENCE_USAGES as u64,
+        false,
+    )?;
+    check(
+        "recorded pastes",
+        total.source_links,
+        MAX_RPROV_SOURCE_LINKS as u64,
+        false,
+    )
+}
+
+impl std::error::Error for FinalizationLimitExceeded {}
+
+/// Per-segment limits applied before the immutable capture. Tests lower them
+/// to reach an over-limit journal without recording thousands of checkpoints.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FinalizationLimits {
+    aggregate_events: u64,
+    checkpoints: usize,
+    /// Packaged files in one submission, earlier attempts included.
+    files: u64,
+}
+
+impl FinalizationLimits {
+    pub(super) const PACKAGE: Self = Self {
+        aggregate_events: MAX_RPROV_EVENTS,
+        checkpoints: MAX_RPROV_CHECKPOINTS_PER_SEGMENT,
+        files: MAX_RPROV_ARCHIVE_ENTRIES as u64,
+    };
+
+    #[cfg(test)]
+    pub(super) fn with_checkpoints(maximum: usize) -> Self {
+        Self {
+            checkpoints: maximum,
+            ..Self::PACKAGE
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_files(maximum: u64) -> Self {
+        Self {
+            files: maximum,
+            ..Self::PACKAGE
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -188,11 +483,16 @@ pub(crate) struct ReadOnlyFinalizationReceipt {
     pub(crate) terminal_chain_hash: Hash,
     pub(crate) aggregate_event_count: u64,
     pub(crate) ancestry_session_ids: Vec<SessionId>,
+    pub(crate) chain: ChainTotals,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum ReadOnlyFinalizationStatus {
-    Unfinished,
+    /// Mutable and resumable. `last_submit_failure` is the reason a previous
+    /// submit stopped before capturing anything; a new submit retries it.
+    Unfinished {
+        last_submit_failure: Option<String>,
+    },
     Prepared {
         session_id: SessionId,
     },
@@ -329,6 +629,7 @@ struct CapturedCurrent {
     publications: Vec<(String, Vec<u8>)>,
     prefix_bytes: Vec<u8>,
     initial_workspace: Option<RprovInitialWorkspace>,
+    initial_files: BTreeMap<WorkspacePath, Vec<u8>>,
     final_workspace: BTreeMap<WorkspacePath, Vec<u8>>,
     gaps: Vec<RprovRecoveryGap>,
 }
@@ -359,12 +660,21 @@ enum ParentEvidenceKind {
     FinalizedRevision,
 }
 
-struct CaptureCurrentInput<'a> {
+struct CaptureCurrentInput<'a, 'j> {
     metadata: &'a SessionMetadata,
     ordinal: u32,
     prefix_events: &'a [EventEnvelope],
     terminal: Option<&'a EventEnvelope>,
-    checkpoints: &'a [StoredCheckpoint],
+    checkpoints: JournalCheckpoints<'j>,
+    maximum_checkpoints: usize,
+    maximum_files: u64,
+    /// The verified live workspace the last checkpoint must equal.
+    expected_final: &'a BTreeMap<WorkspacePath, Vec<u8>>,
+    /// What the earlier attempts of a linked revision already hold (zero for
+    /// a first attempt), or `None` when they cannot be read.
+    earlier: Option<ChainTotals>,
+    /// The encoded length of the terminal the submission will append.
+    terminal_bytes: u64,
     parent_link: Option<RprovParentLink>,
     original_starter_tree_hash: Hash,
     include_initial_workspace: bool,
@@ -403,16 +713,16 @@ impl ProductionSession {
     /// Consumes the active controller and returns a receipt only after its exact
     /// prepared terminal event and ended-session bit are durable.
     pub fn finalize(self, student_id: &str) -> Result<FinalizationReceipt> {
-        self.finalize_with_limit(student_id, MAX_RPROV_EVENTS)
+        self.finalize_with_limits(student_id, FinalizationLimits::PACKAGE)
     }
 
-    fn finalize_with_limit(
+    pub(super) fn finalize_with_limits(
         mut self,
         student_id: &str,
-        maximum_aggregate_event_count: u64,
+        limits: FinalizationLimits,
     ) -> Result<FinalizationReceipt> {
         let result = self
-            .prepare_finalization(student_id, maximum_aggregate_event_count)
+            .prepare_finalization(student_id, limits)
             .and_then(|marker| {
                 finish_prepared(
                     &mut self.effects.0.borrow_mut().owner,
@@ -446,7 +756,22 @@ impl ProductionSession {
         student_id: &str,
         maximum: u64,
     ) -> Result<FinalizationReceipt> {
-        self.finalize_with_limit(student_id, maximum)
+        self.finalize_with_limits(
+            student_id,
+            FinalizationLimits {
+                aggregate_events: maximum,
+                ..FinalizationLimits::PACKAGE
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn finalize_with_checkpoint_limit(
+        self,
+        student_id: &str,
+        maximum: usize,
+    ) -> Result<FinalizationReceipt> {
+        self.finalize_with_limits(student_id, FinalizationLimits::with_checkpoints(maximum))
     }
 
     /// Completes or loads a prepared finalization without reading the live
@@ -467,16 +792,18 @@ impl ProductionSession {
         let mut owner = pinned
             .open_state_directory()?
             .open_journal_file(&metadata.session_id)?;
-        let started = [
-            RECEIPT_MARKER,
-            PREPARED_MARKER,
-            RECOVERY_CAPTURE,
-            INCOMPLETE_MARKER,
-        ]
-        .into_iter()
-        .try_fold(false, |found, name| {
-            artifact_exists(&owner, name).map(|exists| found || exists)
-        });
+        // Only a capture artifact starts finalization. Without one, a failure
+        // marker, whatever it claims or even if unreadable, records why the
+        // last submit stopped: the journal is still the only authority and
+        // resumes, so a new attempt finalizes it.
+        let started = (|| -> Result<bool> {
+            for name in CAPTURE_ARTIFACTS {
+                if artifact_exists(&owner, name)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })();
         owner.release_ownership()?;
         if started? {
             Self::recover_finalization(root).map(Some)
@@ -507,7 +834,28 @@ impl ProductionSession {
                 session_id: prepared.binding.session_id,
             });
         }
-        if state.artifact_exists(INCOMPLETE_MARKER)? {
+        let mut captured = false;
+        for name in CAPTURE_ARTIFACTS {
+            captured |= state.artifact_exists(name)?;
+        }
+        let has_marker = state.artifact_exists(INCOMPLETE_MARKER)?;
+        if !captured {
+            // Without a capture the journal is the only authority: the attempt
+            // is unfinished, and a marker only records why the last submit
+            // stopped, whatever else it claims.
+            let last_submit_failure = has_marker.then(|| match read_incomplete_state(&state) {
+                Ok(marker) if marker.session_id == metadata.session_id => marker.reason,
+                Ok(marker) => format!(
+                    "reason unknown: its failure record names another session, {}",
+                    marker.session_id
+                ),
+                Err(_) => "reason unknown: its failure record is unreadable".to_owned(),
+            });
+            return Ok(ReadOnlyFinalizationStatus::Unfinished {
+                last_submit_failure,
+            });
+        }
+        if has_marker {
             let incomplete = read_incomplete_state(&state)?;
             if incomplete.session_id != metadata.session_id {
                 return Err("incomplete finalization has the wrong session identity".into());
@@ -518,15 +866,17 @@ impl ProductionSession {
                 capture_available: incomplete.capture_available,
             });
         }
-        if state.artifact_exists(RECOVERY_CAPTURE)? {
-            return Ok(ReadOnlyFinalizationStatus::Incomplete {
-                reason: "immutable recovery capture exists without a published finalization marker"
-                    .to_owned(),
-                session_id: metadata.session_id,
-                capture_available: true,
-            });
-        }
-        Ok(ReadOnlyFinalizationStatus::Unfinished)
+        let capture_available = state.artifact_exists(RECOVERY_CAPTURE)?;
+        Ok(ReadOnlyFinalizationStatus::Incomplete {
+            reason: if capture_available {
+                "immutable recovery capture exists without a published finalization marker"
+            } else {
+                "finalization event streams exist without their recovery capture"
+            }
+            .to_owned(),
+            session_id: metadata.session_id,
+            capture_available,
+        })
     }
 
     fn recover_finalization_with_actual_limit(
@@ -707,7 +1057,7 @@ impl ProductionSession {
         student_id: &str,
         stage: FinalizationInterruption,
     ) -> Result<()> {
-        let marker = self.prepare_finalization(student_id, MAX_RPROV_EVENTS)?;
+        let marker = self.prepare_finalization(student_id, FinalizationLimits::PACKAGE)?;
         let boundary = match stage {
             FinalizationInterruption::AfterCapture => FinishBoundary::AfterCapture,
             FinalizationInterruption::AfterTerminal => FinishBoundary::AfterTerminal,
@@ -720,8 +1070,9 @@ impl ProductionSession {
     fn prepare_finalization(
         &mut self,
         student_id: &str,
-        maximum_aggregate_event_count: u64,
+        limits: FinalizationLimits,
     ) -> Result<PreparedMarker> {
+        let maximum_aggregate_event_count = limits.aggregate_events;
         validate_student_id(student_id)?;
         self.shutdown_command()?;
         if self.effects.0.borrow().command_active
@@ -803,9 +1154,7 @@ impl ProductionSession {
             .sequence
             .checked_add(1)
             .ok_or("terminal event count overflow")?;
-        if terminal_count > MAX_RPROV_EVENTS {
-            return Err("segment terminal event exceeds package event limit".into());
-        }
+        FinalizationLimitExceeded::check("recorded events", terminal_count, MAX_RPROV_EVENTS)?;
         let terminal = EventEnvelope {
             format_version: 1,
             session_id: self.metadata.session_id.clone(),
@@ -825,19 +1174,36 @@ impl ProductionSession {
         let mut terminal_replay = prefix.replay.clone();
         terminal_replay.apply(&terminal)?;
 
-        let checkpoints = read_all_checkpoints(&mut journal, &self.metadata.session_id)?;
-        process_probe("finalization-before-capture");
+        let checkpoints = JournalCheckpoints::new(&mut journal, &self.metadata.session_id)?;
         let had_parent = parent_evidence_kind == ParentEvidenceKind::FinalizedRevision;
+        // Unreadable ancestry is reported after the capture, as before; only
+        // readable earlier attempts can be counted up front.
+        let earlier = if had_parent {
+            authority
+                .owner
+                .read_artifact("parent.json", METADATA_LIMIT)
+                .ok()
+                .and_then(|bytes| earlier_attempt_totals(&bytes, &self.metadata))
+        } else {
+            Some(ChainTotals::default())
+        };
+        let terminal_bytes = encode_envelope(&terminal)?.len() as u64 + 1;
+        process_probe("finalization-before-capture");
         let original_starter_tree_hash = (!had_parent).then_some(self.metadata.starter_hash);
         let mut current = capture_current_segment(
-            &authority.owner,
+            &authority,
             &state_directory,
             CaptureCurrentInput {
                 metadata: &self.metadata,
                 ordinal: 1,
                 prefix_events: &prefix_events,
                 terminal: None,
-                checkpoints: &checkpoints,
+                checkpoints,
+                maximum_checkpoints: limits.checkpoints,
+                maximum_files: limits.files,
+                expected_final: &logical,
+                earlier,
+                terminal_bytes,
                 parent_link: None,
                 // The outer Option is authoritative for raw recovery. Zero is
                 // an inert internal sentinel and is never emitted in a manifest.
@@ -847,9 +1213,8 @@ impl ProductionSession {
                 artifact_tag: "finalization-recovery",
             },
         )?;
-        if current.final_workspace != logical {
-            return Err("captured final checkpoint differs from the verified live boundary".into());
-        }
+        // Every later step reads the durable capture, not the decoded prefix.
+        drop(prefix_events);
         let manifest_bytes = authority
             .owner
             .read_artifact("manifest.toml", METADATA_LIMIT)?;
@@ -873,7 +1238,8 @@ impl ProductionSession {
             payloads: current.payloads.clone(),
             gaps: current.gaps.clone(),
         };
-        publish_current_capture(&authority.owner, &authority, &current, &persisted_current)?;
+        retire_failure_marker(&authority.owner, prefix.sequence)?;
+        publish_current_capture(&authority, &persisted_current)?;
 
         // The raw current boundary above is the recovery commit point. Only
         // after it exists may revision seed/link parsing fail. A certified
@@ -921,10 +1287,7 @@ impl ProductionSession {
             // Student IDs belong to each submission, not its recorded event history.
             // A linked revision may correct the ID without changing the parent receipt.
             require_assignment_match(&parent.manifest, &self.metadata, &authority.owner)?;
-            let child_initial = checkpoints
-                .first()
-                .ok_or("revision child is missing its genesis checkpoint")?;
-            if parent.final_workspace != checkpoint_files(&child_initial.snapshot) {
+            if parent.final_workspace != current.initial_files {
                 return Err("revision child start no longer equals the parent final tree".into());
             }
         }
@@ -936,8 +1299,8 @@ impl ProductionSession {
             return Err("revision history exceeds the package segment limit".into());
         }
         let ordinal = u32::try_from(ordinal).map_err(|_| "segment ordinal overflow")?;
-        let captured = complete_current_capture(
-            &current,
+        let mut captured = complete_current_capture(
+            current,
             &state_directory,
             &terminal,
             ordinal,
@@ -1072,6 +1435,9 @@ impl ProductionSession {
         authority
             .owner
             .publish_artifact(PREFIX_EVENTS, &captured.prefix_bytes, false)?;
+        // Validation reads the published copies; free the in-memory streams.
+        captured.publications = Vec::new();
+        captured.prefix_bytes = Vec::new();
         let candidate = validate_receipt_parts(
             &authority.owner,
             manifest,
@@ -1095,39 +1461,131 @@ impl ProductionSession {
     }
 }
 
+/// One session's checkpoints, read from its stopped journal in bounded pages,
+/// so a capture holds at most one page of decoded workspace copies however
+/// many checkpoints the session recorded.
+struct JournalCheckpoints<'j> {
+    journal: &'j mut Journal,
+    session_id: &'j SessionId,
+    totals: CheckpointTotals,
+}
+
+impl<'j> JournalCheckpoints<'j> {
+    fn new(journal: &'j mut Journal, session_id: &'j SessionId) -> Result<Self> {
+        let totals = journal.checkpoint_totals(session_id)?;
+        Ok(Self {
+            journal,
+            session_id,
+            totals,
+        })
+    }
+
+    fn first(&mut self) -> Result<StoredCheckpoint> {
+        self.journal
+            .load_checkpoint(self.session_id, 1)?
+            .ok_or_else(|| "journal has no genesis checkpoint".into())
+    }
+
+    fn last(&mut self) -> Result<StoredCheckpoint> {
+        self.journal
+            .latest_checkpoint_at_or_before(self.session_id, MAX_JOURNAL_SEQUENCE)?
+            .ok_or_else(|| "journal has no checkpoints to finalize".into())
+    }
+
+    /// Visits every checkpoint once, in owning-sequence order.
+    fn for_each(
+        &mut self,
+        mut visit: impl FnMut(usize, StoredCheckpoint) -> Result<()>,
+    ) -> Result<()> {
+        let mut next = 1_u64;
+        let mut index = 0_usize;
+        loop {
+            let page =
+                self.journal
+                    .list_checkpoints(self.session_id, next, MAX_CHECKPOINTS_PER_READ)?;
+            let Some(last) = page.last() else {
+                break;
+            };
+            next = last
+                .owning_event
+                .sequence
+                .checked_add(1)
+                .ok_or("checkpoint sequence overflow")?;
+            for checkpoint in page {
+                visit(index, checkpoint)?;
+                index += 1;
+            }
+        }
+        if index as u64 != self.totals.count {
+            return Err("checkpoint listing differs from its counted total".into());
+        }
+        Ok(())
+    }
+}
+
+/// Captures the current prefix. Every limit check, and every identity check
+/// that needs no full checkpoint listing, runs before anything is published,
+/// so such a failure leaves nothing to replace. The components are then
+/// published, with checkpoints streamed one page at a time; the per-checkpoint
+/// owner checks and the listing check run during that stream, still before
+/// the caller publishes `RECOVERY_CAPTURE`, the commit point.
 fn capture_current_segment(
-    owner: &PinnedJournalFile,
+    authority: &super::Authority,
     state_directory: &Path,
-    input: CaptureCurrentInput<'_>,
+    input: CaptureCurrentInput<'_, '_>,
 ) -> Result<CapturedCurrent> {
+    let owner = &authority.owner;
     let CaptureCurrentInput {
         metadata,
         ordinal,
         prefix_events,
         terminal,
-        checkpoints,
+        mut checkpoints,
+        maximum_checkpoints,
+        maximum_files,
+        expected_final,
+        earlier,
+        terminal_bytes,
         parent_link,
         original_starter_tree_hash,
         include_initial_workspace,
         event_artifact,
         artifact_tag,
     } = input;
-    if checkpoints.len() < 2 || checkpoints.len() > MAX_RPROV_CHECKPOINTS_PER_SEGMENT {
-        return Err(
-            "finalization requires distinct initial/final full checkpoints within limits".into(),
-        );
+    let totals = checkpoints.totals;
+    FinalizationLimitExceeded::check_with(
+        "checkpoints",
+        totals.count,
+        maximum_checkpoints as u64,
+        false,
+        true,
+    )?;
+    if totals.count < 2 {
+        return Err("finalization requires distinct initial/final full checkpoints".into());
     }
+    FinalizationLimitExceeded::check(
+        "bytes of checkpoints",
+        totals.encoded_bytes,
+        MAX_RPROV_SEGMENT_CHECKPOINT_BYTES,
+    )?;
+    let checkpoint_count =
+        usize::try_from(totals.count).map_err(|_| "checkpoint count does not fit usize")?;
     let prefix_bytes = encode_event_stream(prefix_events)?;
-    let mut event_bytes = prefix_bytes.clone();
-    if let Some(terminal) = terminal {
-        event_bytes.extend_from_slice(&encode_envelope(terminal)?);
-        event_bytes.push(b'\n');
-    }
-    if event_bytes.len() as u64 > MAX_RPROV_SEGMENT_EVENTS_BYTES {
-        return Err("captured event stream exceeds the segment byte limit".into());
-    }
+    let event_bytes = match terminal {
+        None => std::borrow::Cow::Borrowed(prefix_bytes.as_slice()),
+        Some(terminal) => {
+            let mut bytes = prefix_bytes.clone();
+            bytes.extend_from_slice(&encode_envelope(terminal)?);
+            bytes.push(b'\n');
+            std::borrow::Cow::Owned(bytes)
+        }
+    };
+    FinalizationLimitExceeded::check(
+        "bytes of recorded events",
+        event_bytes.len() as u64,
+        MAX_RPROV_SEGMENT_EVENTS_BYTES,
+    )?;
 
-    let mut publications = vec![(event_artifact.to_owned(), event_bytes.clone())];
     let event_entry = format!("segments/{ordinal:04}/events.jsonl");
     let event_digest = rprov_raw_blake3(&event_bytes);
     let mut inventory = vec![RprovInventoryEntry {
@@ -1147,49 +1605,18 @@ fn capture_current_segment(
         .chain(terminal)
         .map(|event| (event.sequence, event))
         .collect::<BTreeMap<_, _>>();
+    let owned_by_prefix = |checkpoint: &StoredCheckpoint| {
+        event_by_sequence
+            .get(&checkpoint.owning_event.sequence)
+            .copied()
+            == Some(&checkpoint.owning_event)
+    };
 
-    let mut checkpoint_refs = Vec::with_capacity(checkpoints.len());
-    for (index, checkpoint) in checkpoints.iter().enumerate() {
-        let sequence = checkpoint.owning_event.sequence;
-        if event_by_sequence.get(&sequence).copied() != Some(&checkpoint.owning_event) {
-            return Err("checkpoint owner differs from the fixed event prefix".into());
-        }
-        let bytes = encode_checkpoint(&checkpoint.snapshot)?;
-        let digest = rprov_raw_blake3(&bytes);
-        let local_name = format!("{artifact_tag}-checkpoint-{sequence:020}.rcpk");
-        let entry = format!("segments/{ordinal:04}/checkpoints/{sequence:020}.rcpk");
-        let role = if index == 0 {
-            RprovCheckpointRole::Initial
-        } else if terminal.is_some() && index + 1 == checkpoints.len() {
-            RprovCheckpointRole::Final
-        } else {
-            RprovCheckpointRole::Accepted
-        };
-        checkpoint_refs.push(RprovCheckpointRef {
-            role,
-            format_version: 1,
-            entry: entry.clone(),
-            byte_length: bytes.len() as u64,
-            blake3: digest,
-            owner: event_reference(&checkpoint.owning_event),
-            workspace_hash: checkpoint.snapshot.workspace_hash(),
-        });
-        inventory.push(RprovInventoryEntry {
-            path: entry.clone(),
-            byte_length: bytes.len() as u64,
-            blake3: digest,
-            kind: RprovEntryKind::Checkpoint,
-        });
-        payloads.push(FinalizationPayload {
-            entry,
-            path: state_directory.join(&local_name),
-            byte_length: bytes.len() as u64,
-            blake3: digest,
-        });
-        publications.push((local_name, bytes));
+    let initial_checkpoint = checkpoints.first()?;
+    let final_checkpoint = checkpoints.last()?;
+    if !owned_by_prefix(&initial_checkpoint) || !owned_by_prefix(&final_checkpoint) {
+        return Err("checkpoint owner differs from the fixed event prefix".into());
     }
-    let initial_checkpoint = checkpoints.first().ok_or("missing initial checkpoint")?;
-    let final_checkpoint = checkpoints.last().ok_or("missing final checkpoint")?;
     if initial_checkpoint.owning_event.sequence != 1
         || terminal
             .is_some_and(|terminal| final_checkpoint.owning_event.sequence + 1 != terminal.sequence)
@@ -1198,6 +1625,10 @@ fn capture_current_segment(
                 != prefix_events.last().map_or(0, |event| event.sequence)
     {
         return Err("final checkpoint is not the exact captured boundary event".into());
+    }
+    let final_workspace = checkpoint_files(&final_checkpoint.snapshot);
+    if final_workspace != *expected_final {
+        return Err("captured final checkpoint differs from the verified live boundary".into());
     }
 
     let runtime_metadata = capture_runtime_metadata(
@@ -1215,50 +1646,7 @@ fn capture_current_segment(
     payloads.extend(captured_evidence.payloads);
     let source_links = capture_source_links(prefix_events)?;
 
-    let last_event = terminal
-        .or_else(|| prefix_events.last())
-        .ok_or("captured event stream is empty")?;
-    let segment = RprovSegment {
-        ordinal,
-        session_id: metadata.session_id.clone(),
-        course_id: metadata.course_id.clone(),
-        assignment_id: metadata.assignment_id.clone(),
-        assignment_version: metadata.assignment_version.clone(),
-        assignment_manifest_blake3: metadata.manifest_hash,
-        original_starter_tree_hash,
-        initial_tree_hash: metadata.starter_hash,
-        producer: runtime_metadata.producer,
-        time: RprovSegmentTime {
-            started_at_utc: RprovKnown::Unknown,
-            ended_at_utc: RprovKnown::Unknown,
-            inter_attempt_time: RprovInterAttemptTime::Unknown,
-        },
-        parent: parent_link,
-        events: RprovEventStreamRef {
-            format_version: 1,
-            entry: event_entry,
-            byte_length: event_bytes.len() as u64,
-            blake3: event_digest,
-            completeness: if terminal.is_some() {
-                RprovEventStreamCompleteness::Complete
-            } else {
-                RprovEventStreamCompleteness::PrefixOnly
-            },
-        },
-        checkpoints: checkpoint_refs,
-        metadata: runtime_metadata.refs,
-        evidence: captured_evidence.refs,
-        source_links,
-        inclusive_event_count: last_event.sequence,
-        last_event_hash: last_event.event_hash,
-        terminal_event_hash: terminal.map_or(RprovKnown::Unknown, |terminal| RprovKnown::Known {
-            value: terminal.event_hash,
-        }),
-        final_tree_hash: terminal.map_or(RprovKnown::Unknown, |_| RprovKnown::Known {
-            value: final_checkpoint.snapshot.workspace_hash(),
-        }),
-    };
-
+    let mut starter_publications = Vec::new();
     let initial_workspace = if include_initial_workspace {
         let mut files = Vec::with_capacity(initial_checkpoint.snapshot.files().len());
         if initial_checkpoint.snapshot.files().len() > MAX_RPROV_INITIAL_FILES {
@@ -1294,12 +1682,157 @@ fn capture_current_segment(
                     byte_length: length,
                     blake3: digest,
                 });
-                publications.push((local_name, file.contents.clone()));
+                starter_publications.push((local_name, file.contents.clone()));
             }
         }
         Some(RprovInitialWorkspace { files })
     } else {
         None
+    };
+    if let Some(earlier) = earlier {
+        let own = ChainTotals {
+            segments: 1,
+            entries: (inventory.len() as u64).saturating_add(totals.count),
+            events: prefix_events
+                .last()
+                .map_or(0, |event| event.sequence)
+                .saturating_add(1),
+            event_bytes: (event_bytes.len() as u64).saturating_add(terminal_bytes),
+            checkpoint_bytes: totals.encoded_bytes,
+            metadata_bytes: runtime_metadata
+                .refs
+                .iter()
+                .map(|metadata| metadata.byte_length)
+                .sum(),
+            evidence_bytes: captured_evidence
+                .refs
+                .iter()
+                .map(|evidence| evidence.byte_length)
+                .sum(),
+            evidence_usages: captured_evidence
+                .refs
+                .iter()
+                .map(|evidence| evidence.usages.len() as u64)
+                .sum(),
+            source_links: source_links.len() as u64,
+        };
+        check_package_totals(earlier, own, final_workspace.len() as u64, maximum_files)?;
+    }
+    let initial_files = checkpoint_files(&initial_checkpoint.snapshot);
+    let initial_owner = event_reference(&initial_checkpoint.owning_event);
+    let final_owner = event_reference(&final_checkpoint.owning_event);
+    let final_tree_hash = final_checkpoint.snapshot.workspace_hash();
+    drop((initial_checkpoint, final_checkpoint));
+
+    // RECOVERY_CAPTURE, which the caller publishes, is the commit point.
+    // Components left before it by an interruption are incomplete and may be
+    // replaced by the next owned, fully validated boundary capture.
+    let starter_bytes = starter_publications
+        .iter()
+        .map(|(_, bytes)| bytes.len() as u64)
+        .sum::<u64>();
+    authority.headroom(
+        (event_bytes.len() as u64)
+            .checked_add(totals.encoded_bytes)
+            .and_then(|total| total.checked_add(starter_bytes))
+            .ok_or("recovery capture byte count overflow")?,
+    )?;
+    let replacing_partial = artifact_exists(owner, RECOVERY_EVENTS)?;
+    owner.publish_artifact(event_artifact, &event_bytes, replacing_partial)?;
+    let event_byte_length = event_bytes.len() as u64;
+    drop(event_bytes);
+    let mut checkpoint_refs = Vec::with_capacity(checkpoint_count);
+    checkpoints.for_each(|index, checkpoint| {
+        if !owned_by_prefix(&checkpoint) {
+            return Err("checkpoint owner differs from the fixed event prefix".into());
+        }
+        let sequence = checkpoint.owning_event.sequence;
+        let bytes = encode_checkpoint(&checkpoint.snapshot)?;
+        let digest = rprov_raw_blake3(&bytes);
+        let local_name = format!("{artifact_tag}-checkpoint-{sequence:020}.rcpk");
+        let entry = format!("segments/{ordinal:04}/checkpoints/{sequence:020}.rcpk");
+        let role = if index == 0 {
+            RprovCheckpointRole::Initial
+        } else if terminal.is_some() && index + 1 == checkpoint_count {
+            RprovCheckpointRole::Final
+        } else {
+            RprovCheckpointRole::Accepted
+        };
+        checkpoint_refs.push(RprovCheckpointRef {
+            role,
+            format_version: 1,
+            entry: entry.clone(),
+            byte_length: bytes.len() as u64,
+            blake3: digest,
+            owner: event_reference(&checkpoint.owning_event),
+            workspace_hash: checkpoint.snapshot.workspace_hash(),
+        });
+        inventory.push(RprovInventoryEntry {
+            path: entry.clone(),
+            byte_length: bytes.len() as u64,
+            blake3: digest,
+            kind: RprovEntryKind::Checkpoint,
+        });
+        payloads.push(FinalizationPayload {
+            entry,
+            path: state_directory.join(&local_name),
+            byte_length: bytes.len() as u64,
+            blake3: digest,
+        });
+        owner.publish_artifact(&local_name, &bytes, replacing_partial)?;
+        Ok(())
+    })?;
+    if checkpoint_refs.first().map(|checkpoint| &checkpoint.owner) != Some(&initial_owner)
+        || checkpoint_refs.last().map(|checkpoint| &checkpoint.owner) != Some(&final_owner)
+    {
+        return Err("checkpoint listing changed during the capture".into());
+    }
+    for (name, bytes) in &starter_publications {
+        owner.publish_artifact(name, bytes, replacing_partial)?;
+    }
+
+    let last_event = terminal
+        .or_else(|| prefix_events.last())
+        .ok_or("captured event stream is empty")?;
+    let segment = RprovSegment {
+        ordinal,
+        session_id: metadata.session_id.clone(),
+        course_id: metadata.course_id.clone(),
+        assignment_id: metadata.assignment_id.clone(),
+        assignment_version: metadata.assignment_version.clone(),
+        assignment_manifest_blake3: metadata.manifest_hash,
+        original_starter_tree_hash,
+        initial_tree_hash: metadata.starter_hash,
+        producer: runtime_metadata.producer,
+        time: RprovSegmentTime {
+            started_at_utc: RprovKnown::Unknown,
+            ended_at_utc: RprovKnown::Unknown,
+            inter_attempt_time: RprovInterAttemptTime::Unknown,
+        },
+        parent: parent_link,
+        events: RprovEventStreamRef {
+            format_version: 1,
+            entry: event_entry,
+            byte_length: event_byte_length,
+            blake3: event_digest,
+            completeness: if terminal.is_some() {
+                RprovEventStreamCompleteness::Complete
+            } else {
+                RprovEventStreamCompleteness::PrefixOnly
+            },
+        },
+        checkpoints: checkpoint_refs,
+        metadata: runtime_metadata.refs,
+        evidence: captured_evidence.refs,
+        source_links,
+        inclusive_event_count: last_event.sequence,
+        last_event_hash: last_event.event_hash,
+        terminal_event_hash: terminal.map_or(RprovKnown::Unknown, |terminal| RprovKnown::Known {
+            value: terminal.event_hash,
+        }),
+        final_tree_hash: terminal.map_or(RprovKnown::Unknown, |_| RprovKnown::Known {
+            value: final_tree_hash,
+        }),
     };
 
     inventory.sort_by(|left, right| left.path.cmp(&right.path));
@@ -1308,41 +1841,42 @@ fn capture_current_segment(
         segment,
         inventory,
         payloads,
-        publications,
+        publications: Vec::new(),
         prefix_bytes,
         initial_workspace,
-        final_workspace: checkpoint_files(&final_checkpoint.snapshot),
+        initial_files,
+        final_workspace,
         gaps: captured_evidence.gaps,
     })
 }
 
+/// A marker left by an earlier submit that stopped before its capture only
+/// records why that submit stopped. Once a new capture is about to become the
+/// commit point, the marker is renamed out of the way, so a later crash or
+/// success is never reported with the old reason; the renamed file keeps the
+/// record.
+fn retire_failure_marker(owner: &PinnedJournalFile, prefix_sequence: u64) -> Result<()> {
+    if artifact_exists(owner, INCOMPLETE_MARKER)? {
+        owner.rename_artifact(
+            INCOMPLETE_MARKER,
+            &format!("finalization-incomplete-before-{prefix_sequence:020}.json"),
+        )?;
+    }
+    Ok(())
+}
+
 fn publish_current_capture(
-    owner: &PinnedJournalFile,
     authority: &super::Authority,
-    current: &CapturedCurrent,
     persisted: &PersistedCurrentCapture,
 ) -> Result<()> {
     let persisted_bytes = serde_json::to_vec(persisted)?;
     if persisted_bytes.len() > FINALIZATION_METADATA_LIMIT {
         return Err("current recovery capture exceeds its bounded metadata limit".into());
     }
-    let publication_bytes = current.publications.iter().try_fold(
-        persisted_bytes.len() as u64,
-        |total, (_, bytes)| {
-            total
-                .checked_add(bytes.len() as u64)
-                .ok_or("recovery capture byte count overflow")
-        },
-    )?;
-    authority.headroom(publication_bytes)?;
-    let replacing_partial = artifact_exists(owner, RECOVERY_EVENTS)?;
-    for (name, bytes) in &current.publications {
-        // RECOVERY_CAPTURE below is the commit point. Components left before
-        // that marker by an interruption are incomplete and may be replaced by
-        // the next owned, fully validated boundary capture.
-        owner.publish_artifact(name, bytes, replacing_partial)?;
-    }
-    owner.publish_artifact(RECOVERY_CAPTURE, &persisted_bytes, false)?;
+    authority.headroom(persisted_bytes.len() as u64)?;
+    authority
+        .owner
+        .publish_artifact(RECOVERY_CAPTURE, &persisted_bytes, false)?;
     Ok(())
 }
 
@@ -1361,7 +1895,7 @@ fn publish_enriched_current_capture(
 }
 
 fn complete_current_capture(
-    current: &CapturedCurrent,
+    current: CapturedCurrent,
     state_directory: &Path,
     terminal: &EventEnvelope,
     ordinal: u32,
@@ -1378,10 +1912,13 @@ fn complete_current_capture(
     {
         return Err("terminal does not immediately extend the immutable current prefix".into());
     }
-    let mut result = current.clone();
+    let mut result = current;
     result.publications.clear();
-    let mut complete_events = current.prefix_bytes.clone();
-    complete_events.extend_from_slice(&encode_envelope(terminal)?);
+    let terminal_bytes = encode_envelope(terminal)?;
+    let mut complete_events =
+        Vec::with_capacity(result.prefix_bytes.len() + terminal_bytes.len() + 1);
+    complete_events.extend_from_slice(&result.prefix_bytes);
+    complete_events.extend_from_slice(&terminal_bytes);
     complete_events.push(b'\n');
     if complete_events.len() as u64 > MAX_RPROV_SEGMENT_EVENTS_BYTES {
         return Err("captured event stream exceeds the segment byte limit".into());
@@ -1541,6 +2078,81 @@ fn load_revision_seed(
     }))
 }
 
+/// One validated toolchain observation, reduced to what export selection needs.
+#[derive(Clone, Debug)]
+pub(super) struct RuntimeObservation {
+    pub(super) sequence: u64,
+    event_hash: Hash,
+    name: String,
+    byte_length: u64,
+    blake3: Hash,
+    report_digest: Hash,
+}
+
+impl RuntimeObservation {
+    pub(super) fn new(
+        name: String,
+        bytes: &[u8],
+        observation: &RuntimeToolchainMetadata,
+    ) -> Result<Self> {
+        Ok(Self {
+            sequence: observation.sequence,
+            event_hash: observation.event_hash,
+            name,
+            byte_length: bytes.len() as u64,
+            blake3: rprov_raw_blake3(bytes),
+            report_digest: rprov_raw_blake3(&serde_json::to_vec(&observation.report)?),
+        })
+    }
+
+    pub(super) fn byte_length(&self) -> u64 {
+        self.byte_length
+    }
+
+    pub(super) fn blake3(&self) -> Hash {
+        self.blake3
+    }
+}
+
+/// Every `rustrace work` start records one toolchain observation, but a
+/// segment exports at most `limit`. Up to the limit every observation is kept,
+/// so those bundles keep every byte. Beyond it the export keeps the first
+/// observation, each one whose report differs from the observation before it,
+/// and the last, which sets the producer; if those still exceed the limit, the
+/// first and the most recent are kept. The event stream still records every
+/// launch, and verify needs no observation per launch.
+pub(super) fn select_runtime_observations(
+    mut observations: Vec<RuntimeObservation>,
+    limit: usize,
+) -> Vec<RuntimeObservation> {
+    observations.sort_by(|left, right| {
+        left.sequence
+            .cmp(&right.sequence)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    if observations.len() <= limit {
+        return observations;
+    }
+    let last = observations.len() - 1;
+    let mut selected = observations
+        .iter()
+        .enumerate()
+        .filter(|(index, observation)| {
+            *index == 0
+                || *index == last
+                || observation.report_digest != observations[index - 1].report_digest
+        })
+        .map(|(_, observation)| observation.clone())
+        .collect::<Vec<_>>();
+    if selected.len() > limit {
+        debug_assert!(limit >= 2, "the first and the last must both fit");
+        let recent = selected.split_off(selected.len() - (limit - 1));
+        selected.truncate(1);
+        selected.extend(recent);
+    }
+    selected
+}
+
 fn capture_runtime_metadata(
     owner: &PinnedJournalFile,
     state_directory: &Path,
@@ -1550,6 +2162,7 @@ fn capture_runtime_metadata(
 ) -> Result<CapturedRuntimeMetadata> {
     owner.verify()?;
     let mut observations = Vec::new();
+    let mut latest: Option<(u64, String, ToolchainReport)> = None;
     for entry in fs::read_dir(state_directory)? {
         let entry = entry?;
         let name = entry
@@ -1570,34 +2183,29 @@ fn capture_runtime_metadata(
         {
             return Err("runtime metadata owner/assignment identity mismatch".into());
         }
-        if observations.len() == MAX_RPROV_METADATA_PER_SEGMENT {
-            return Err("runtime metadata exceeds the segment item limit".into());
+        observations.push(RuntimeObservation::new(name.clone(), &bytes, &observation)?);
+        if latest.as_ref().is_none_or(|(sequence, latest_name, _)| {
+            (observation.sequence, &name) > (*sequence, latest_name)
+        }) {
+            latest = Some((observation.sequence, name, observation.report));
         }
-        observations.push((observation, name, bytes));
     }
     owner.verify()?;
-    observations.sort_by_key(|(observation, _, _)| observation.sequence);
-    let selected_report = observations
-        .last()
-        .map(|(observation, _, _)| &observation.report);
-    let producer = producer(metadata, selected_report);
+    let producer = producer(metadata, latest.as_ref().map(|(_, _, report)| report));
     let mut by_entry = BTreeMap::new();
-    for (observation, name, bytes) in observations {
-        let digest = rprov_raw_blake3(&bytes);
-        let archive_entry = format!("segments/{ordinal:04}/metadata/{digest}.json");
-        by_entry
-            .entry(archive_entry)
-            .or_insert((observation, name, bytes.len() as u64, digest));
+    for observation in select_runtime_observations(observations, MAX_RPROV_METADATA_PER_SEGMENT) {
+        let archive_entry = format!("segments/{ordinal:04}/metadata/{}.json", observation.blake3);
+        by_entry.entry(archive_entry).or_insert(observation);
     }
     let mut refs = Vec::with_capacity(by_entry.len());
     let mut inventory = Vec::with_capacity(by_entry.len());
     let mut payloads = Vec::with_capacity(by_entry.len());
-    for (entry, (observation, name, byte_length, digest)) in by_entry {
+    for (entry, observation) in by_entry {
         refs.push(RprovMetadataRef {
             format_version: 1,
             entry: entry.clone(),
-            byte_length,
-            blake3: digest,
+            byte_length: observation.byte_length,
+            blake3: observation.blake3,
             owner: RecordedEventRef {
                 session_id: metadata.session_id.clone(),
                 sequence: observation.sequence,
@@ -1606,15 +2214,15 @@ fn capture_runtime_metadata(
         });
         inventory.push(RprovInventoryEntry {
             path: entry.clone(),
-            byte_length,
-            blake3: digest,
+            byte_length: observation.byte_length,
+            blake3: observation.blake3,
             kind: RprovEntryKind::RuntimeMetadata,
         });
         payloads.push(FinalizationPayload {
             entry,
-            path: state_directory.join(name),
-            byte_length,
-            blake3: digest,
+            path: state_directory.join(observation.name),
+            byte_length: observation.byte_length,
+            blake3: observation.blake3,
         });
     }
     Ok(CapturedRuntimeMetadata {
@@ -1654,24 +2262,34 @@ fn capture_evidence(
             usage_count = usage_count
                 .checked_add(1)
                 .ok_or("evidence usage count overflow")?;
-            if usage_count > MAX_RPROV_EVIDENCE_USAGES {
-                return Err("evidence usages exceed the package limit".into());
-            }
-            if !grouped.contains_key(&hash) && grouped.len() == MAX_RPROV_EVIDENCE_PER_SEGMENT {
-                return Err("evidence artifacts exceed the segment item limit".into());
-            }
             let group = grouped
                 .entry(hash)
                 .or_insert_with(|| (name.clone(), Vec::new()));
             if group.0 != name {
                 return Err("one evidence digest resolves to conflicting durable artifacts".into());
             }
-            if group.1.len() == MAX_RPROV_EVIDENCE_USAGES_PER_ARTIFACT {
-                return Err("one evidence artifact exceeds its usage limit".into());
-            }
             group.1.push(event_reference(envelope));
         }
     }
+    FinalizationLimitExceeded::check(
+        "recorded outside-change observations",
+        usage_count as u64,
+        MAX_RPROV_EVIDENCE_USAGES as u64,
+    )?;
+    FinalizationLimitExceeded::check(
+        "distinct outside-change evidence files",
+        grouped.len() as u64,
+        MAX_RPROV_EVIDENCE_PER_SEGMENT as u64,
+    )?;
+    FinalizationLimitExceeded::check(
+        "observations of one outside-change evidence file",
+        grouped
+            .values()
+            .map(|(_, usages)| usages.len() as u64)
+            .max()
+            .unwrap_or(0),
+        MAX_RPROV_EVIDENCE_USAGES_PER_ARTIFACT as u64,
+    )?;
     let mut refs = Vec::with_capacity(grouped.len());
     let mut inventory = Vec::with_capacity(grouped.len());
     let mut payloads = Vec::with_capacity(grouped.len());
@@ -1777,10 +2395,12 @@ fn capture_source_links(events: &[EventEnvelope]) -> Result<Vec<RprovSourceLink>
             }
             _ => {}
         }
-        if links.len() > MAX_RPROV_SOURCE_LINKS_PER_SEGMENT {
-            return Err("paste source links exceed the segment item limit".into());
-        }
     }
+    FinalizationLimitExceeded::check(
+        "recorded pastes",
+        links.len() as u64,
+        MAX_RPROV_SOURCE_LINKS_PER_SEGMENT as u64,
+    )?;
     Ok(links)
 }
 
@@ -2129,39 +2749,38 @@ fn validate_receipt_parts_inner(
         .segments
         .last()
         .ok_or("receipt has no terminal segment")?;
-    let complete_bytes = read_declared_payload(&payloads, &tip.events.entry)?;
-    let complete_events = decode_event_stream(&complete_bytes)?;
-    let (terminal, prefix_events) = complete_events
-        .split_last()
-        .ok_or("receipt event stream is empty")?;
-    let prefix_bytes = encode_event_stream(prefix_events)?;
-    let Event::SubmissionFinalized(finalized) = &terminal.event else {
-        return Err("receipt event stream has no SubmissionFinalized terminal".into());
-    };
-    if prefix_events.len() as u64 != binding.prefix_event_count
-        || prefix_events.last().map(|event| event.event_hash) != Some(binding.prefix_event_hash)
-        || prefix_bytes.len() as u64 != binding.prefix_byte_length
-        || rprov_raw_blake3(&prefix_bytes) != binding.prefix_blake3
-        || terminal.sequence != binding.terminal_event_count
-        || terminal.event_hash != binding.terminal_event_hash
-        || terminal.previous_event_hash != binding.prefix_event_hash
-        || finalized.event_count != binding.terminal_event_count
-        || finalized.final_workspace_hash != binding.final_tree_hash
-        || tip.inclusive_event_count != binding.terminal_event_count
-        || tip.last_event_hash != binding.terminal_event_hash
-        || tip.terminal_event_hash.known() != Some(&binding.terminal_event_hash)
-        || tip.final_tree_hash.known() != Some(&binding.final_tree_hash)
     {
-        return Err("receipt binding disagrees with the actual complete event stream".into());
-    }
-    let durable_prefix = owner.read_artifact(
-        PREFIX_EVENTS,
-        usize::try_from(binding.prefix_byte_length)
-            .unwrap_or(usize::MAX)
-            .min(MAX_RPROV_SEGMENT_EVENTS_BYTES as usize),
-    )?;
-    if durable_prefix != prefix_bytes {
-        return Err("durable prefix bytes differ from the complete event stream".into());
+        let complete_bytes = read_declared_payload(&payloads, &tip.events.entry)?;
+        let tail = complete_stream_tail(&complete_bytes)?;
+        let terminal = &tail.terminal;
+        let Event::SubmissionFinalized(finalized) = &terminal.event else {
+            return Err("receipt event stream has no SubmissionFinalized terminal".into());
+        };
+        if tail.prefix_event_count != binding.prefix_event_count
+            || tail.last_prefix_hash != Some(binding.prefix_event_hash)
+            || tail.prefix.len() as u64 != binding.prefix_byte_length
+            || rprov_raw_blake3(tail.prefix) != binding.prefix_blake3
+            || terminal.sequence != binding.terminal_event_count
+            || terminal.event_hash != binding.terminal_event_hash
+            || terminal.previous_event_hash != binding.prefix_event_hash
+            || finalized.event_count != binding.terminal_event_count
+            || finalized.final_workspace_hash != binding.final_tree_hash
+            || tip.inclusive_event_count != binding.terminal_event_count
+            || tip.last_event_hash != binding.terminal_event_hash
+            || tip.terminal_event_hash.known() != Some(&binding.terminal_event_hash)
+            || tip.final_tree_hash.known() != Some(&binding.final_tree_hash)
+        {
+            return Err("receipt binding disagrees with the actual complete event stream".into());
+        }
+        let durable_prefix = owner.read_artifact(
+            PREFIX_EVENTS,
+            usize::try_from(binding.prefix_byte_length)
+                .unwrap_or(usize::MAX)
+                .min(MAX_RPROV_SEGMENT_EVENTS_BYTES as usize),
+        )?;
+        if durable_prefix != tail.prefix {
+            return Err("durable prefix bytes differ from the complete event stream".into());
+        }
     }
     let initial_files = read_initial_workspace(&manifest, &payloads)?;
     let mut latest_final = None;
@@ -2239,15 +2858,15 @@ fn replay_segment(
     payloads: &[FinalizationPayload],
 ) -> Result<CheckpointSnapshot> {
     let event_bytes = read_declared_payload(payloads, &segment.events.entry)?;
-    let events = decode_event_stream(&event_bytes)?;
+    let mut events = event_records(&event_bytes)?;
     let initial_ref = segment
         .checkpoints
         .first()
         .ok_or("segment has no initial checkpoint")?;
     let initial = decode_checkpoint(&read_declared_payload(payloads, &initial_ref.entry)?)?;
-    let first = events.first().ok_or("segment event stream is empty")?;
+    let first = events.next().ok_or("segment event stream is empty")??;
     let mut replay = ReplayEngine::from_initial_checkpoint(StoredCheckpoint {
-        owning_event: first.clone(),
+        owning_event: first,
         snapshot: initial,
     })?;
     let checkpoints = segment
@@ -2256,8 +2875,9 @@ fn replay_segment(
         .map(|checkpoint| (checkpoint.owner.sequence, checkpoint))
         .collect::<BTreeMap<_, _>>();
     let mut final_snapshot = None;
-    for envelope in events.iter().skip(1) {
-        replay.apply(envelope)?;
+    for envelope in events {
+        let envelope = envelope?;
+        replay.apply(&envelope)?;
         if matches!(envelope.event, Event::WorkspaceCheckpoint(_)) {
             let declaration = checkpoints
                 .get(&envelope.sequence)
@@ -2265,7 +2885,7 @@ fn replay_segment(
             let snapshot =
                 decode_checkpoint(&read_declared_payload(payloads, &declaration.entry)?)?;
             let stored = StoredCheckpoint {
-                owning_event: envelope.clone(),
+                owning_event: envelope,
                 snapshot: snapshot.clone(),
             };
             replay.validate_checkpoint(&stored)?;
@@ -2466,18 +3086,15 @@ fn load_published_summary(
         return Err("terminal event-stream artifact differs from its source receipt".into());
     }
     validate_rprov_event_stream(&manifest, tip, &complete_bytes)?;
-    let complete_events = decode_event_stream(&complete_bytes)?;
-    let (terminal, prefix_events) = complete_events
-        .split_last()
-        .ok_or("receipt event stream is empty")?;
-    let prefix_bytes = encode_event_stream(prefix_events)?;
+    let tail = complete_stream_tail(&complete_bytes)?;
+    let terminal = &tail.terminal;
     let Event::SubmissionFinalized(finalized) = &terminal.event else {
         return Err("receipt event stream has no SubmissionFinalized terminal".into());
     };
-    if prefix_events.len() as u64 != binding.prefix_event_count
-        || prefix_events.last().map(|event| event.event_hash) != Some(binding.prefix_event_hash)
-        || prefix_bytes.len() as u64 != binding.prefix_byte_length
-        || rprov_raw_blake3(&prefix_bytes) != binding.prefix_blake3
+    if tail.prefix_event_count != binding.prefix_event_count
+        || tail.last_prefix_hash != Some(binding.prefix_event_hash)
+        || tail.prefix.len() as u64 != binding.prefix_byte_length
+        || rprov_raw_blake3(tail.prefix) != binding.prefix_blake3
         || terminal.sequence != binding.terminal_event_count
         || terminal.event_hash != binding.terminal_event_hash
         || terminal.previous_event_hash != binding.prefix_event_hash
@@ -2492,7 +3109,7 @@ fn load_published_summary(
             .unwrap_or(usize::MAX)
             .min(MAX_RPROV_SEGMENT_EVENTS_BYTES as usize),
     )?;
-    if durable_prefix != prefix_bytes {
+    if durable_prefix != tail.prefix {
         return Err("durable prefix bytes differ from the complete event stream".into());
     }
     let assignment_bytes = state.read_artifact("manifest.toml", METADATA_LIMIT)?;
@@ -2510,6 +3127,7 @@ fn load_published_summary(
         .iter()
         .map(|segment| segment.session_id.clone())
         .collect();
+    let chain = ChainTotals::of_manifest(&manifest);
     Ok(ReadOnlyFinalizationReceipt {
         student_id: manifest.student_id,
         latest_session_id: manifest.latest_session_id,
@@ -2517,6 +3135,7 @@ fn load_published_summary(
         terminal_chain_hash: binding.terminal_event_hash,
         aggregate_event_count: manifest.aggregate_event_count,
         ancestry_session_ids,
+        chain,
     })
 }
 
@@ -2982,6 +3601,7 @@ fn rebase_prefix_capture(
         publications: Vec::new(),
         prefix_bytes: read_declared_payload(&persisted.payloads, &persisted.segment.events.entry)?,
         initial_workspace: persisted.initial_workspace.clone(),
+        initial_files: BTreeMap::new(),
         final_workspace: BTreeMap::new(),
         gaps: persisted.gaps.clone(),
     })
@@ -3049,15 +3669,16 @@ fn replay_prefix_segment(
     segment: &RprovSegment,
     payloads: &[FinalizationPayload],
 ) -> Result<CheckpointSnapshot> {
-    let events = decode_event_stream(&read_declared_payload(payloads, &segment.events.entry)?)?;
-    let first = events.first().ok_or("segment event stream is empty")?;
+    let event_bytes = read_declared_payload(payloads, &segment.events.entry)?;
+    let mut events = event_records(&event_bytes)?;
+    let first = events.next().ok_or("segment event stream is empty")??;
     let initial_ref = segment
         .checkpoints
         .first()
         .ok_or("segment has no initial checkpoint")?;
     let initial = decode_checkpoint(&read_declared_payload(payloads, &initial_ref.entry)?)?;
     let mut replay = ReplayEngine::from_initial_checkpoint(StoredCheckpoint {
-        owning_event: first.clone(),
+        owning_event: first,
         snapshot: initial,
     })?;
     let checkpoints = segment
@@ -3066,8 +3687,9 @@ fn replay_prefix_segment(
         .map(|checkpoint| (checkpoint.owner.sequence, checkpoint))
         .collect::<BTreeMap<_, _>>();
     let mut boundary = None;
-    for envelope in events.iter().skip(1) {
-        replay.apply(envelope)?;
+    for envelope in events {
+        let envelope = envelope?;
+        replay.apply(&envelope)?;
         if matches!(envelope.event, Event::WorkspaceCheckpoint(_)) {
             let declaration = checkpoints
                 .get(&envelope.sequence)
@@ -3075,7 +3697,7 @@ fn replay_prefix_segment(
             let snapshot =
                 decode_checkpoint(&read_declared_payload(payloads, &declaration.entry)?)?;
             replay.validate_checkpoint(&StoredCheckpoint {
-                owning_event: envelope.clone(),
+                owning_event: envelope,
                 snapshot: snapshot.clone(),
             })?;
             boundary = Some(snapshot);
@@ -3352,19 +3974,24 @@ fn validate_current_journal(
     if encode_event_stream(&events[..prefix_count])? != expected_bytes {
         return Err("local journal prefix differs from the immutable recovery capture".into());
     }
-    let checkpoints = read_all_checkpoints(&mut journal, &persisted.segment.session_id)?;
-    if checkpoints.len() != persisted.segment.checkpoints.len() {
+    journal.verify_session_checkpoints(&persisted.segment.session_id)?;
+    let mut checkpoints = JournalCheckpoints::new(&mut journal, &persisted.segment.session_id)?;
+    let declarations = &persisted.segment.checkpoints;
+    if checkpoints.totals.count != declarations.len() as u64 {
         return Err("local checkpoint count differs from the immutable recovery capture".into());
     }
-    for (stored, declaration) in checkpoints.iter().zip(&persisted.segment.checkpoints) {
+    checkpoints.for_each(|index, stored| {
+        let declaration = declarations
+            .get(index)
+            .ok_or("local checkpoint count differs from the immutable recovery capture")?;
         let bytes = read_declared_payload(&persisted.payloads, &declaration.entry)?;
         if declaration.owner != event_reference(&stored.owning_event)
             || encode_checkpoint(&stored.snapshot)? != bytes
         {
             return Err("local checkpoint differs from the immutable recovery capture".into());
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn artifact_exists(owner: &PinnedJournalFile, name: &str) -> Result<bool> {
@@ -3405,7 +4032,10 @@ fn read_payload_source(payload: &FinalizationPayload) -> Result<Vec<u8>> {
     if !before.is_file() || before.len() != payload.byte_length {
         return Err(format!("receipt payload {} has changed size/type", payload.entry).into());
     }
-    let mut bytes = Vec::with_capacity(maximum.min(1024 * 1024));
+    // The length was just checked against the open file, so one exact
+    // allocation holds it; growing by doubling would leave each larger
+    // stream's intermediate buffers resident.
+    let mut bytes = Vec::with_capacity(maximum.saturating_add(1));
     file.take(payload.byte_length.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() != maximum || rprov_raw_blake3(&bytes) != payload.blake3 {
@@ -3425,9 +4055,10 @@ fn read_declared_payload(payloads: &[FinalizationPayload], entry: &str) -> Resul
 
 fn read_all_events(journal: &mut Journal, session_id: &SessionId) -> Result<Vec<EventEnvelope>> {
     let chain = journal.verify_session_chain(session_id)?;
-    if chain.event_count == 0 || chain.event_count > MAX_RPROV_EVENTS {
-        return Err("journal event count is outside finalization limits".into());
+    if chain.event_count == 0 {
+        return Err("journal has no events to finalize".into());
     }
+    FinalizationLimitExceeded::check("recorded events", chain.event_count, MAX_RPROV_EVENTS)?;
     let capacity =
         usize::try_from(chain.event_count).map_err(|_| "event count does not fit usize")?;
     let mut result = Vec::with_capacity(capacity.min(MAX_EVENTS_PER_READ));
@@ -3446,69 +4077,95 @@ fn read_all_events(journal: &mut Journal, session_id: &SessionId) -> Result<Vec<
     Ok(result)
 }
 
-fn read_all_checkpoints(
-    journal: &mut Journal,
-    session_id: &SessionId,
-) -> Result<Vec<StoredCheckpoint>> {
-    let verified = journal.verify_session_checkpoints(session_id)?;
-    if verified.checkpoint_count == 0
-        || verified.checkpoint_count as usize > MAX_RPROV_CHECKPOINTS_PER_SEGMENT
-    {
-        return Err("checkpoint count is outside finalization limits".into());
-    }
-    let mut result = Vec::with_capacity(verified.checkpoint_count as usize);
-    let mut next = 1_u64;
-    loop {
-        let page = journal.list_checkpoints(session_id, next, MAX_CHECKPOINTS_PER_READ)?;
-        if page.is_empty() {
-            break;
-        }
-        next = page
-            .last()
-            .and_then(|checkpoint| checkpoint.owning_event.sequence.checked_add(1))
-            .ok_or("checkpoint sequence overflow")?;
-        result.extend(page);
-    }
-    if result.len() as u64 != verified.checkpoint_count {
-        return Err("checkpoint listing differs from its verified count".into());
-    }
-    Ok(result)
-}
-
+/// Encodes the stream into one exactly sized buffer: its size is measured
+/// first, both to check the segment limit before allocating and because
+/// growing a large buffer by doubling leaves the smaller copies resident.
 fn encode_event_stream(events: &[EventEnvelope]) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
+    let mut length = 0_u64;
     for event in events {
-        let encoded = encode_envelope(event)?;
-        let new_length = bytes
-            .len()
-            .checked_add(encoded.len())
-            .and_then(|length| length.checked_add(1))
+        length = length
+            .checked_add(encode_envelope(event)?.len() as u64 + 1)
             .ok_or("event stream byte count overflow")?;
-        if new_length as u64 > MAX_RPROV_SEGMENT_EVENTS_BYTES {
-            return Err("event stream exceeds its bounded segment limit".into());
-        }
-        bytes.extend_from_slice(&encoded);
+    }
+    FinalizationLimitExceeded::check(
+        "bytes of recorded events",
+        length,
+        MAX_RPROV_SEGMENT_EVENTS_BYTES,
+    )?;
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(length).map_err(|_| "event stream exceeds usize")?);
+    for event in events {
+        bytes.extend_from_slice(&encode_envelope(event)?);
         bytes.push(b'\n');
+    }
+    if bytes.len() as u64 != length {
+        return Err("event stream encoding is not deterministic".into());
     }
     Ok(bytes)
 }
 
 fn decode_event_stream(bytes: &[u8]) -> Result<Vec<EventEnvelope>> {
+    event_records(bytes)?.collect()
+}
+
+/// Decodes one record at a time, so a replay holds one decoded event rather
+/// than the whole stream.
+fn event_records(bytes: &[u8]) -> Result<impl Iterator<Item = Result<EventEnvelope>> + '_> {
     let framed = bytes
         .strip_suffix(b"\n")
         .ok_or("event stream is missing its final LF")?;
     if framed.is_empty() {
         return Err("event stream is empty".into());
     }
-    framed
-        .split(|byte| *byte == b'\n')
-        .map(
-            |line| match decode_envelope(line, DecodePolicy::RejectUnsupported)? {
-                DecodeOutcome::Decoded(event) => Ok(event),
-                DecodeOutcome::Skipped(_) => Err("unsupported event was not rejected".into()),
-            },
-        )
-        .collect()
+    Ok(framed.split(|byte| *byte == b'\n').map(decode_event_record))
+}
+
+fn decode_event_record(line: &[u8]) -> Result<EventEnvelope> {
+    match decode_envelope(line, DecodePolicy::RejectUnsupported)? {
+        DecodeOutcome::Decoded(event) => Ok(event),
+        DecodeOutcome::Skipped(_) => Err("unsupported event was not rejected".into()),
+    }
+}
+
+/// The binding facts of a complete event stream. The caller has already
+/// validated every record as its own canonical encoding, so the prefix is
+/// exactly the bytes before the terminal record and only the last two
+/// records need decoding.
+struct CompleteStreamTail<'a> {
+    prefix: &'a [u8],
+    prefix_event_count: u64,
+    last_prefix_hash: Option<Hash>,
+    terminal: EventEnvelope,
+}
+
+fn complete_stream_tail(bytes: &[u8]) -> Result<CompleteStreamTail<'_>> {
+    let last_record = |framed: &[u8]| {
+        framed
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1)
+    };
+    let framed = bytes
+        .strip_suffix(b"\n")
+        .ok_or("event stream is missing its final LF")?;
+    if framed.is_empty() {
+        return Err("receipt event stream is empty".into());
+    }
+    let terminal_start = last_record(framed);
+    let terminal = decode_event_record(&framed[terminal_start..])?;
+    let prefix = &bytes[..terminal_start];
+    let last_prefix_hash = match prefix.strip_suffix(b"\n") {
+        Some(framed_prefix) => {
+            Some(decode_event_record(&framed_prefix[last_record(framed_prefix)..])?.event_hash)
+        }
+        None => None,
+    };
+    Ok(CompleteStreamTail {
+        prefix,
+        prefix_event_count: prefix.iter().filter(|byte| **byte == b'\n').count() as u64,
+        last_prefix_hash,
+        terminal,
+    })
 }
 
 fn event_reference(event: &EventEnvelope) -> RecordedEventRef {

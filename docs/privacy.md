@@ -209,7 +209,11 @@ original starter files, exact event streams, full checkpoints, runtime metadata,
 and referenced recovery evidence. Runtime
 metadata includes the selected toolchain, probe commands, bounded probe output,
 statuses, and remediation text. Its schema is in
-[`src/toolchain.rs`](../src/toolchain.rs). Rustrace validates the package
+[`src/toolchain.rs`](../src/toolchain.rs). Each `rustrace work` start records
+one observation, and an attempt carries at most 64: all of them up to that
+number; otherwise the first, the last, and each one whose whole report differs
+from the launch before it; and if those are still more than 64, the first and
+the 63 most recent of them. Rustrace validates the package
 inventory and byte totals against fixed version 1 format limits.
 
 Each revised bundle is self-contained: it includes all prior recorded attempts
