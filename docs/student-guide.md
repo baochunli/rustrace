@@ -776,6 +776,8 @@ cargo run --release
 cargo run < input.txt
 cargo run > output.txt
 cargo run --release < input.txt > output.txt
+cargo run -- ARG...
+cargo run --release -- ARG... < input.txt > output.txt
 ```
 
 For `cargo test`, brackets mark optional groups; do not type the brackets.
@@ -828,13 +830,31 @@ update: older readers reject recordings containing the new Test arguments.
 Existing `.rta` packages need no changes, and updated readers still accept
 older recordings.
 
+The complete `cargo run` form is
+`cargo run [--release] [-- ARG...] [< IN] [> OUT]`; brackets mark optional
+parts. Everything after `--` is passed to your program as its arguments, one
+argument per space-separated word, exactly as typed: `cargo run -- -n fn main`
+gives your program the three arguments `-n`, `fn`, and `main`. Words such as
+`--release` or a second `--` after the separator are arguments too. Give at
+least one argument after `--`; at most 64 are allowed, each up to 1024 bytes.
+Because there is no quoting, one argument cannot contain a space. The first
+word that is exactly `<` or `>` ends the arguments and starts the
+redirections, which therefore always come last: `cargo run -- a < in.txt`
+works, and `cargo run < in.txt -- a` is rejected. An argument may not contain
+`<` or `>`. A version 3 case's `NAME.args` file can hold arguments with spaces,
+which the console cannot type. Your program's arguments are recorded with the
+command; the lines you type as its standard input are not.
+
 Redirections are allowed only for `cargo run`. Their paths are relative to a
-directory named `test-cases` that sits next to your workspace directory, and
-each may appear once. Quotes, pipes, wildcards, and other shell characters are
-rejected. A line is limited to 4096 bytes, including surrounding spaces.
-Leading, trailing, and repeated ASCII spaces are allowed; tabs and newlines
-are rejected. If the output file already exists, the console asks before
-overwriting: Y or Enter overwrites, N or Esc cancels and leaves the file alone.
+directory named `test-cases` that sits next to your workspace directory, or to
+the workspace's own test-case folder such as `lab2.test-cases` for a version 3
+assignment, and each may appear once. In a version 3 test-case folder, `> OUT`
+cannot replace `.rustrace-cases.json` or write into `files/`. Quotes, pipes,
+wildcards, and other shell characters are rejected. A line is limited to 4096
+bytes, including surrounding spaces. Leading, trailing, and repeated ASCII
+spaces are allowed; tabs and newlines are rejected. If the output file already
+exists, the console asks before overwriting: Y or Enter overwrites, N or Esc
+cancels and leaves the file alone.
 
 When `cargo run` starts without an input redirect, the prompt line becomes the
 program's standard input. Type a line and press Enter to send it; the console
@@ -891,7 +911,11 @@ while they run. If the picker was opened over the Console view, closing its
 final reopened modal restores that view. A
 selected case uses the same prepared, policy-checked, limited, and recorded
 Cargo action as typing `cargo run < NAME.in` in the console, apart from its
-shorter deadline. Every completed
+shorter deadline. A version 3 case reads its `NAME.args` and `NAME.in` when it
+starts, so a case behaves like `cargo run -- ARG... < NAME.in` from the
+[folder described above](#where-a-version-3-program-runs). Its `NAME.in` bytes
+are read first and reach your program through a pipe, not as a file, and a
+case without `NAME.in` runs with standard input closed. Every completed
 picker run records one `test_case_compared` event immediately after its
 controlled command finishes. That event retains the command ID, case name,
 expected BLAKE3 digest, optional actual BLAKE3 digest, and typed result.
@@ -927,6 +951,32 @@ happens outside Rustrace.
 Pasting into the console or test-case picker is blocked and recorded the same
 way as in the editor. The record shows only what happened inside Rustrace; it
 cannot show how files you produced elsewhere were made.
+
+### Where a version 3 program runs
+
+A version 3 package with a `test-cases/files/` folder deploys it as
+`files/` inside the workspace's test-case folder, for example
+`lab2.test-cases/files`. Every `cargo run` in such an assignment starts your
+program in that folder: a case run from the picker, a `cargo run` typed in the
+console with or without arguments, and the menu's Run. A program therefore
+opens the case's files by the same relative names that its arguments and
+expected output use. Typing a case's arguments and input in the console, such
+as `cargo run -- -n main < NAME.in`, runs the program the same way, except that
+the console cannot type an argument containing a space. Cargo still builds your workspace into its own `target` folder;
+the recorded command adds `--manifest-path ../../WORKSPACE/Cargo.toml`, which
+names only your workspace folder. Other commands, such as `cargo check` and
+`cargo test`, still run in the workspace. A version 3 package without `files/`,
+and every version 1 or 2 assignment, runs programs in the workspace as before.
+
+Before each such Run, Rustrace checks the folder against the package and
+records its fixture hash. If you changed, added, or removed a file there, the
+program still runs with the files as they are, and a warning says so; a
+picker case run this way will not verify against the package. To restore the
+packaged files, remove the files you changed or added, then quit and resume the
+workspace, which puts back any missing packaged file. If `files/` itself is
+missing, the Run is refused until you resume. A `.cargo` folder or file in the
+workspace, in the test-case folder, or in `files/` is also refused, because
+Cargo would read it as configuration for some commands and not others.
 
 ## Use an external debugger
 
