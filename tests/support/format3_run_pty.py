@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Run a format 3 packaged case and console Runs end to end in a real workspace.
+"""Run format 3 packaged cases and console Runs end to end in a real workspace.
 
-The F4 picker lists every case with a `.expected`, including `quiet`, which
-has no `.in`, and runs the `echo` case: its arguments, hashed input, and the
-fixture working directory. The console runs `cargo run -- ARG...` from the
-fixture folder, a changed fixture tree shows a warning toast, and a workspace
-`.cargo` is refused.
+The F4 picker lists every case with a `.expected`, including `quiet` and
+`touch`, which have no `.in`, and shows the selected case's arguments, input,
+fixture files and result. It runs the `echo` case (its arguments, hashed
+input, and the fixture working directory), then Run all across the three
+cases; `touch` adds a file to the fixture folder, which the reopened picker
+reports as changed. The console runs `cargo run -- ARG...` from the fixture
+folder, a changed fixture tree shows in the picker before a run and as a
+warning toast, and a workspace `.cargo` is refused.
 """
 import errno
 import fcntl
@@ -81,6 +84,10 @@ def fake_tool():
         log.write(json.dumps({"cwd": str(cwd), "args": program_args, "stdin": kind}) + "\n")
     value = b"" if kind == "console" else sys.stdin.buffer.read()
     data = (cwd / "data.txt").read_bytes()
+    if "--touch" in program_args:
+        # A program that writes into the folder it runs in changes the
+        # fixtures for every later run.
+        (cwd / "touched.txt").write_bytes(b"touched\n")
     os.write(1, (
         f"cwd={cwd.parent.name}/{cwd.name}\nargs={'|'.join(program_args)}\nstdin={kind}:"
     ).encode() + value + b"\ndata=" + data)
@@ -131,6 +138,8 @@ entries = [
     ("test-cases/echo.expected", expected),
     ("test-cases/quiet.args", b"--quiet\n"),
     ("test-cases/quiet.expected", b"cwd=lab.test-cases/files\nargs=--quiet\nstdin=closed:\ndata=" + data),
+    ("test-cases/touch.args", b"--touch\n"),
+    ("test-cases/touch.expected", b"cwd=lab.test-cases/files\nargs=--touch\nstdin=closed:\ndata=" + data),
     ("test-cases/files/data.txt", data),
 ]
 package = root / "lab.rta"
@@ -296,22 +305,71 @@ try:
     assert (folder / ".rustrace-cases.json").is_file()
     assert (files / "data.txt").read_bytes() == data
 
-    # F4 runs the `echo` case: its arguments, its hashed input through a
-    # pipe, and the fixture folder as the working directory.
+    # F4 lists every case, shows what the selected `echo` runs with, and
+    # runs it: its arguments, its hashed input through a pipe, and the
+    # fixture folder as the working directory.
     send(b"\x1b[14~")
     wait_for(
-        lambda: all(value in rendered_screen() for value in ["Test cases", "echo", "Run all"]),
-        "picker",
+        lambda: all(
+            value in rendered_screen()
+            for value in [
+                "Test cases", "echo", "quiet", "touch", "Run all",
+                "Arguments  «-i» «two words»",
+                "Input      echo.in (6 bytes)",
+                "Runs in    lab.test-cases/files (1 file)",
+                "Files      data.txt",
+                "Result     not run yet",
+            ]
+        ),
+        "picker with the echo detail",
     )
-    assert "quiet" in rendered_screen(), "the picker lists a case without .in"
+    assert "changed from the package" not in rendered_screen()
     send(b"\r")
     wait_for(
         lambda: len(runs()) == 1
         and " TEST CASES " in rendered_screen()
-        and "PASS" in rendered_screen(),
+        and "Result     PASS" in rendered_screen(),
         "echo PASS in the reopened picker",
     )
     assert runs()[0] == {"cwd": str(files), "args": ["-i", "two words"], "stdin": "pipe"}, runs()
+
+    # A case without `.in` runs with standard input closed.
+    send(b"\x1b[B")
+    wait_for(
+        lambda: "Arguments  «--quiet»" in rendered_screen()
+        and "Input      no input (stdin closed)" in rendered_screen(),
+        "quiet detail",
+    )
+
+    # Run all runs the three cases in order with the same arguments, closed
+    # stdin and fixture folder. `touch` adds a file there, so the reopened
+    # picker says the fixtures changed; removing it and refreshing clears that.
+    send(b"\x1b[B\x1b[B")
+    wait_for(
+        lambda: "Results    3 cases: 1 PASS, 0 FAIL, 0 ERROR, 2 not run yet" in rendered_screen(),
+        "Run all tally",
+    )
+    send(b"\r")
+    wait_for(
+        lambda: len(runs()) == 4
+        and " TEST CASES " in rendered_screen()
+        and "Results    3 cases: 3 PASS, 0 FAIL, 0 ERROR, 0 not run yet" in rendered_screen()
+        and "changed from the package; runs with them will not verify" in rendered_screen()
+        and "Runs in    lab.test-cases/files (2 files)" in rendered_screen(),
+        "Run all PASS with the touched fixtures",
+    )
+    assert runs()[1:] == [
+        {"cwd": str(files), "args": ["-i", "two words"], "stdin": "pipe"},
+        {"cwd": str(files), "args": ["--quiet"], "stdin": "closed"},
+        {"cwd": str(files), "args": ["--touch"], "stdin": "closed"},
+    ], runs()
+    (files / "touched.txt").unlink()
+    send(b"r")
+    wait_for(
+        lambda: "Runs in    lab.test-cases/files (1 file)" in rendered_screen()
+        and "changed from the package" not in rendered_screen(),
+        "refreshed fixtures match the package again",
+    )
     send(b"\x1b")
     wait_for(lambda: " TEST CASES " not in rendered_screen(), "picker closed")
     time.sleep(0.3)
@@ -322,12 +380,12 @@ try:
     # Nothing expands arguments: `*` and `$` reach the program as typed.
     type_console("cargo run -- --console a*b $HOME")
     wait_for(
-        lambda: len(runs()) == 2
+        lambda: len(runs()) == 5
         and "cwd=lab.test-cases/files" in rendered_screen()
         and "args=--console|a*b|$HOME" in rendered_screen(),
         "console Run output",
     )
-    assert runs()[1] == {
+    assert runs()[4] == {
         "cwd": str(files), "args": ["--console", "a*b", "$HOME"], "stdin": "console"
     }, runs()
     wait_console_idle("first console Run finished")
@@ -340,17 +398,25 @@ try:
     wait_for(lambda: " CONSOLE " not in rendered_screen(), "console closed")
     time.sleep(0.3)
 
-    # A changed fixture tree still runs, and the student sees why its result
-    # will not verify.
+    # A changed fixture tree shows in the picker before a run, still runs,
+    # and the student sees why its result will not verify.
     (files / "data.txt").write_bytes(b"student edit\n")
     offset = len(transcript)
     send(b"\x1b[14~")
-    wait_for(lambda: " TEST CASES " in rendered_screen(), "picker reopened")
+    wait_for(
+        lambda: " TEST CASES " in rendered_screen()
+        and "Arguments  «-i» «two words»" in rendered_screen()
+        and "changed from the package; a run with them will not verify" in rendered_screen(),
+        "picker reopened on echo with the changed-fixtures warning",
+    )
     send(b"\r")
     wait_for(
-        lambda: len(runs()) == 3
+        lambda: len(runs()) == 6
         and " TEST CASES " in rendered_screen()
         and "FAIL line 5" in rendered_screen()
+        and "Result     FAIL at line 5" in rendered_screen()
+        and 'expected (17 bytes) "data=fixture data"' in rendered_screen()
+        and 'got (17 bytes) "data=student edit"' in rendered_screen()
         and "● warning" in toast_text_since(offset)
         and "warning: the files in lab.test-cases/files differ from the assignment package; "
         "the case runs with them as they are and will not verify against the package"
@@ -366,7 +432,7 @@ try:
     wait_for(lambda: " CONSOLE " in rendered_screen(), "console again")
     type_console("cargo run -- --console x")
     wait_for(
-        lambda: len(runs()) == 4
+        lambda: len(runs()) == 7
         and "data=student edit" in rendered_screen()
         and "● warning" in toast_text_since(offset)
         and "differ from the assignment package; your program runs with them as they are"
@@ -387,7 +453,7 @@ try:
         "workspace .cargo refusal",
     )
     time.sleep(0.3)
-    assert len(runs()) == 4, runs()
+    assert len(runs()) == 7, runs()
     send(b"\x7f" * len("cargo run -- --console y"))
     wait_for(lambda: "> ▏" in rendered_screen(), "empty prompt again")
     send(b"\x1b")
@@ -407,7 +473,7 @@ try:
     )
     assert "Command unavailable" not in toast_text_since(offset)
     time.sleep(0.3)
-    assert len(runs()) == 4, runs()
+    assert len(runs()) == 7, runs()
     (workspace / ".cargo").rmdir()
     send(b"\x1b")
     wait_for(lambda: " CONSOLE " not in rendered_screen(), "console closed after refusal")
@@ -418,8 +484,8 @@ try:
     send(b"\x1b[18~")
     wait_for(lambda: " MENU " in rendered_screen(), "command menu")
     send(b"\x1b[B\r")
-    wait_for(lambda: len(runs()) == 5 and " CONSOLE " in rendered_screen(), "menu Run")
-    assert runs()[4] == {"cwd": str(files), "args": [], "stdin": "pipe"}, runs()
+    wait_for(lambda: len(runs()) == 8 and " CONSOLE " in rendered_screen(), "menu Run")
+    assert runs()[7] == {"cwd": str(files), "args": [], "stdin": "pipe"}, runs()
     wait_for(lambda: "ctrl-c stop" in rendered_screen(), "running menu Run")
     send(b"\x03")
     wait_console_idle("menu Run stopped")
@@ -448,45 +514,68 @@ try:
         event["payload"] for event in events
         if event["type"] == "controlled_command_started" and "console" in event["payload"]
     ]
-    assert len(starts) == 5, starts
+    assert len(starts) == 8, starts
     fixtures = {"kind": "fixtures", "fixtures_blake3": packaged}
-    assert starts[0]["console"] == {
+    echo_route = {
         "stdin": {"kind": "file", "path": "echo.in"},
         "stdout": {"kind": "console"},
         "args": ["-i", "two words"],
         "working_directory": fixtures,
         "test_case": "echo",
-    }, starts[0]
+    }
+    assert starts[0]["console"] == echo_route, starts[0]
     assert starts[0]["argv"][4:] == [
         "run", "--locked", "--manifest-path", "../../lab.work/Cargo.toml", "--", "-i", "two words"
     ], starts[0]["argv"]
-    assert starts[1]["console"] == {
+    # Run all: echo, then the two cases without `.in`, with stdin closed.
+    assert starts[1]["console"] == echo_route, starts[1]
+    for start, name in [(starts[2], "quiet"), (starts[3], "touch")]:
+        assert start["console"] == {
+            "stdin": {"kind": "closed"},
+            "stdout": {"kind": "console"},
+            "args": [f"--{name}"],
+            "working_directory": fixtures,
+            "test_case": name,
+        }, start
+        assert start["argv"][4:] == [
+            "run", "--locked", "--manifest-path", "../../lab.work/Cargo.toml", "--", f"--{name}"
+        ], start["argv"]
+    assert starts[4]["console"] == {
         "stdin": {"kind": "submitted"},
         "stdout": {"kind": "console"},
         "args": ["--console", "a*b", "$HOME"],
         "working_directory": fixtures,
-    }, starts[1]
-    changed = starts[2]["console"]["working_directory"]["fixtures_blake3"]
+    }, starts[4]
+    changed = starts[5]["console"]["working_directory"]["fixtures_blake3"]
     assert changed != packaged
-    assert starts[3]["console"]["working_directory"]["fixtures_blake3"] == changed
-    assert starts[4]["console"] == {
+    assert starts[6]["console"]["working_directory"]["fixtures_blake3"] == changed
+    assert starts[7]["console"] == {
         "stdin": {"kind": "submitted"},
         "stdout": {"kind": "console"},
         "working_directory": fixtures,
-    }, starts[4]
-    assert starts[4]["argv"][4:] == [
+    }, starts[7]
+    assert starts[7]["argv"][4:] == [
         "run", "--locked", "--manifest-path", "../../lab.work/Cargo.toml"
-    ], starts[4]["argv"]
+    ], starts[7]["argv"]
     comparisons = [event["payload"] for event in events if event["type"] == "test_case_compared"]
-    assert [comparison["outcome"]["kind"] for comparison in comparisons] == ["pass", "mismatch"]
-    assert comparisons[0]["invocation"]["fixtures_blake3"] == packaged
+    assert [comparison["outcome"]["kind"] for comparison in comparisons] == [
+        "pass", "pass", "pass", "pass", "mismatch"
+    ]
+    assert [comparison["case"] for comparison in comparisons] == [
+        "echo", "echo", "quiet", "touch", "echo"
+    ]
+    for comparison in comparisons[:4]:
+        assert comparison["invocation"]["fixtures_blake3"] == packaged, comparison
     assert comparisons[0]["invocation"]["stdin"]["kind"] == "file"
-    assert comparisons[1]["invocation"]["fixtures_blake3"] == changed
+    assert comparisons[2]["invocation"]["stdin"] == {"kind": "closed"}
+    assert comparisons[3]["invocation"]["stdin"] == {"kind": "closed"}
+    assert comparisons[4]["invocation"]["fixtures_blake3"] == changed
 
     success = True
     print(
-        "format 3 run PTY: picker case with arguments and fixtures, console arguments, "
-        "changed-fixture warnings, typed and menu .cargo refusals, menu Run, and provenance passed"
+        "format 3 run PTY: picker listing and detail, a case with arguments and fixtures, "
+        "closed-stdin cases, Run all, console arguments, changed-fixture indicator and "
+        "warnings, typed and menu .cargo refusals, menu Run, and provenance passed"
     )
 finally:
     (root / "format3-run-transcript.bin").write_bytes(transcript)
