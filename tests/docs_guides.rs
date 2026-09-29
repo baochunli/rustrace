@@ -116,6 +116,25 @@ fn student_guide_explains_packaged_test_case_placement_and_collisions() {
 }
 
 #[test]
+fn student_guide_explains_what_the_picker_shows_for_version_3_cases() {
+    let guide = unwrapped(&read_doc("student-guide.md"));
+    for wording in [
+        "for a version 3 assignment, it lists every case that has a `NAME.expected`, including cases without `NAME.in`",
+        "### Version 3 cases in the picker",
+        "each between `«` and `»`",
+        "appear as escapes such as `\\u{202e}`",
+        "`no input (stdin closed)`",
+        "`changed from the package; a run with them will not verify`",
+        "Do not edit, add, or remove files in the fixture folder",
+        "The console's `cargo run` already starts in the same folder as the case.",
+        "`cargo run -- -n fn tests/grep.md < grep_n.in`",
+        "A backslash does not escape a space either: `cargo run -- a\\ b` passes the two arguments `a\\` and `b`.",
+    ] {
+        assert!(guide.contains(wording), "student guide must say: {wording}");
+    }
+}
+
+#[test]
 fn every_live_git_install_command_pins_the_toolchain_tag_and_package() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();

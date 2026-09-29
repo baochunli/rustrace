@@ -845,8 +845,9 @@ passes `a*b`, not a list of matching files; `cargo run -- $HOME` passes the
 five characters `$HOME`; and `cargo run -- fn(x) tests/grep.md` passes
 `fn(x)` and `tests/grep.md`. Quoting and pipes are not supported: an argument
 may not contain `'`, `"`, or a backtick, nor `|`, `&`, `;`, `<`, or `>`, and
-because there is no quoting, one argument cannot contain a space. The first
-word that is exactly `<` or `>` ends the arguments and starts the
+because there is no quoting, one argument cannot contain a space. A backslash
+does not escape a space either: `cargo run -- a\ b` passes the two arguments
+`a\` and `b`. The first word that is exactly `<` or `>` ends the arguments and starts the
 redirections, which therefore always come last: `cargo run -- a < in.txt`
 works, and `cargo run < in.txt -- a` is rejected. A version 3 case's
 `NAME.args` file can hold any of these characters, and spaces, which the
@@ -897,14 +898,18 @@ limit stops the command. The existing deadline (at most five minutes) and Esc
 or Ctrl-C cancellation also apply to filtered tests and every output option. Esc returns
 to the workspace view.
 
-F4 or the Test cases menu entry opens a modal test-case picker. It lists complete
-`.in`/`.expected` paired cases in bytewise name order and ends with a `Run all`
-row. Each case shows `—`, `PASS`, `FAIL line N`, or `ERROR` for its last result
-in this session. Up and Down select with wrapping; mouse hover or a single click
-also selects. Enter or a double-click runs the selection, R refreshes pairs from
-the sibling directory, and Esc closes the picker. A version 1 assignment with no
-sibling directory says that no packaged test cases are available; missing
-packaged data for a version 2 assignment is reported as unavailable.
+F4 or the Test cases menu entry opens a modal test-case picker. For a version 1
+or 2 assignment, it lists complete `.in`/`.expected` paired cases; for a
+version 3 assignment, it lists every case that has a `NAME.expected`, including
+cases without `NAME.in`. Cases appear in bytewise name order, and the list ends
+with a `Run all` row. Each case shows `—`, `PASS`, `FAIL line N`, or `ERROR` for
+its last result in this session. Up and Down select with wrapping; mouse hover
+or a single click also selects. Enter or a double-click runs the selection, R
+refreshes the list from the test-case folder, and Esc closes the picker. A
+version 1 assignment with no sibling directory says that no packaged test cases
+are available; missing packaged data for a version 2 or 3 assignment is
+reported as unavailable. A version 3 picker also shows what the selected case
+runs with, as [described below](#version-3-cases-in-the-picker).
 
 The picker closes before a run starts and reopens after the run or queue
 finishes. The output pane shows the controlled command and then one test-case
@@ -960,6 +965,79 @@ happens outside Rustrace.
 Pasting into the console or test-case picker is blocked and recorded the same
 way as in the editor. The record shows only what happened inside Rustrace; it
 cannot show how files you produced elsewhere were made.
+
+### Version 3 cases in the picker
+
+In a version 3 assignment, the picker is larger and shows, under the list,
+what the selected row runs with, one labelled row per fact:
+
+```text
+Arguments  «-n» «fn main» «tests/grep.md»
+Input      no input (stdin closed)
+Runs in    lab2.test-cases/files (3 files)
+Files      tests/grep.md
+           tests/recursive/grep.md
+           tests/recursive/notes.md
+Result     FAIL at line 2
+           expected (14 bytes) "3:fn main() {}"
+           got (0 bytes) ""
+```
+
+- **Arguments** are the lines of `NAME.args`, in order, each between `«` and
+  `»`. The marks are not part of the argument; they show where it starts and
+  ends, so a space inside an argument or at either end is visible. Control
+  characters, invisible and zero-width characters such as U+200B, characters
+  that change the direction of text such as U+202E, whitespace other than an
+  ordinary space such as U+00A0, and the marks themselves appear as escapes
+  such as `\u{202e}`. Every other character, including `\`, quotes, `*`, and
+  `$`, appears as itself and reaches your program unchanged. A case without
+  `NAME.args` shows `none`. If `NAME.args` cannot be read, the row says why, and
+  running the case reports `ERROR (could not start: ...)`.
+- **Input** is `NAME.in` with its size, or `no input (stdin closed)` for a case
+  without it.
+- **Runs in** is the folder your program starts in, such as
+  `lab2.test-cases/files`, with its number of files; see [where a version 3
+  program runs](#where-a-version-3-program-runs). If the package has no fixture
+  files, it names your workspace folder instead.
+- **Files** lists the files in that folder, relative to it and as they are on
+  disk now, in name order. Every case in the assignment runs with the same
+  files. When the list does not fit, it ends with `… and N more`; a taller
+  terminal shows more of it.
+- **Result** is `not run yet`, `PASS`, `FAIL at line N` followed by the expected
+  and actual previews that the output pane shows, or `ERROR` with its reason.
+
+When `Run all` is selected, the picker shows the folder, its files, and a tally
+such as `3 cases: 2 PASS, 1 FAIL, 0 ERROR, 0 not run yet`.
+
+If the files in the folder differ from the package, a yellow row under
+**Runs in** says `changed from the package; a run with them will not verify`,
+so you see it before you run a case. The picker reads the folder when it opens,
+when you press R, and when it reopens after a run, so it also reports files
+that your own program created or changed there. Do not edit, add, or remove
+files in the fixture folder: the cases' expected output was written for the
+packaged files, and a case run with changed files still runs but will not
+verify against the package. To restore the files, remove the files you changed
+or added, then quit and resume the workspace.
+
+The list keeps about two fifths of the picker and at least three rows, and
+scrolls when there are more cases; the details use the rest, which is about
+ten rows in an 80x24 terminal. When rows are short, the result,
+the first row of arguments, the folder and any changed-files warning come
+first, then the input and the first file, then the rest of the result, up to
+three rows of arguments, and the remaining files. Arguments that do not fit end
+with `… N arguments`, where N counts them all.
+
+To reproduce a case in the F9 console, type its arguments after `cargo run --`,
+separated by spaces and without the marks, and add `< NAME.in` if the case has
+input. The console's `cargo run` already starts in the same folder as the case.
+For the case shown above, `cargo run -- -n fn main tests/grep.md` would not be
+the same: `fn main` is one argument with a space, which the console cannot
+type, because it has no quoting and a backslash does not escape a space. A
+case such as `«-n» «fn» «tests/grep.md»` with input `grep_n.in` is typed as
+`cargo run -- -n fn tests/grep.md < grep_n.in`. Without `< NAME.in`, the
+console gives your program the prompt as its standard input rather than
+closing it, so a program that reads standard input waits for you to type;
+Ctrl-C stops it.
 
 ### Where a version 3 program runs
 
