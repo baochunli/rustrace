@@ -106,8 +106,10 @@ def prepare_fixture(root, original, replacement):
     tools = root / 'tools'
     tools.mkdir()
     # Finite PATH: no real Rust launchers or ambient shell/startup settings.
+    # The installer and `rustrace update` require Git, as a real build does to
+    # record its release commit.
     for name in ('curl', 'awk', 'sed', 'grep', 'mktemp', 'mkdir', 'mv', 'rm',
-                 'cat', 'dirname', 'uname', 'python3'):
+                 'cat', 'dirname', 'uname', 'python3', 'git'):
         path = shutil.which(name)
         assert path, f'missing utility: {name}'
         (tools / name).symlink_to(path)

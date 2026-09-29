@@ -31,6 +31,10 @@ impl Fixture {
             ),
         );
         script(&root.join("cargo"), include_str!("support/update_cargo.py"));
+        script(
+            &root.join("git"),
+            "#!/bin/sh\necho 'git version 2.99.0 (fixture)'\n",
+        );
         fs::write(root.join("mode"), "success").unwrap();
         fs::write(root.join("cargo-mode"), "success").unwrap();
         let f = Self { home, root, binary };
@@ -48,7 +52,10 @@ impl Fixture {
         fs::write(self.receipt_path(),serde_json::to_vec(&serde_json::json!({"schema_version":1,"method":method,"path":self.binary,"repository":"https://github.com/baochunli/rustrace","version":env!("CARGO_PKG_VERSION"),"tag":format!("v{}",env!("CARGO_PKG_VERSION"))})).unwrap()).unwrap();
     }
     fn manifest(&self, version: &str) {
-        fs::write(self.root.join("latest.json"),serde_json::to_vec(&serde_json::json!({"schema_version":1,"version":version,"tag":format!("v{version}"),"commit":"a".repeat(40),"event_format":1,"package_format":1,"assignment_format":3,"source":{"repository":"https://github.com/baochunli/rustrace","tag":format!("v{version}")},"targets":{}})).unwrap()).unwrap();
+        self.manifest_with_commit(version, &"a".repeat(40));
+    }
+    fn manifest_with_commit(&self, version: &str, commit: &str) {
+        fs::write(self.root.join("latest.json"),serde_json::to_vec(&serde_json::json!({"schema_version":1,"version":version,"tag":format!("v{version}"),"commit":commit,"event_format":1,"package_format":1,"assignment_format":3,"source":{"repository":"https://github.com/baochunli/rustrace","tag":format!("v{version}")},"targets":{}})).unwrap()).unwrap();
     }
     fn command(&self) -> Command {
         let mut cmd = self.home.command(&self.binary);
@@ -196,6 +203,50 @@ fn cargo_failure_leaves_binary_and_receipt_unchanged() {
     assert!(text(&out).contains("Update failed; the previous Rustrace is unchanged."));
     assert_eq!(fs::read(&f.binary).unwrap(), binary);
     assert_eq!(fs::read(f.receipt_path()).unwrap(), receipt);
+}
+#[test]
+fn missing_git_fails_before_building() {
+    for git in [None, Some("#!/bin/sh\nexit 1\n")] {
+        let f = Fixture::new();
+        let binary = fs::read(&f.binary).unwrap();
+        let receipt = fs::read(f.receipt_path()).unwrap();
+        match git {
+            None => fs::remove_file(f.root.join("git")).unwrap(),
+            Some(body) => script(&f.root.join("git"), body),
+        }
+        let out = f.run();
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert!(
+            text(&out).ends_with(
+                "Rustrace needs Git to record which release it is: install Git (sudo apt install git on Debian/Ubuntu, xcode-select --install on macOS), then run rustrace update again.\nUpdate failed; the previous Rustrace is unchanged.\n"
+            ),
+            "{}",
+            text(&out)
+        );
+        assert!(!f.root.join("cargo.json").exists(), "Cargo ran without Git");
+        assert_eq!(fs::read(&f.binary).unwrap(), binary);
+        assert_eq!(fs::read(f.receipt_path()).unwrap(), receipt);
+    }
+}
+#[test]
+fn build_commit_differing_from_the_release_warns_and_installs() {
+    let f = Fixture::new();
+    let release = "c".repeat(40);
+    f.manifest_with_commit("99.0.0", &release);
+    let out = f.run();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains(&format!(
+            "warning: the installed Rustrace reports build commit {}, not the release commit {release}, so work recorded with it is marked as an unidentified build. Check that Git works (git --version), then reinstall:\ncargo +1.98.1 install --git https://github.com/baochunli/rustrace --tag v99.0.0 rustrace --locked --force\n",
+            "a".repeat(40)
+        )),
+        "{}",
+        text(&out)
+    );
+    assert!(text(&out).ends_with("Installed 99.0.0. Restart Rustrace to use it.\n"));
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.receipt_path()).unwrap()).unwrap();
+    assert_eq!(receipt["version"], "99.0.0");
 }
 #[test]
 fn invalid_installed_identity_never_rewrites_receipt() {
@@ -547,6 +598,8 @@ fn running_session_keeps_old_identity_and_updated_binary_records_new_identity() 
     use rustrace::session::ProductionSession;
     let f = Fixture::new();
     let replacement = build_session_fixture(&f);
+    // The fixture binary was built as release commit bbbb….
+    f.manifest_with_commit("99.0.0", &"b".repeat(40));
     let old_root = f.home.root.join("old-workspace");
     let new_root = f.home.root.join("new-workspace");
     for root in [&old_root, &new_root] {

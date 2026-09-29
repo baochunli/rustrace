@@ -5,11 +5,17 @@ set -eu
 cargo_alternative='cargo +1.98.1 install --git https://github.com/baochunli/rustrace --tag vX.Y.Z rustrace --locked'
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 case $(uname -s) in
-    Linux) build_hint='Install native build tools (build-essential on Debian/Ubuntu).';;
-    Darwin) build_hint='Install native build tools (Xcode Command Line Tools on macOS).';;
+    Linux) build_hint='Install native build tools (build-essential on Debian/Ubuntu).'
+        git_hint='sudo apt install git on Debian/Ubuntu';;
+    Darwin) build_hint='Install native build tools (Xcode Command Line Tools on macOS).'
+        git_hint='xcode-select --install on macOS';;
     *) fail "Unsupported OS. Use a supported Linux/macOS system and: $cargo_alternative (replace vX.Y.Z with the latest release tag).";;
 esac
 command -v curl >/dev/null 2>&1 || fail 'The Rustrace installer requires curl.'
+# Cargo can fetch the source without the git command, but the build then
+# cannot record which release commit it is.
+git --version >/dev/null 2>&1 || \
+    fail "Rustrace needs Git to record which release it is: install Git ($git_hint), then rerun the installer."
 if command -v rustup >/dev/null 2>&1; then
     rustup=rustup
 elif [ -x "$HOME/.cargo/bin/rustup" ]; then
@@ -108,18 +114,19 @@ json_field() {
             if(types["/method"]!="string" || escapes["/method"]) bad()
             print fields["/method"]; exit
         }
-        tag=fields["/tag"]
+        tag=fields["/tag"]; commit=fields["/commit"]
+        if(types["/commit"]!="string" || escapes["/commit"] || length(commit)!=40 || commit!~/^[0-9a-f]+$/) bad()
         if(types["/schema_version"]!="literal" || fields["/schema_version"]!="1" ||
            types["/tag"]!="string" || escapes["/tag"] || tag!~/^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/ ||
            types["/source/repository"]!="string" || escapes["/source/repository"] ||
            fields["/source/repository"]!=ENVIRON["RUSTRACE_EXPECTED_REPOSITORY"] ||
            types["/version"]!="string" || escapes["/version"] || fields["/version"]!=substr(tag,2) ||
            types["/source/tag"]!="string" || escapes["/source/tag"] || fields["/source/tag"]!=tag) bad()
-        print tag
+        print tag " " commit
     }' "$1"
 }
 if command -v python3 >/dev/null 2>&1; then
-    tag=$(python3 - "$work/latest.json" "$repository" <<'PY'
+    release=$(python3 - "$work/latest.json" "$repository" <<'PY'
 import json
 import re
 import sys
@@ -138,20 +145,24 @@ try:
     with open(sys.argv[1], encoding='utf-8') as stream:
         data = json.load(stream, object_pairs_hook=unique)
     tag = data['tag']
+    commit = data['commit']
     if not (type(data['schema_version']) is int and data['schema_version'] == 1
+            and isinstance(commit, str) and re.fullmatch(r'[0-9a-f]{40}', commit)
             and isinstance(tag, str) and re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', tag)
             and data['version'] == tag[1:]
             and data['source']['repository'] == sys.argv[2]
             and data['source']['tag'] == tag):
         raise ValueError('invalid release identity')
-    print(tag)
+    print(tag, commit)
 except (OSError, ValueError, KeyError, TypeError, AssertionError, RecursionError):
     sys.exit('Invalid release manifest.')
 PY
     ) || fail 'Invalid release manifest.'
 else
-    tag=$(json_field "$work/latest.json" tag) || fail 'Invalid release manifest.'
+    release=$(json_field "$work/latest.json" release) || fail 'Invalid release manifest.'
 fi
+tag=${release%% *}
+commit=${release#* }
 version=${tag#v}
 cargo_home=${CARGO_HOME:-$HOME/.cargo}
 config_root=
@@ -208,6 +219,13 @@ awk -v version="$version" '
     /^package format: [0-9]+$/ {package=1}
     END {if(!found || !assignment || !package) exit 1}
 ' "$work/version.txt" || fail 'Installed binary version or format metadata differs from the release.'
+# Work recorded by a build that cannot name its release commit is marked as an
+# unidentified build, so say so now rather than at grading time.
+built_commit=$(sed -n 's/^build commit: //p' "$work/version.txt")
+if [ "$built_commit" != "$commit" ]; then
+    printf 'warning: the installed Rustrace reports build commit %s, not the release commit %s, so work recorded with it is marked as an unidentified build. Check that Git works (git --version), then rerun the installer.\n' \
+        "${built_commit:-unknown}" "$commit" >&2
+fi
 
 # Encode strings without depending on Python; values are data, never shell code.
 json_quote() {

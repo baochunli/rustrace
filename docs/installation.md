@@ -15,7 +15,14 @@ first: Xcode Command Line Tools on macOS, or `build-essential` on Debian/Ubuntu.
 Debian/Ubuntu also needs `pkg-config`; Fedora uses `gcc`, `gcc-c++`, `make`,
 and `pkgconf-pkg-config`. Install these prerequisites with your platform's
 package manager. Installation requires curl, Git, and dependency
-network access. The installer never installs rustup; when it is missing, it prints the official command:
+network access. Git matters even though Cargo can fetch the source without it:
+the build records the release commit it was built from, and without the `git`
+command it cannot, so work recorded with that build is marked as an
+unidentified build. The installer and `rustrace update` therefore stop before
+building when Git is missing, with `Rustrace needs Git to record which release
+it is`; install it (`sudo apt install git` on Debian/Ubuntu,
+`xcode-select --install` on macOS) and run the command again. The installer
+never installs rustup; when it is missing, it prints the official command:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -30,8 +37,12 @@ latest published release, rather than the checkout's current source.
 The installer validates the release manifest, builds its immutable tag, checks
 `rustrace --version --verbose`, and records the successful installation in
 `$XDG_STATE_HOME/rustrace/install.json` (default
-`~/.local/state/rustrace/install.json`). Cargo manages existing binary replacement.
-Rerun the same one-liner to reinstall or install the latest release.
+`~/.local/state/rustrace/install.json`). If the installed binary's
+`build commit` differs from the release's commit, it installs anyway and prints
+a warning that begins `warning: the installed Rustrace reports build commit`;
+check that `git --version` works, then rerun the installer. Cargo manages
+existing binary replacement. Rerun the same one-liner to reinstall or install
+the latest release.
 
 Cargo installs into `~/.cargo/bin` by default. Precedence: `RUSTRACE_INSTALL_DIR`
 (passed as Cargo's `--root`), then `CARGO_INSTALL_ROOT`, then `install.root` in
@@ -68,7 +79,8 @@ cargo +1.98.1 install --git https://github.com/baochunli/rustrace --tag vX.Y.Z r
 Replace `vX.Y.Z` with the latest release tag from
 [GitHub Releases](https://github.com/baochunli/rustrace/releases). Each release tag
 is immutable and matches the root Cargo version. This command builds locally
-and needs Rust 1.98.1 installed first; ensure Cargo's binary directory is on PATH.
+and needs Rust 1.98.1 and Git installed first; ensure Cargo's binary directory
+is on PATH.
 
 From a checkout of the release tag, the equivalent local installation is:
 
@@ -107,7 +119,9 @@ install the latest stable release. It makes a fresh release check and, when a
 newer version exists, builds from source using Cargo and Rust 1.98.1. This
 takes a few minutes; Cargo's progress streams to your terminal. After success,
 it prints `Installed X.Y.Z. Restart Rustrace to use it.` Open Rustrace again to
-use the new build. Sessions already running keep their recorded build identity.
+use the new build. Like the installer, it needs Git, and it warns, with a
+release-pinned reinstall command, if the new binary's build commit differs from
+the release's. Sessions already running keep their recorded build identity.
 A failed Cargo build leaves the previous executable unchanged.
 If post-install identity validation fails, the new binary is already installed
 at the reported path; follow the printed manual remedy to repair it.

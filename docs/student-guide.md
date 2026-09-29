@@ -224,7 +224,9 @@ curl -fsSL https://raw.githubusercontent.com/baochunli/rustrace/main/scripts/ins
 
 Install rustup from <https://rustup.rs/> first (version 1.28.1 or newer), plus
 native compiler/linker tools: Xcode Command Line Tools on macOS or
-`build-essential` on Debian/Ubuntu. The installer requires curl and Git. It
+`build-essential` on Debian/Ubuntu. The installer requires curl and Git: the
+build records which release it is, and without Git it cannot, so the installer
+stops and asks you to install Git (`sudo apt install git` on Debian/Ubuntu). It
 builds the latest release from source with Rust 1.98.1; this takes a few minutes.
 If that toolchain is missing, it installs the minimal profile with clippy and
 rustfmt. It never installs rustup or changes your default toolchain. Open a
@@ -243,7 +245,7 @@ cargo +1.98.1 install --git https://github.com/baochunli/rustrace --tag vX.Y.Z r
 
 Replace `vX.Y.Z` with the latest release tag from
 [GitHub Releases](https://github.com/baochunli/rustrace/releases), and install Rust
-1.98.1 first. From a checkout of that tag, run `cargo install --path . --locked`
+1.98.1 and Git first. From a checkout of that tag, run `cargo install --path . --locked`
 at the repository root. The root package ships only the `rustrace` binary, so
 neither command needs `--bin`. The Git form names the package because the
 repository also contains executable fixture manifests. See the

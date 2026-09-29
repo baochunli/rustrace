@@ -16,6 +16,7 @@ REAL_RUSTUP = shutil.which('rustup')
 REAL_CARGO = shutil.which('cargo')
 REAL_RUSTC = shutil.which('rustc')
 RUSTUP_HOME = os.environ.get('RUSTUP_HOME', str(pathlib.Path.home() / '.rustup'))
+RELEASE_COMMIT = '0123456789abcdef0123456789abcdef01234567'
 
 
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
@@ -40,7 +41,7 @@ class InstallerTests(unittest.TestCase):
         self.env.update(PATH=str(self.bin), SHELL='/bin/zsh', RUSTUP_HOME=RUSTUP_HOME,
                         RUSTUP_AUTO_INSTALL='0', CARGO_NET_OFFLINE='true',
                         CARGO_TARGET_DIR=str(self.root / 'target'), RECORD=str(self.root / 'argv'), ENV_RECORD=str(self.root / 'child-env'),
-                        FAKE_VERSION='1.2.3', FAKE_FORMATS='yes')
+                        FAKE_VERSION='1.2.3', FAKE_FORMATS='yes', FAKE_COMMIT=RELEASE_COMMIT)
         # Explicit utility inventory keeps real rustup/cargo out of fake-tool tests.
         for tool in ('curl', 'awk', 'sed', 'grep', 'mktemp', 'mkdir', 'mv', 'rm',
                      'cat', 'dirname', 'uname', 'python3'):
@@ -49,6 +50,7 @@ class InstallerTests(unittest.TestCase):
             self.assertIsNotNone(executable, f'required tool not installed: {selected}')
             (self.bin / tool).symlink_to(executable)
         self.tool('uname', 'echo Linux')
+        self.tool('git', 'echo "git version 2.99.0 (fixture)"')
         self.tool('rustup', '''printf 'rustup:%s\\n' "${RUSTUP_AUTO_INSTALL:-unset}" >> "$ENV_RECORD"
 printf 'rustup\\n' >> "$RECORD"
 printf '<%s>\\n' "$@" >> "$RECORD"
@@ -71,6 +73,9 @@ cat > "$root/bin/rustrace" <<'BIN'
 #!/bin/sh
 [ "$*" = '--version --verbose' ] || exit 9
 printf 'rustrace %s\\n' "$FAKE_VERSION"
+if [ -n "$FAKE_COMMIT" ]; then
+ printf 'build commit: %s\\n' "$FAKE_COMMIT"
+fi
 if [ "$FAKE_FORMATS" = yes ]; then
  printf 'package format: 1\\nassignment format: 2\\n'
 fi
@@ -82,6 +87,7 @@ chmod +x "$root/bin/rustrace"''')
         self.repository = self.repository_path.as_uri()
         self.env['RUSTRACE_SOURCE_REPOSITORY'] = self.repository
         self.manifest = dict(schema_version=1, version='1.2.3', tag='v1.2.3',
+                             commit=RELEASE_COMMIT,
                              source=dict(repository=self.repository, tag='v1.2.3'), targets={})
         self.write_manifest()
         handler = functools.partial(QuietHandler, directory=str(self.root))
@@ -188,6 +194,12 @@ chmod +x "$root/bin/rustrace"''')
                    valid.replace('v1.2.3', 'v1.2.3;touch injected'),
                    valid.replace(self.repository, 'https://evil.example/repo'),
                    valid.replace('"version": "1.2.3"', '"version": "9.9.9"'),
+                   valid.replace(RELEASE_COMMIT, RELEASE_COMMIT[:39]),
+                   valid.replace(RELEASE_COMMIT, RELEASE_COMMIT + '0'),
+                   valid.replace(RELEASE_COMMIT, RELEASE_COMMIT.upper()),
+                   valid.replace(RELEASE_COMMIT, RELEASE_COMMIT[:39] + 'g'),
+                   valid.replace('"' + RELEASE_COMMIT + '"', '1234'),
+                   valid.replace('"commit": "' + RELEASE_COMMIT + '", ', ''),
                    valid[:-1], valid + '{}',
                    valid.replace('"schema_version": 1', '"schema_version": 1, "schema_version": 1'),
                    valid.replace('"source": {', '"source": {"nested": {"repository": "wrong"},')]
@@ -342,6 +354,31 @@ chmod +x "$root/bin/rustrace"''')
             self.assertIn('fish_add_path' if shell == 'fish' else 'export PATH=', output)
             self.assertEqual(list((self.root / 'home').iterdir()), [])
 
+    def test_missing_git_fails_before_building(self):
+        (self.bin / 'git').unlink()
+        output = self.run_install(1)
+        self.assertIn('Rustrace needs Git to record which release it is: install Git '
+                      '(sudo apt install git on Debian/Ubuntu), then rerun the installer.', output)
+        self.assertNotIn('cargo', self.argv())
+        self.tool('uname', 'echo Darwin')
+        self.tool('git', 'exit 1')
+        self.assertIn('install Git (xcode-select --install on macOS)', self.run_install(1))
+        self.assertNotIn('cargo', self.argv())
+        self.assertFalse((self.root / 'state/rustrace/install.json').exists())
+
+    def test_build_commit_differing_from_the_release_warns(self):
+        self.assertNotIn('reports build commit', self.run_install())
+        for reported, shown in [('f' * 40, 'f' * 40), (RELEASE_COMMIT + '-dirty', RELEASE_COMMIT + '-dirty'),
+                                ('unknown', 'unknown'), ('', 'unknown')]:
+            with self.subTest(reported=reported):
+                self.env['FAKE_COMMIT'] = reported
+                output = self.run_install()
+                self.assertIn(f'warning: the installed Rustrace reports build commit {shown}, '
+                              f'not the release commit {RELEASE_COMMIT}, so work recorded with it is '
+                              'marked as an unidentified build. Check that Git works (git --version), '
+                              'then rerun the installer.', output)
+                self.assertEqual(self.receipt()['version'], '1.2.3')
+
     def test_unsupported_os_and_missing_curl(self):
         self.tool('uname', 'echo FreeBSD')
         self.assertIn('cargo +1.98.1 install', self.run_install(1))
@@ -442,6 +479,8 @@ chmod +x "$root/bin/rustrace"''')
             (self.bin / name).unlink()
             (self.bin / name).symlink_to(path)
         (self.bin / 'rustc').symlink_to(REAL_RUSTC)
+        (self.bin / 'git').unlink()
+        (self.bin / 'git').symlink_to(shutil.which('git'))
         self.env['PATH'] += os.pathsep + os.path.dirname(shutil.which('git')) + os.pathsep + '/usr/bin:/bin'
         # Cargo offline mode refuses even a fresh file:// checkout. This crate
         # has no dependencies and its only Git source is the local bare repo.
@@ -450,7 +489,16 @@ chmod +x "$root/bin/rustrace"''')
         source = self.root / 'crate'
         (source / 'src').mkdir(parents=True)
         (source / 'Cargo.toml').write_text('[package]\nname="rustrace"\nversion="1.2.3"\nedition="2024"\n[workspace]\n')
-        (source / 'src/main.rs').write_text('fn main() { println!("rustrace 1.2.3\\npackage format: 1\\nassignment format: 2"); }\n')
+        # Like Rustrace's own build script, record the commit Cargo's Git
+        # checkout is at, so the installer can compare it with the release.
+        (source / 'build.rs').write_text(
+            'fn main() { let out = std::process::Command::new("git").args(["rev-parse", "HEAD"])'
+            '.output().unwrap(); assert!(out.status.success());'
+            ' let dirty = !std::process::Command::new("git").args(["diff", "--quiet", "HEAD"])'
+            '.status().unwrap().success();'
+            ' println!("cargo:rustc-env=FIXTURE_COMMIT={}{}", String::from_utf8(out.stdout).unwrap().trim(),'
+            ' if dirty { "-dirty" } else { "" }); }\n')
+        (source / 'src/main.rs').write_text('fn main() { println!("rustrace 1.2.3\\nbuild commit: {}\\npackage format: 1\\nassignment format: 2", env!("FIXTURE_COMMIT")); }\n')
         def run(*args):
             result = subprocess.run(args, cwd=source, env=self.env, capture_output=True, text=True, timeout=45)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -460,9 +508,13 @@ chmod +x "$root/bin/rustrace"''')
         run('git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture')
         run('git', 'tag', 'v1.2.3')
         run('git', 'clone', '--bare', str(source), str(self.repository_path))
+        self.manifest['commit'] = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=source, env=self.env,
+                                                 capture_output=True, text=True, check=True).stdout.strip()
+        self.write_manifest()
         (self.root / 'cargo/config.toml').write_text('[install]\nroot = "real-installed"\n')
-        self.run_install()
-        self.run_install()
+        # Cargo's Git checkout reports the tagged commit, clean.
+        for _ in range(2):
+            self.assertNotIn('reports build commit', self.run_install())
         self.assertEqual(self.receipt()['method'], 'cargo-git')
         self.assertEqual(self.receipt()['path'], str(self.root / 'real-installed/bin/rustrace'))
         self.assertTrue((self.root / 'real-installed/bin/rustrace').is_file())
