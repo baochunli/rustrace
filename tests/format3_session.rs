@@ -701,8 +701,9 @@ fn format3_fixture_change_during_start_parent() {
     fs::remove_dir_all(parent).unwrap();
 }
 
-/// The fixture tree is hashed again just before the start is recorded; a
-/// change after the student was told it matches cancels that launch.
+/// The fixture tree is hashed, and Cargo configuration checked, again just
+/// before the start is recorded; a change after the student was told the Run
+/// can start cancels that launch.
 #[test]
 fn format3_fixture_change_during_start_child() {
     let Some(root) = child_root() else {
@@ -716,34 +717,51 @@ fn format3_fixture_change_during_start_child() {
         br#"{"mode":"console_io","mutate_source":false,"echo":true,"report":true,"resolve_delay_millis":400}"#,
     )
     .unwrap();
-    let case = session.list_test_cases().unwrap().remove(0);
-    session.start_test_case(case).unwrap();
-    assert_eq!(session.take_run_warning(), None);
+    // Changes made while tools resolve, before the start is recorded.
+    let data = files.join("data.txt");
+    let workspace_cargo = root.join(".cargo");
+    type Change<'a> = (&'a dyn Fn(), &'a str, &'a dyn Fn());
+    let changes: [Change<'_>; 2] = [
+        (
+            &|| fs::write(&data, b"changed while starting\n").unwrap(),
+            "the files in lab.test-cases/files changed while the run was starting; run it again",
+            &|| fs::write(&data, DATA).unwrap(),
+        ),
+        (
+            &|| fs::create_dir(&workspace_cargo).unwrap(),
+            "remove `.cargo` from the workspace: Cargo would read it for commands run in the workspace but not for a Run from the test-case fixture folder",
+            &|| fs::remove_dir(&workspace_cargo).unwrap(),
+        ),
+    ];
     let resolving = root.join("target/resolving");
-    let until = Instant::now() + Duration::from_secs(20);
-    while !resolving.exists() && Instant::now() < until {
-        session.poll_command().unwrap();
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    assert!(resolving.exists());
-    fs::write(files.join("data.txt"), b"changed while starting\n").unwrap();
-    let mut error = None;
-    let until = Instant::now() + Duration::from_secs(20);
-    while session.command_active() && Instant::now() < until {
-        if let Err(failure) = session.poll_command() {
-            error = Some(failure.to_string());
+    for (change, expected, undo) in changes {
+        let _ = fs::remove_file(&resolving);
+        let case = session.list_test_cases().unwrap().remove(0);
+        session.start_test_case(case).unwrap();
+        assert_eq!(session.take_run_warning(), None);
+        let until = Instant::now() + Duration::from_secs(20);
+        while !resolving.exists() && Instant::now() < until {
+            session.poll_command().unwrap();
+            std::thread::sleep(Duration::from_millis(2));
         }
-        std::thread::sleep(Duration::from_millis(2));
+        assert!(resolving.exists());
+        change();
+        let mut error = None;
+        let until = Instant::now() + Duration::from_secs(20);
+        while session.command_active() && Instant::now() < until {
+            if let Err(failure) = session.poll_command() {
+                error = Some(failure.to_string());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(error.as_deref(), Some(expected));
+        let result = session.take_test_case_result().unwrap();
+        assert_eq!(
+            result.outcome,
+            TestCaseOutcome::Error("could not start".into())
+        );
+        undo();
     }
-    assert_eq!(
-        error.as_deref(),
-        Some("the files in lab.test-cases/files changed while the run was starting; run it again")
-    );
-    let result = session.take_test_case_result().unwrap();
-    assert_eq!(
-        result.outcome,
-        TestCaseOutcome::Error("could not start".into())
-    );
     assert!(
         !root.join("target/invocation.json").exists(),
         "Cargo never ran"

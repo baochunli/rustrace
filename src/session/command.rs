@@ -1776,7 +1776,13 @@ impl ProductionSession {
         } else {
             None
         };
-        let console = match ready.console.take().map(prepare_console_io).transpose() {
+        let workspace_root = self.workspace.root().to_path_buf();
+        let console = match ready
+            .console
+            .take()
+            .map(|launch| prepare_console_io(launch, &workspace_root))
+            .transpose()
+        {
             Ok(console) => console,
             Err(error) => {
                 self.clear_command_ownership()?;
@@ -2686,12 +2692,19 @@ fn reject_workspace_cargo_configuration(workspace: &Path) -> Result<()> {
     }
 }
 
-fn prepare_console_io(mut launch: ConsoleLaunch) -> Result<ConsoleIo> {
+fn prepare_console_io(mut launch: ConsoleLaunch, workspace: &Path) -> Result<ConsoleIo> {
     // Hash the pinned fixture folder again just before the start is recorded,
     // so the route names the tree the program is launched in. A change since
-    // the student was told whether it matches the package cancels the launch.
+    // the student was told whether it matches the package cancels the launch,
+    // and Cargo configuration added meanwhile is refused as it was at start.
     let fixtures = match launch.fixtures.take() {
         Some(pinned) => {
+            launch
+                .cases
+                .as_ref()
+                .ok_or("missing test-case authority for a fixture Run")?
+                .reject_cargo_configuration()?;
+            reject_workspace_cargo_configuration(workspace)?;
             pinned.root.verify_binding()?;
             let current = pinned.root.hash()?;
             if current != pinned.deployed() {
