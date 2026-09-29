@@ -456,6 +456,20 @@ fn a_failure_marker_without_a_capture_never_blocks_submit() {
             Some(b"not a marker".to_vec()),
             "reason unknown: its failure record is unreadable",
         ),
+        (
+            "other-session",
+            Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "version": 1,
+                    "label": "INCOMPLETE RECOVERY",
+                    "reason": "belongs elsewhere",
+                    "session_id": "session-elsewhere",
+                    "capture_available": false
+                }))
+                .unwrap(),
+            ),
+            "reason unknown: its failure record names another session, session-elsewhere",
+        ),
     ] {
         let (fixture, session) = Fixture::started(&format!("bundle-marker-{label}"));
         let id = session.session_id().clone();
@@ -584,6 +598,15 @@ fn a_revision_over_the_package_file_limit_stays_unfinished_and_retries() {
         child.execute(EditorCommand::Insert('C')).unwrap();
         child.capture_boundary().unwrap();
     }
+    // Status and the warning read the parent's manifest totals alone; they
+    // agree with the full check finalization runs.
+    let link = fs::read(child_root.join(".rustrace/parent.json")).unwrap();
+    let full = super::finalization::earlier_attempt_totals(&link, child.metadata());
+    assert!(full.is_some_and(|totals| totals.entries == parent_entries));
+    assert_eq!(
+        super::finalization::earlier_attempt_totals_for_display(&link, child.metadata()),
+        full
+    );
     // The earlier attempt fits, but not together with this one.
     let maximum = parent_entries + 4;
     let error = child
@@ -710,4 +733,64 @@ fn five_hundred_toolchain_observations_still_submit_and_verify() {
         .collect::<Vec<_>>();
     owners.sort_unstable();
     assert_eq!(owners, [1, 200, 300, 500]);
+}
+
+fn packaged_file_count(error: &str) -> u64 {
+    error
+        .strip_prefix("this attempt and its earlier attempts together have ")
+        .and_then(|rest| rest.split(' ').next())
+        .unwrap_or_else(|| panic!("not a package file limit: {error}"))
+        .replace(',', "")
+        .parse()
+        .unwrap()
+}
+
+/// The count finalization checks is the importer's: outer ZIP entries plus
+/// the `.rprov` records, earlier attempts included. The exact count passes
+/// and one less fails.
+#[test]
+fn the_package_file_limit_counts_what_the_importer_counts() {
+    let (fixture, mut parent) = Fixture::started("bundle-chain-boundary");
+    parent.execute(EditorCommand::Insert('B')).unwrap();
+    let parent_receipt = parent.finalize("student-1").unwrap();
+    let child_root = fixture.base.join("child");
+    fs::create_dir(&child_root).unwrap();
+    for (path, bytes) in parent_receipt.final_workspace() {
+        fs::write(child_root.join(path.as_str()), bytes).unwrap();
+    }
+    let mut child =
+        ProductionSession::start_revision(&fixture.workspace, &child_root, MANIFEST).unwrap();
+    child.execute(EditorCommand::Insert('C')).unwrap();
+    child.quit().unwrap();
+    let submit = |maximum| {
+        super::bundle::submit_with_limits(
+            &child_root,
+            "student-1",
+            Some(fixture.base.join(format!("child-{maximum}.zip")).as_path()),
+            super::finalization::FinalizationLimits::with_files(maximum),
+        )
+    };
+
+    let first = packaged_file_count(&submit(1).unwrap_err().to_string());
+    // Each retry records one more boundary checkpoint, so one more file.
+    let error = submit(first).unwrap_err().to_string();
+    let second = packaged_file_count(&error);
+    assert_eq!(second, first + 1, "{error}");
+    assert!(
+        error.contains(&format!("more than the {first} one submission can hold")),
+        "{error}"
+    );
+    let exact = second + 1;
+    let bundle = submit(exact).expect("the exact count fits");
+
+    let imported = import_rprov(Cursor::new(fs::read(&bundle.path).unwrap())).unwrap();
+    assert_eq!(imported.kind(), ImportedPackageKind::LmsZip);
+    // Outer entries: the source files and session.rprov; inner records:
+    // manifest.json and the inventory.
+    let combined = imported.outer_source_files().len() as u64 + 1 + imported.entries().len() as u64;
+    assert_eq!(combined, exact);
+    assert_eq!(
+        imported.entries().len() as u64,
+        imported.manifest().inventory.len() as u64 + 1
+    );
 }

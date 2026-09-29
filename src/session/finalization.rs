@@ -202,13 +202,7 @@ pub(super) fn earlier_attempt_totals(
     link_bytes: &[u8],
     metadata: &SessionMetadata,
 ) -> Option<ChainTotals> {
-    if metadata.parent_evidence != Some(digest(link_bytes)) {
-        return None;
-    }
-    let link: RevisionLink = serde_json::from_slice(link_bytes).ok()?;
-    if link.version != 1 || link.kind != "finalized_revision" {
-        return None;
-    }
+    let link = revision_link(link_bytes, metadata)?;
     match ProductionSession::inspect_finalization_read_only(&link.parent_root).ok()? {
         ReadOnlyFinalizationStatus::Finalized(parent)
             if parent.latest_session_id == link.parent_session_id =>
@@ -217,6 +211,46 @@ pub(super) fn earlier_attempt_totals(
         }
         _ => None,
     }
+}
+
+/// The same totals for status and the startup warning, read from the
+/// parent's receipt-bound manifest alone: the manifest must match the
+/// receipt's digest, but the parent's event stream is not re-validated just
+/// to size a warning. Finalization still runs the full check.
+pub(super) fn earlier_attempt_totals_for_display(
+    link_bytes: &[u8],
+    metadata: &SessionMetadata,
+) -> Option<ChainTotals> {
+    let link = revision_link(link_bytes, metadata)?;
+    let state = PinnedWorkspaceRoot::open(&link.parent_root)
+        .ok()?
+        .open_existing_state_directory()
+        .ok()?;
+    let marker: FinalReceiptMarker =
+        serde_json::from_slice(&state.read_artifact(RECEIPT_MARKER, METADATA_LIMIT).ok()?).ok()?;
+    if marker.version != 1
+        || marker.label != "FINALIZATION RECEIPT"
+        || marker.binding.session_id != link.parent_session_id
+    {
+        return None;
+    }
+    let manifest_bytes = state
+        .read_artifact(PREPARED_MANIFEST, MAX_RPROV_MANIFEST_BYTES)
+        .ok()?;
+    if rprov_raw_blake3(&manifest_bytes) != marker.binding.manifest_blake3 {
+        return None;
+    }
+    let manifest = decode_rprov_manifest(&manifest_bytes).ok()?;
+    (manifest.latest_session_id == link.parent_session_id)
+        .then(|| ChainTotals::of_manifest(&manifest))
+}
+
+fn revision_link(link_bytes: &[u8], metadata: &SessionMetadata) -> Option<RevisionLink> {
+    if metadata.parent_evidence != Some(digest(link_bytes)) {
+        return None;
+    }
+    let link: RevisionLink = serde_json::from_slice(link_bytes).ok()?;
+    (link.version == 1 && link.kind == "finalized_revision").then_some(link)
 }
 
 /// Checks one submission's package-wide limits before anything is captured,
@@ -811,7 +845,11 @@ impl ProductionSession {
             // stopped, whatever else it claims.
             let last_submit_failure = has_marker.then(|| match read_incomplete_state(&state) {
                 Ok(marker) if marker.session_id == metadata.session_id => marker.reason,
-                _ => "reason unknown: its failure record is unreadable".to_owned(),
+                Ok(marker) => format!(
+                    "reason unknown: its failure record names another session, {}",
+                    marker.session_id
+                ),
+                Err(_) => "reason unknown: its failure record is unreadable".to_owned(),
             });
             return Ok(ReadOnlyFinalizationStatus::Unfinished {
                 last_submit_failure,

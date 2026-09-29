@@ -9,7 +9,7 @@
 
 use super::{
     METADATA_LIMIT, ProductionSession, Result, SessionMetadata,
-    finalization::{ChainTotals, earlier_attempt_totals},
+    finalization::{ChainTotals, earlier_attempt_totals_for_display},
 };
 use crate::display::grouped;
 use rustrace_journal::{Journal, MAX_JOURNAL_SEQUENCE};
@@ -267,7 +267,7 @@ fn earlier_from_link(link: &[u8], metadata: &SessionMetadata) -> EarlierAttempts
         {
             EarlierAttempts::None
         }
-        _ => earlier_attempt_totals(link, metadata)
+        _ => earlier_attempt_totals_for_display(link, metadata)
             .map_or(EarlierAttempts::Unreadable, EarlierAttempts::Known),
     }
 }
