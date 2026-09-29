@@ -2670,13 +2670,13 @@ fn diagnostic_count(count: usize, label: &str) -> String {
 }
 
 /// Refuses a format 3 console output redirection onto Rustrace's case-folder
-/// marker or into the fixture tree a Run starts in.
+/// marker or into the fixture tree a Run starts in, including any spelling a
+/// case- or normalization-insensitive filesystem treats as the same name.
 fn refuse_managed_case_output(path: &WorkspacePath) -> Result<()> {
+    use rustrace_workspace::fixture_tree::{FIXTURE_ROOT, host_alias_key};
     let first = path.components().next().unwrap_or_default();
-    if path
-        .as_str()
-        .eq_ignore_ascii_case(crate::console::CASE_FOLDER_MARKER)
-        || first.eq_ignore_ascii_case(rustrace_workspace::fixture_tree::FIXTURE_ROOT)
+    if host_alias_key(path.as_str()) == host_alias_key(crate::console::CASE_FOLDER_MARKER)
+        || host_alias_key(first) == host_alias_key(FIXTURE_ROOT)
     {
         return Err(format!(
             "console output cannot replace {} or write into files/ in the test-case folder; choose another file name",

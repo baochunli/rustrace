@@ -174,7 +174,7 @@ impl FixtureTree {
     pub(crate) fn reject_host_aliases(&self) -> Result<(), FixtureTreeError> {
         let mut seen = HashMap::<String, &WorkspacePath>::new();
         for path in self.directories.iter().chain(self.files.keys()) {
-            let key = path.as_str().nfd().case_fold().nfd().collect::<String>();
+            let key = host_alias_key(path.as_str());
             if let Some(previous) = seen.insert(key, path)
                 && previous != path
             {
@@ -214,6 +214,13 @@ impl FixtureTree {
         self.directories.insert(path);
         Ok(())
     }
+}
+
+/// The name a case-insensitive, normalization-insensitive filesystem would
+/// store `name` under: two names with the same key are one entry on some
+/// supported computer.
+pub fn host_alias_key(name: &str) -> String {
+    name.nfd().case_fold().nfd().collect()
 }
 
 /// Fixture paths are canonical workspace paths without control characters,

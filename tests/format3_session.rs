@@ -381,6 +381,9 @@ fn format3_runner_child() {
         "cargo run > files/out.txt",
         "cargo run -- x > FILES/sub/out.txt",
         "cargo run > .rustrace-cases.json",
+        // Spellings a case- or normalization-insensitive filesystem folds.
+        "cargo run > .Rustrace-Cases.JSON",
+        "cargo run > \u{fb01}les/out.txt",
     ] {
         let error = session.start_console_command(line).unwrap_err().to_string();
         assert!(
