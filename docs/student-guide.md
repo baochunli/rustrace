@@ -1159,16 +1159,26 @@ It reports one of four states: `UNFINISHED` (reopen with `rustrace work`),
 `INCOMPLETE RECOVERY` (see below), or `FINALIZED IMMUTABLE SNAPSHOT` with the
 receipt details and local export records.
 
-For an unfinished attempt, `status` also shows what the attempt has recorded
-against what one submission can hold: checkpoints (at most 8,192; the recorder
-adds about 120 an hour while you edit, plus two for each command you run),
-events (at most 1,000,000), and launches of `rustrace work`. Launches have no
-limit: a submission keeps at most 64 of their toolchain observations, the
-first, the last, and each change. While a Rustrace session is open on the
-workspace, `status` leaves its history alone and reports these counts as
-unknown. Once a count passes three quarters of its limit, `rustrace work`
-prints a warning when it starts. Submit the attempt before it reaches the
-limit, and use `rustrace revise` to keep working after that.
+For an unfinished attempt, `status` also shows how many checkpoints and
+events the attempt has recorded, and how many more fit before `rustrace
+submit` would stop. One attempt holds at most 8,192 checkpoints; the recorder
+adds about 120 an hour while you edit, plus two for each command you run. One
+submission holds at most 1,000,000 events and 16,384 files. A linked
+attempt's ZIP also carries every earlier attempt, so its room is what the
+earlier attempts leave, and `status` names what they already hold. The room
+leaves out what `submit` adds itself: one checkpoint and up to three events,
+also on a submit that stops. Launches of `rustrace work` have no limit: a
+submission keeps at most 64 of their toolchain observations, the first, the
+last, and each change. While a Rustrace session is open on the workspace,
+`status` leaves its history alone and reports these counts as unknown.
+
+Once a count passes three quarters of what the attempt can hold, `rustrace
+work` prints a warning when it starts. Submit the attempt soon. If only the
+attempt's own checkpoint limit is near, use `rustrace revise` to keep working
+after that; the warning says when a linked attempt would not add room, and
+past a limit it tells you to contact your course staff. Near the limit,
+`submit` first prints `Packaging N checkpoints; this can take a minute or
+two...`.
 
 `rustrace work assignment.rta --workspace assignment.work --inspect` prints,
 without changing anything, the last saved contents of each file, the last
@@ -1197,14 +1207,14 @@ it, or quit it in Activity Monitor) and resume again. Rustrace then records the
 interrupted command as stopped, without the output it lost, and continues.
 
 If `submit` stops before it captures anything, for example because the
-student ID is invalid or the attempt holds more checkpoints than one
-submission can, it names the cause and creates no ZIP. Nothing is lost and the
+student ID is invalid or the attempt holds more than one submission can, it
+names the cause and the count and creates no ZIP. Nothing is lost and the
 attempt stays unfinished: `rustrace status` shows `Unfinished (last submit
-failed: REASON)`, and `rustrace work` reopens it as usual. Fix the cause, or
-run `rustrace update` when the message names a limit, and run the same
-`submit` command again. In Rustrace 0.1.7 and earlier, such a failure made
-every later `submit` repeat it as `INCOMPLETE RECOVERY`; with a newer
-Rustrace, that workspace submits normally.
+failed: REASON)`, and `rustrace work` reopens it as usual. Fix the cause and
+run the same `submit` command again. For a limit, the message says whether
+`rustrace update` can help or you should tell your course staff. In Rustrace
+0.1.7 and earlier, such a failure made every later `submit` repeat it as
+`INCOMPLETE RECOVERY`; with a newer Rustrace, that workspace submits normally.
 
 If finalization itself was interrupted, `submit` refuses to build a normal
 bundle and tells you to rerun with `--allow-incomplete`. That produces a ZIP

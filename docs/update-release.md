@@ -11,7 +11,7 @@ Assume that the latest release is v0.1.6, and a fix should be released as v0.1.7
 ```
 cargo check --workspace
 ./scripts/check-release-tag.sh v0.1.7
-cargo test --test submit_cli --test retention_cli
+cargo test --test submit_cli --test retention_cli --test long_session
 ```
 
 2. Commit the fix and version bump:
