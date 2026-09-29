@@ -659,43 +659,47 @@ impl<R: Read + std::os::fd::AsRawFd> Pipe<R> {
 #[cfg(unix)]
 struct SubmittedInput {
     receiver: Option<Receiver<StdinMessage>>,
-    writer: Option<std::process::ChildStdin>,
+    writer: Option<File>,
     pending: VecDeque<u8>,
     eof: bool,
 }
 
+/// Makes the parent's end of a stdin pipe nonblocking, so feeding the child
+/// never stalls the capture loop.
+#[cfg(unix)]
+fn set_nonblocking(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 impl SubmittedInput {
-    fn new(receiver: Receiver<StdinMessage>, writer: std::process::ChildStdin) -> Self {
-        Self::start(Some(receiver), Vec::new(), writer)
-    }
-
-    /// Writes `bytes` without blocking as the child reads them, then closes
-    /// the pipe. A child that exits early just ends the writes.
-    fn from_bytes(bytes: Vec<u8>, writer: std::process::ChildStdin) -> Self {
-        Self::start(None, bytes, writer)
-    }
-
-    fn start(
-        receiver: Option<Receiver<StdinMessage>>,
-        bytes: Vec<u8>,
-        writer: std::process::ChildStdin,
-    ) -> Self {
-        use std::os::fd::AsRawFd;
-        let fd = writer.as_raw_fd();
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        let failed = flags == -1
-            || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1;
-        let eof = failed || receiver.is_none();
+    /// Streams lines submitted at the console prompt. If the pipe cannot be
+    /// made nonblocking, stdin closes at once, as if no line were sent.
+    fn new(receiver: Receiver<StdinMessage>, writer: impl Into<std::os::fd::OwnedFd>) -> Self {
+        let writer = File::from(writer.into());
+        let usable = set_nonblocking(&writer).is_ok();
         Self {
-            receiver: receiver.filter(|_| !failed),
-            writer: (!failed).then_some(writer),
-            pending: if failed {
-                VecDeque::new()
-            } else {
-                bytes.into()
-            },
-            eof,
+            receiver: usable.then_some(receiver),
+            writer: usable.then_some(writer),
+            pending: VecDeque::new(),
+            eof: !usable,
+        }
+    }
+
+    /// Writes `bytes` to an already nonblocking pipe as the child reads them,
+    /// then closes it. A child that exits early just ends the writes.
+    fn from_bytes(bytes: Vec<u8>, writer: File) -> Self {
+        Self {
+            receiver: None,
+            writer: Some(writer),
+            pending: bytes.into(),
+            eof: true,
         }
     }
 
@@ -850,7 +854,19 @@ pub(crate) fn execute_with_io_and_handoff(
         ProcessStdin::Closed => (Stdio::null(), None),
         ProcessStdin::File(file) => (Stdio::from(file), None),
         ProcessStdin::Submitted(receiver) => (Stdio::piped(), Some(Ok(receiver))),
-        ProcessStdin::Bytes(bytes) => (Stdio::piped(), Some(Err(bytes))),
+        // The pipe is made nonblocking before the spawn, so a failure stops
+        // the launch instead of giving the program no input.
+        ProcessStdin::Bytes(bytes) => {
+            let (reader, writer) = match io::pipe() {
+                Ok(pipe) => pipe,
+                Err(error) => return launch_failed(error),
+            };
+            let writer = File::from(std::os::fd::OwnedFd::from(writer));
+            if let Err(error) = set_nonblocking(&writer) {
+                return launch_failed(error);
+            }
+            (Stdio::from(reader), Some(Err((bytes, writer))))
+        }
     };
     command.stdin(stdin);
     let captured_stdout = matches!(stdout_mode, ProcessStdout::Captured);
@@ -864,6 +880,9 @@ pub(crate) fn execute_with_io_and_handoff(
         Ok(child) => child,
         Err(error) => return launch_failed(error),
     };
+    // Release the parent's copies of the child's stdio, such as the read end
+    // of a byte-stdin pipe, so an exited child ends the writes with EPIPE.
+    drop(command);
     let mut process = SpawnedProcess::new(child, cleanup_handoff);
     let group = process.group;
     crate::session::process_probe("command-running");
@@ -890,16 +909,16 @@ pub(crate) fn execute_with_io_and_handoff(
             .take()
             .expect("requested stderr pipe"),
     );
-    let mut submitted = submitted.map(|source| {
-        let writer = process
-            .child_mut()
-            .stdin
-            .take()
-            .expect("requested stdin pipe");
-        match source {
-            Ok(receiver) => SubmittedInput::new(receiver, writer),
-            Err(bytes) => SubmittedInput::from_bytes(bytes, writer),
-        }
+    let mut submitted = submitted.map(|source| match source {
+        Ok(receiver) => SubmittedInput::new(
+            receiver,
+            process
+                .child_mut()
+                .stdin
+                .take()
+                .expect("requested stdin pipe"),
+        ),
+        Err((bytes, writer)) => SubmittedInput::from_bytes(bytes, writer),
     });
     let mut remaining = limits.output_bytes;
     let mut reason = None;
