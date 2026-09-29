@@ -75,7 +75,7 @@ pub struct ConsoleCommand {
 /// space. `--` must be followed by at least one argument. Arguments end at
 /// the first `<` or `>` token, so redirections always follow the arguments
 /// and are never passed to the program; an argument may not contain `<` or
-/// `>` at all, and one redirection before `--` is refused. The two
+/// `>` at all, and a redirection before `--` is refused. The two
 /// redirections may appear in either order, each at most once. Arguments
 /// obey the packaged `NAME.args` bounds: at most 64, each 1 to 1024 bytes.
 pub fn parse_console_command(input: &str) -> Result<ConsoleCommand, PreparationError> {
