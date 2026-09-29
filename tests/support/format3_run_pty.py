@@ -319,14 +319,17 @@ try:
     # Console Runs start in the fixture folder with literal arguments.
     send(b"\x1b[20~")
     wait_for(lambda: " CONSOLE " in rendered_screen(), "console")
-    type_console("cargo run -- --console a b")
+    # Nothing expands arguments: `*` and `$` reach the program as typed.
+    type_console("cargo run -- --console a*b $HOME")
     wait_for(
         lambda: len(runs()) == 2
         and "cwd=lab.test-cases/files" in rendered_screen()
-        and "args=--console|a|b" in rendered_screen(),
+        and "args=--console|a*b|$HOME" in rendered_screen(),
         "console Run output",
     )
-    assert runs()[1] == {"cwd": str(files), "args": ["--console", "a", "b"], "stdin": "console"}
+    assert runs()[1] == {
+        "cwd": str(files), "args": ["--console", "a*b", "$HOME"], "stdin": "console"
+    }, runs()
     wait_console_idle("first console Run finished")
     type_console("cargo run -- 'quoted'")
     wait_for(lambda: "console command rejected" in normalized_since(0), "quoted refusal")
@@ -385,9 +388,29 @@ try:
     )
     time.sleep(0.3)
     assert len(runs()) == 4, runs()
-    (workspace / ".cargo").rmdir()
+    send(b"\x7f" * len("cargo run -- --console y"))
+    wait_for(lambda: "> ▏" in rendered_screen(), "empty prompt again")
     send(b"\x1b")
     wait_for(lambda: " CONSOLE " not in rendered_screen(), "console closed again")
+    time.sleep(0.3)
+
+    # F7 Run is refused the same way and says why, not just "unavailable".
+    offset = len(transcript)
+    send(b"\x1b[18~")
+    wait_for(lambda: " MENU " in rendered_screen(), "command menu for refused Run")
+    send(b"\x1b[B\r")
+    wait_for(
+        lambda: "● action failed" in toast_text_since(offset)
+        and "console command rejected: remove `.cargo` from the workspace"
+        in toast_text_since(offset),
+        "menu Run .cargo refusal",
+    )
+    assert "Command unavailable" not in toast_text_since(offset)
+    time.sleep(0.3)
+    assert len(runs()) == 4, runs()
+    (workspace / ".cargo").rmdir()
+    send(b"\x1b")
+    wait_for(lambda: " CONSOLE " not in rendered_screen(), "console closed after refusal")
     time.sleep(0.3)
 
     # F7 Run is `cargo run` typed in the console, so it starts in the fixture
@@ -440,7 +463,7 @@ try:
     assert starts[1]["console"] == {
         "stdin": {"kind": "submitted"},
         "stdout": {"kind": "console"},
-        "args": ["--console", "a", "b"],
+        "args": ["--console", "a*b", "$HOME"],
         "working_directory": fixtures,
     }, starts[1]
     changed = starts[2]["console"]["working_directory"]["fixtures_blake3"]
@@ -463,7 +486,7 @@ try:
     success = True
     print(
         "format 3 run PTY: picker case with arguments and fixtures, console arguments, "
-        "changed-fixture warnings, .cargo refusal, menu Run, and provenance passed"
+        "changed-fixture warnings, typed and menu .cargo refusals, menu Run, and provenance passed"
     )
 finally:
     (root / "format3-run-transcript.bin").write_bytes(transcript)
