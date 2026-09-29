@@ -38,12 +38,6 @@ const MAX_FLAG_LINK_BYTES: usize = 512;
 /// A single Keyboard transaction reaches this advisory at 200 inserted UTF-8
 /// bytes. Insertions across every edit in the transaction are summed.
 pub const LARGE_SINGLE_INSERTION_BYTES: usize = 200;
-/// Uniform timing is evaluated over each rolling run of 60 consecutive
-/// Keyboard transactions.
-pub const UNIFORM_KEY_TIMING_TRANSACTIONS: usize = 60;
-/// A timing window is advisory only when its population coefficient of
-/// variation is strictly below 0.15.
-pub const UNIFORM_KEY_TIMING_COEFFICIENT_OF_VARIATION: f64 = 0.15;
 /// Sustained typing rate uses an exact 60-second sliding window.
 pub const SUSTAINED_HIGH_RATE_WINDOW_MILLIS: u64 = 60_000;
 /// A 60-second Keyboard window is advisory only when it contains more than 15
@@ -54,21 +48,15 @@ const ADVISORY_SUFFIX: &str = "advisory: heuristic; expect false positives";
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum AdvisoryFlagKind {
     LargeSingleInsertion,
-    UniformKeyTiming,
     SustainedHighRate,
 }
 
 impl AdvisoryFlagKind {
-    pub const ALL: [Self; 3] = [
-        Self::LargeSingleInsertion,
-        Self::UniformKeyTiming,
-        Self::SustainedHighRate,
-    ];
+    pub const ALL: [Self; 2] = [Self::LargeSingleInsertion, Self::SustainedHighRate];
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::LargeSingleInsertion => "LARGE_SINGLE_INSERTION",
-            Self::UniformKeyTiming => "UNIFORM_KEY_TIMING",
             Self::SustainedHighRate => "SUSTAINED_HIGH_RATE",
         }
     }
@@ -77,9 +65,6 @@ impl AdvisoryFlagKind {
         match self {
             Self::LargeSingleInsertion => {
                 "the record contains one Keyboard transaction inserting at least 200 bytes"
-            }
-            Self::UniformKeyTiming => {
-                "the record contains 60 consecutive Keyboard transactions with inter-event timing coefficient of variation below 0.15"
             }
             Self::SustainedHighRate => {
                 "the record contains more than 15 inserted characters per second across a 60-second Keyboard window"
@@ -105,8 +90,6 @@ struct KeyboardObservation {
 pub(crate) struct TypingShapeAccumulator {
     segment: u32,
     advisories: Vec<AdvisoryFlag>,
-    uniform_window: VecDeque<KeyboardObservation>,
-    uniform_advisory_active: bool,
     rate_window: VecDeque<KeyboardObservation>,
     first_keyboard_millis: Option<u64>,
     rate_advisory_active: bool,
@@ -117,8 +100,6 @@ impl TypingShapeAccumulator {
         Self {
             segment,
             advisories: Vec::new(),
-            uniform_window: VecDeque::with_capacity(UNIFORM_KEY_TIMING_TRANSACTIONS),
-            uniform_advisory_active: false,
             rate_window: VecDeque::new(),
             first_keyboard_millis: None,
             rate_advisory_active: false,
@@ -130,8 +111,6 @@ impl TypingShapeAccumulator {
             return;
         };
         if transaction.origin != EditOrigin::Keyboard {
-            self.uniform_window.clear();
-            self.uniform_advisory_active = false;
             return;
         }
 
@@ -162,29 +141,7 @@ impl TypingShapeAccumulator {
                 measured_value: format!("{inserted_bytes} bytes"),
             });
         }
-        self.observe_uniform_timing(observation.clone());
         self.observe_sustained_rate(observation);
-    }
-
-    fn observe_uniform_timing(&mut self, observation: KeyboardObservation) {
-        self.uniform_window.push_back(observation);
-        if self.uniform_window.len() > UNIFORM_KEY_TIMING_TRANSACTIONS {
-            self.uniform_window.pop_front();
-        }
-        if self.uniform_window.len() < UNIFORM_KEY_TIMING_TRANSACTIONS {
-            return;
-        }
-
-        let coefficient = coefficient_of_variation(&self.uniform_window);
-        let qualifies = coefficient < UNIFORM_KEY_TIMING_COEFFICIENT_OF_VARIATION;
-        if qualifies && !self.uniform_advisory_active {
-            self.advisories.push(AdvisoryFlag {
-                kind: AdvisoryFlagKind::UniformKeyTiming,
-                link: self.uniform_window.front().expect("full window").link,
-                measured_value: format!("{coefficient:.3} coefficient of variation"),
-            });
-        }
-        self.uniform_advisory_active = qualifies;
     }
 
     fn observe_sustained_rate(&mut self, observation: KeyboardObservation) {
@@ -234,27 +191,6 @@ impl TypingShapeAccumulator {
     pub(crate) fn finish(self) -> Vec<AdvisoryFlag> {
         self.advisories
     }
-}
-
-fn coefficient_of_variation(window: &VecDeque<KeyboardObservation>) -> f64 {
-    let interval_count = window.len() - 1;
-    let mean = window
-        .iter()
-        .zip(window.iter().skip(1))
-        .map(|(left, right)| right.monotonic_millis.saturating_sub(left.monotonic_millis) as f64)
-        .sum::<f64>()
-        / interval_count as f64;
-    if mean == 0.0 {
-        return 0.0;
-    }
-    let variance = window
-        .iter()
-        .zip(window.iter().skip(1))
-        .map(|(left, right)| right.monotonic_millis.saturating_sub(left.monotonic_millis) as f64)
-        .map(|interval| (interval - mean).powi(2))
-        .sum::<f64>()
-        / interval_count as f64;
-    variance.sqrt() / mean
 }
 
 pub fn display_advisory(advisory: &AdvisoryFlag) -> String {
@@ -501,20 +437,6 @@ mod tests {
         flags.iter().map(|flag| flag.kind).collect()
     }
 
-    fn uniform_events(count: usize, intervals: &[u64]) -> Vec<EventEnvelope> {
-        assert!(count > 0);
-        assert_eq!(intervals.len(), count - 1);
-        let mut millis = 0;
-        (0..count)
-            .map(|index| {
-                if index > 0 {
-                    millis += intervals[index - 1];
-                }
-                edit_event(index as u64 + 1, millis, EditOrigin::Keyboard, "x")
-            })
-            .collect()
-    }
-
     fn high_rate_events(inserted_characters: usize) -> Vec<EventEnvelope> {
         let mut remaining = inserted_characters;
         (0..=60)
@@ -550,37 +472,6 @@ mod tests {
     }
 
     #[test]
-    fn uniform_key_timing_uses_the_transaction_and_variation_boundaries() {
-        let below_count = uniform_events(UNIFORM_KEY_TIMING_TRANSACTIONS - 1, &vec![100; 58]);
-        let at_count = uniform_events(UNIFORM_KEY_TIMING_TRANSACTIONS, &vec![100; 59]);
-        let above_count = uniform_events(UNIFORM_KEY_TIMING_TRANSACTIONS + 1, &vec![100; 60]);
-        assert!(!kinds(&derive(&below_count)).contains(&AdvisoryFlagKind::UniformKeyTiming));
-        assert!(kinds(&derive(&at_count)).contains(&AdvisoryFlagKind::UniformKeyTiming));
-        assert!(kinds(&derive(&above_count)).contains(&AdvisoryFlagKind::UniformKeyTiming));
-
-        let just_below = uniform_events(
-            60,
-            &(0..59)
-                .map(|i| if i % 2 == 0 { 86 } else { 114 })
-                .collect::<Vec<_>>(),
-        );
-        let just_above = uniform_events(
-            60,
-            &(0..59)
-                .map(|i| if i % 2 == 0 { 84 } else { 116 })
-                .collect::<Vec<_>>(),
-        );
-        let mut exactly_at_threshold = vec![40; 59];
-        exactly_at_threshold[..6].copy_from_slice(&[71, 9, 50, 30, 41, 39]);
-        assert!(kinds(&derive(&just_below)).contains(&AdvisoryFlagKind::UniformKeyTiming));
-        assert!(
-            !kinds(&derive(&uniform_events(60, &exactly_at_threshold)))
-                .contains(&AdvisoryFlagKind::UniformKeyTiming)
-        );
-        assert!(!kinds(&derive(&just_above)).contains(&AdvisoryFlagKind::UniformKeyTiming));
-    }
-
-    #[test]
     fn sustained_high_rate_uses_a_strict_sixty_second_rate_threshold() {
         for (characters, expected) in [(899, false), (900, false), (901, true)] {
             let flags = derive(&high_rate_events(characters));
@@ -608,6 +499,27 @@ mod tests {
     }
 
     #[test]
+    fn evenly_timed_keyboard_edits_such_as_a_held_backspace_raise_no_advisory() {
+        // Holding Backspace repeats deletion-only Keyboard edits at a fixed
+        // interval. Regular timing is not an advisory condition.
+        let deletions = (0..120)
+            .map(|index| {
+                let mut event = edit_event(index + 1, index * 33, EditOrigin::Keyboard, "");
+                if let Event::FileEdited(transaction) = &mut event.event {
+                    transaction.edits[0].start_byte = 120 - index - 1;
+                    transaction.edits[0].end_byte = 120 - index;
+                }
+                event
+            })
+            .collect::<Vec<_>>();
+        assert!(derive(&deletions).is_empty());
+        let typed = (0..120)
+            .map(|index| edit_event(index + 1, index * 100, EditOrigin::Keyboard, "x"))
+            .collect::<Vec<_>>();
+        assert!(derive(&typed).is_empty());
+    }
+
+    #[test]
     fn non_keyboard_origins_are_excluded_from_every_advisory() {
         for origin in [
             EditOrigin::Paste,
@@ -630,7 +542,8 @@ mod tests {
     }
 
     #[test]
-    fn scripted_typing_journal_fires_all_three_with_first_event_links_and_neutral_wording() {
+    fn scripted_typing_journal_fires_both_typing_advisories_with_first_event_links_and_neutral_wording()
+     {
         let mut events = vec![edit_event(
             10,
             0,
@@ -651,13 +564,11 @@ mod tests {
             kinds(&flags),
             vec![
                 AdvisoryFlagKind::LargeSingleInsertion,
-                AdvisoryFlagKind::UniformKeyTiming,
                 AdvisoryFlagKind::SustainedHighRate,
             ]
         );
         assert_eq!(flags[0].link.sequence, 10);
         assert_eq!(flags[1].link.sequence, 10);
-        assert_eq!(flags[2].link.sequence, 10);
         assert!(flags.iter().all(|flag| flag.link.segment == 2));
         for flag in &flags {
             assert!(!flag.measured_value.is_empty());

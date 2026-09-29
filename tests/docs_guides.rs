@@ -3,8 +3,7 @@
 mod test_home;
 use rustrace::review_flags::{
     LARGE_SINGLE_INSERTION_BYTES, SUSTAINED_HIGH_RATE_CHARACTERS_PER_SECOND,
-    SUSTAINED_HIGH_RATE_WINDOW_MILLIS, UNIFORM_KEY_TIMING_COEFFICIENT_OF_VARIATION,
-    UNIFORM_KEY_TIMING_TRANSACTIONS,
+    SUSTAINED_HIGH_RATE_WINDOW_MILLIS,
 };
 use std::{fs, path::PathBuf};
 
@@ -409,8 +408,6 @@ fn files_panel_context_menu_is_the_documented_file_management_route() {
 #[test]
 fn typing_shape_advisory_thresholds_are_stable() {
     assert_eq!(LARGE_SINGLE_INSERTION_BYTES, 200);
-    assert_eq!(UNIFORM_KEY_TIMING_TRANSACTIONS, 60);
-    assert_eq!(UNIFORM_KEY_TIMING_COEFFICIENT_OF_VARIATION, 0.15);
     assert_eq!(SUSTAINED_HIGH_RATE_CHARACTERS_PER_SECOND, 15);
     assert_eq!(SUSTAINED_HIGH_RATE_WINDOW_MILLIS, 60_000);
 }

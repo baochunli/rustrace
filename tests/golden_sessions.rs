@@ -2128,11 +2128,7 @@ fn fake_server_completion_and_degradation_fixtures_reach_all_consumers() {
 fn advisory_kind_vocabulary_is_reachable_from_the_golden_suite() {
     assert_eq!(
         AdvisoryFlagKind::ALL.map(AdvisoryFlagKind::name),
-        [
-            "LARGE_SINGLE_INSERTION",
-            "UNIFORM_KEY_TIMING",
-            "SUSTAINED_HIGH_RATE",
-        ]
+        ["LARGE_SINGLE_INSERTION", "SUSTAINED_HIGH_RATE",]
     );
 }
 
