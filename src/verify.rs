@@ -4,8 +4,8 @@ use crate::{
     console::{TestCase, TestCaseOutcome, compare_test_case_bytes},
     process_indicators::{AttemptIndicatorAccumulator, ReviewIndicators, merge_factual},
     review_flags::{
-        AdvisoryFlag, EVIDENCE_LIMITATION_FIRST, EVIDENCE_LIMITATION_SECOND,
-        TypingShapeAccumulator, display_advisory, evidence_statement,
+        AdvisoryAccumulator, AdvisoryFlag, EVIDENCE_LIMITATION_FIRST, EVIDENCE_LIMITATION_SECOND,
+        display_advisory, evidence_statement,
     },
     session::hash_imported_outer_source,
     toolchain::RuntimeToolchainMetadata,
@@ -721,7 +721,7 @@ fn replay_segments(
     for (index, segment) in package.manifest().segments.iter().enumerate() {
         let mut indicators =
             AttemptIndicatorAccumulator::new(segment.ordinal, segment.session_id.clone());
-        let mut advisories = TypingShapeAccumulator::new(segment.ordinal);
+        let mut advisories = AdvisoryAccumulator::new(segment.ordinal);
         let initial_ref = segment
             .checkpoints
             .first()

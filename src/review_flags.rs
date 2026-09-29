@@ -7,7 +7,10 @@ use crate::{
         VerificationIssueKind, VerificationIssueLocation, VerificationReport, VerificationStatus,
     },
 };
-use rustrace_model::{EditOrigin, Event, EventEnvelope, inserted_text_counts};
+use rustrace_model::{
+    EditOrigin, EditorTransaction, Event, EventEnvelope, PasteRejected, PasteRejectionReason,
+    inserted_text_counts,
+};
 use std::collections::VecDeque;
 
 pub const EVIDENCE_CONSISTENCY: &str = "This provenance is internally replayable and consistent.";
@@ -43,21 +46,31 @@ pub const SUSTAINED_HIGH_RATE_WINDOW_MILLIS: u64 = 60_000;
 /// A 60-second Keyboard window is advisory only when it contains more than 15
 /// inserted Unicode scalar values per second.
 pub const SUSTAINED_HIGH_RATE_CHARACTERS_PER_SECOND: u64 = 15;
+/// An attempt reaches this advisory at one blocked attempt to paste text from
+/// outside Rustrace (a `paste_rejected` event with reason `external_input`).
+/// Other rejection reasons are not counted.
+pub const REJECTED_PASTE_ATTEMPTS_MINIMUM: u64 = 1;
 const ADVISORY_SUFFIX: &str = "advisory: heuristic; expect false positives";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum AdvisoryFlagKind {
     LargeSingleInsertion,
     SustainedHighRate,
+    RejectedPasteAttempts,
 }
 
 impl AdvisoryFlagKind {
-    pub const ALL: [Self; 2] = [Self::LargeSingleInsertion, Self::SustainedHighRate];
+    pub const ALL: [Self; 3] = [
+        Self::LargeSingleInsertion,
+        Self::SustainedHighRate,
+        Self::RejectedPasteAttempts,
+    ];
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::LargeSingleInsertion => "LARGE_SINGLE_INSERTION",
             Self::SustainedHighRate => "SUSTAINED_HIGH_RATE",
+            Self::RejectedPasteAttempts => "REJECTED_PASTE_ATTEMPTS",
         }
     }
 
@@ -68,6 +81,9 @@ impl AdvisoryFlagKind {
             }
             Self::SustainedHighRate => {
                 "the record contains more than 15 inserted characters per second across a 60-second Keyboard window"
+            }
+            Self::RejectedPasteAttempts => {
+                "the record contains at least one blocked attempt to paste text from outside Rustrace"
             }
         }
     }
@@ -87,15 +103,21 @@ struct KeyboardObservation {
     inserted_characters: u64,
 }
 
-pub(crate) struct TypingShapeAccumulator {
+/// Derives every advisory for one attempt (one `.rprov` segment) from its
+/// validated events, in stream order. Advisories tied to one event are
+/// emitted as their event is observed; the per-attempt summaries follow in
+/// [`Self::finish`].
+pub(crate) struct AdvisoryAccumulator {
     segment: u32,
     advisories: Vec<AdvisoryFlag>,
     rate_window: VecDeque<KeyboardObservation>,
     first_keyboard_millis: Option<u64>,
     rate_advisory_active: bool,
+    rejected_pastes: u64,
+    first_rejected_paste: Option<VerificationEventLocation>,
 }
 
-impl TypingShapeAccumulator {
+impl AdvisoryAccumulator {
     pub(crate) fn new(segment: u32) -> Self {
         Self {
             segment,
@@ -103,17 +125,39 @@ impl TypingShapeAccumulator {
             rate_window: VecDeque::new(),
             first_keyboard_millis: None,
             rate_advisory_active: false,
+            rejected_pastes: 0,
+            first_rejected_paste: None,
         }
     }
 
     pub(crate) fn observe(&mut self, envelope: &EventEnvelope) {
-        let Event::FileEdited(transaction) = &envelope.event else {
-            return;
+        let link = VerificationEventLocation {
+            segment: self.segment,
+            sequence: envelope.sequence,
         };
-        if transaction.origin != EditOrigin::Keyboard {
-            return;
+        match &envelope.event {
+            Event::PasteRejected(PasteRejected {
+                reason: PasteRejectionReason::ExternalInput,
+                ..
+            }) => self.observe_rejected_paste(link),
+            Event::FileEdited(transaction) if transaction.origin == EditOrigin::Keyboard => {
+                self.observe_keyboard(link, envelope.monotonic_millis, transaction);
+            }
+            _ => {}
         }
+    }
 
+    fn observe_rejected_paste(&mut self, link: VerificationEventLocation) {
+        self.rejected_pastes = self.rejected_pastes.saturating_add(1);
+        self.first_rejected_paste.get_or_insert(link);
+    }
+
+    fn observe_keyboard(
+        &mut self,
+        link: VerificationEventLocation,
+        monotonic_millis: u64,
+        transaction: &EditorTransaction,
+    ) {
         let inserted_bytes = transaction
             .edits
             .iter()
@@ -126,11 +170,8 @@ impl TypingShapeAccumulator {
             )
         });
         let observation = KeyboardObservation {
-            link: VerificationEventLocation {
-                segment: self.segment,
-                sequence: envelope.sequence,
-            },
-            monotonic_millis: envelope.monotonic_millis,
+            link,
+            monotonic_millis,
             inserted_characters,
         };
 
@@ -188,9 +229,22 @@ impl TypingShapeAccumulator {
         self.rate_advisory_active = qualifies;
     }
 
-    pub(crate) fn finish(self) -> Vec<AdvisoryFlag> {
+    pub(crate) fn finish(mut self) -> Vec<AdvisoryFlag> {
+        if self.rejected_pastes >= REJECTED_PASTE_ATTEMPTS_MINIMUM
+            && let Some(first) = self.first_rejected_paste
+        {
+            self.advisories.push(AdvisoryFlag {
+                kind: AdvisoryFlagKind::RejectedPasteAttempts,
+                link: first,
+                measured_value: plural(self.rejected_pastes, "blocked outside paste"),
+            });
+        }
         self.advisories
     }
+}
+
+fn plural(count: u64, noun: &str) -> String {
+    format!("{count} {noun}{}", if count == 1 { "" } else { "s" })
 }
 
 pub fn display_advisory(advisory: &AdvisoryFlag) -> String {
@@ -394,11 +448,11 @@ pub fn display_flag_link(flag: &ReviewFlag) -> String {
 mod tests {
     use super::*;
     use rustrace_model::{
-        DocumentId, EditOrigin, EditorTransaction, Event, EventEnvelope, Hash, SelectionState,
-        SessionId, TextEdit,
+        DocumentId, EditOrigin, EditorTransaction, Event, EventEnvelope, Hash, PasteInputChannel,
+        PasteRejected, PasteRejectionReason, SelectionState, SessionId, TextEdit,
     };
 
-    fn edit_event(sequence: u64, millis: u64, origin: EditOrigin, inserted: &str) -> EventEnvelope {
+    fn envelope(sequence: u64, millis: u64, event: Event) -> EventEnvelope {
         EventEnvelope {
             format_version: 1,
             session_id: SessionId::new("advisory-test").unwrap(),
@@ -407,7 +461,26 @@ mod tests {
             wall_clock_utc: None,
             previous_event_hash: Hash::zero(),
             event_hash: Hash::zero(),
-            event: Event::FileEdited(EditorTransaction {
+            event,
+        }
+    }
+
+    fn rejected_paste(sequence: u64, millis: u64, reason: PasteRejectionReason) -> EventEnvelope {
+        envelope(
+            sequence,
+            millis,
+            Event::PasteRejected(PasteRejected {
+                reason,
+                channel: PasteInputChannel::TerminalBracketed,
+            }),
+        )
+    }
+
+    fn edit_event(sequence: u64, millis: u64, origin: EditOrigin, inserted: &str) -> EventEnvelope {
+        envelope(
+            sequence,
+            millis,
+            Event::FileEdited(EditorTransaction {
                 document_id: DocumentId::new("main").unwrap(),
                 version_before: sequence,
                 version_after: sequence + 1,
@@ -422,11 +495,11 @@ mod tests {
                 hash_before: Hash::zero(),
                 hash_after: Hash::zero(),
             }),
-        }
+        )
     }
 
     fn derive(events: &[EventEnvelope]) -> Vec<AdvisoryFlag> {
-        let mut accumulator = TypingShapeAccumulator::new(2);
+        let mut accumulator = AdvisoryAccumulator::new(2);
         for event in events {
             accumulator.observe(event);
         }
@@ -520,6 +593,57 @@ mod tests {
     }
 
     #[test]
+    fn rejected_paste_attempts_counts_blocked_outside_pastes_and_links_the_first() {
+        assert!(derive(&[]).is_empty());
+
+        // One blocked outside paste reaches the minimum.
+        let flags = derive(&[rejected_paste(4, 10, PasteRejectionReason::ExternalInput)]);
+        assert_eq!(REJECTED_PASTE_ATTEMPTS_MINIMUM, 1);
+        assert_eq!(kinds(&flags), vec![AdvisoryFlagKind::RejectedPasteAttempts]);
+        assert_eq!(
+            flags[0].link,
+            VerificationEventLocation {
+                segment: 2,
+                sequence: 4
+            }
+        );
+        assert_eq!(flags[0].measured_value, "1 blocked outside paste");
+
+        // Other rejection reasons are not outside text and are not counted.
+        let other_reasons = [
+            PasteRejectionReason::UnverifiableInput,
+            PasteRejectionReason::MissingLiveSource,
+            PasteRejectionReason::OutsideEditor,
+        ];
+        let others = other_reasons
+            .iter()
+            .enumerate()
+            .map(|(index, reason)| rejected_paste(index as u64 + 1, 10, *reason))
+            .collect::<Vec<_>>();
+        assert!(derive(&others).is_empty());
+
+        let mut mixed = others.clone();
+        mixed.extend([
+            rejected_paste(5, 20, PasteRejectionReason::ExternalInput),
+            edit_event(6, 30, EditOrigin::Keyboard, "x"),
+            rejected_paste(7, 40, PasteRejectionReason::ExternalInput),
+            rejected_paste(8, 50, PasteRejectionReason::OutsideEditor),
+            rejected_paste(9, 60, PasteRejectionReason::ExternalInput),
+        ]);
+        let flags = derive(&mixed);
+        assert_eq!(kinds(&flags), vec![AdvisoryFlagKind::RejectedPasteAttempts]);
+        assert_eq!(flags[0].link.sequence, 5);
+        assert_eq!(flags[0].measured_value, "3 blocked outside pastes");
+        assert!(
+            display_advisory(&flags[0]).starts_with(
+                "REJECTED_PASTE_ATTEMPTS [segment:2 seq:5]: the record contains at least one blocked attempt to paste text from outside Rustrace; measured value: 3 blocked outside pastes; "
+            ),
+            "{}",
+            display_advisory(&flags[0])
+        );
+    }
+
+    #[test]
     fn non_keyboard_origins_are_excluded_from_every_advisory() {
         for origin in [
             EditOrigin::Paste,
@@ -602,6 +726,11 @@ mod tests {
             wording.push_str(kind.name());
             wording.push_str(kind.explanation());
         }
+        for kind in AdvisoryFlagKind::ALL {
+            wording.push_str(kind.name());
+            wording.push_str(kind.explanation());
+        }
+        wording.push_str(ADVISORY_SUFFIX);
         let wording = wording.to_ascii_lowercase();
         for forbidden in ["cheat", "misconduct", "plagiar", "authorship"] {
             assert!(
