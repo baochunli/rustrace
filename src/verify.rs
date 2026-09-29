@@ -1420,9 +1420,13 @@ pub fn run_verify(args: &[String], output: &mut impl Write) -> Result<u8, String
         status(report.checkpoint_hashes),
     )?;
     write_remainder(output, &report, reference)?;
-    for advisory in &report.advisories {
-        writeln!(output, "Advisory: {}", display_advisory(advisory))
-            .map_err(|error| error.to_string())?;
+    // Advisories are for instructors, who verify against the assignment
+    // package. Students run plain `verify`, which reports validity only.
+    if reference.is_some() {
+        for advisory in &report.advisories {
+            writeln!(output, "Advisory: {}", display_advisory(advisory))
+                .map_err(|error| error.to_string())?;
+        }
     }
     write_evidence_limitations(output, &report)?;
     Ok(report.exit_code())

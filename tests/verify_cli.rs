@@ -559,14 +559,11 @@ fn verify_cli_accepts_production_zip_and_standalone_without_opening_the_tui() {
 }
 
 #[test]
-fn verify_advisory_golden_keeps_consistent_exit_zero_and_prints_before_evidence() {
+fn verify_prints_advisories_only_with_a_reference_and_keeps_consistent_exit_zero() {
     let test_home = test_home::TestHome::new(false);
     let fixture = Fixture::new("verify-advisory");
-    fs::write(
-        fixture.workspace.join("main.rs"),
-        (0..80).map(|_| "x\n").collect::<String>(),
-    )
-    .unwrap();
+    let starter = (0..80).map(|_| "x\n").collect::<String>();
+    fs::write(fixture.workspace.join("main.rs"), &starter).unwrap();
     let mut session = fixture.start_session();
     session.execute(EditorCommand::SelectAll).unwrap();
     session.execute(EditorCommand::ToggleComment).unwrap();
@@ -574,38 +571,82 @@ fn verify_advisory_golden_keeps_consistent_exit_zero_and_prints_before_evidence(
     let bundle = create_bundle(&receipt, &fixture.base.join("advisory.zip"))
         .unwrap()
         .path;
+    let reference = write_reference(&fixture.base, MANIFEST, starter.as_bytes());
 
-    let report = verify_path(&bundle, None);
+    let report = verify_path(&bundle, Some(&reference));
     assert!(report.is_clean(), "{report:#?}");
+    assert_eq!(report.assignment_reference, AssignmentReferenceStatus::Ok);
     assert_eq!(report.exit_code(), 0);
     assert_eq!(review_flags(&report), vec![]);
-    assert_eq!(report.advisories.len(), 1, "{:#?}", report.advisories);
     assert_eq!(
-        report.advisories[0].kind,
-        AdvisoryFlagKind::LargeSingleInsertion
+        report
+            .advisories
+            .iter()
+            .map(|advisory| advisory.kind)
+            .collect::<Vec<_>>(),
+        vec![AdvisoryFlagKind::LargeSingleInsertion],
+        "{:#?}",
+        report.advisories
     );
+    // Advisories are derived whether or not a reference is given; only the
+    // printing differs.
+    assert_eq!(verify_path(&bundle, None).advisories, report.advisories);
 
-    let output = test_home
-        .command(env!("CARGO_BIN_EXE_rustrace"))
-        .arg("verify")
-        .arg(&bundle)
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(0));
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let lines = stdout.lines().collect::<Vec<_>>();
-    let advisory = format!("Advisory: {}", display_advisory(&report.advisories[0]));
-    let advisory_index = lines
+    let run = |reference: Option<&Path>| {
+        let mut command = test_home.command(env!("CARGO_BIN_EXE_rustrace"));
+        command.arg("verify").arg(&bundle);
+        if let Some(reference) = reference {
+            command.arg("--reference").arg(reference);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    // `verify --reference` is the instructor view: each advisory follows the
+    // check rows and precedes the evidence limitations.
+    let instructor = run(Some(&reference));
+    let lines = instructor.lines().collect::<Vec<_>>();
+    let advisory_lines = report
+        .advisories
         .iter()
-        .position(|line| *line == advisory)
-        .unwrap_or_else(|| panic!("missing advisory golden line in {stdout:?}"));
-    assert_eq!(lines[advisory_index - 1], "Unknown edit origins     0");
+        .map(|advisory| format!("Advisory: {}", display_advisory(advisory)))
+        .collect::<Vec<_>>();
+    let first = lines
+        .iter()
+        .position(|line| *line == advisory_lines[0])
+        .unwrap_or_else(|| panic!("missing advisory golden line in {instructor:?}"));
+    assert_eq!(lines[first - 1], "Unknown edit origins     0");
+    assert_eq!(&lines[first..first + advisory_lines.len()], advisory_lines);
     assert_eq!(
-        lines[advisory_index + 1],
+        lines[first + advisory_lines.len()],
         format!(
             "Evidence limitations: {EVIDENCE_CONSISTENCY} {EVIDENCE_LIMITATION_FIRST} {EVIDENCE_LIMITATION_SECOND}"
         )
     );
+
+    // Plain `verify` is what students run: validity only, with no advisory
+    // line, count or wording, and every other line unchanged.
+    let student = run(None);
+    assert!(
+        !student.to_ascii_lowercase().contains("advisor"),
+        "{student}"
+    );
+    assert!(!student.contains("heuristic"), "{student}");
+    assert!(!student.contains("false positives"), "{student}");
+    let expected = lines
+        .iter()
+        .filter(|line| !line.starts_with("Advisory: "))
+        .map(|line| {
+            if *line == "Assignment reference     OK" {
+                "Assignment reference     unverified"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(student.lines().collect::<Vec<_>>(), expected);
 }
 
 #[test]
