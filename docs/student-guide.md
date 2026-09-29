@@ -963,11 +963,13 @@ For a version 2 package, provenance retains one hash of the validated packaged
 suite plus the per-run comparison fields above, so an instructor reference can
 be checked without trusting the mutable sibling. Editing the live copies
 happens outside Rustrace. Do not edit a packaged case's files: a run of a
-case whose `.in`, `.expected`, or `.args` you changed won't match the
-package's case, and it is reported to your instructor.
+case whose `.expected` you changed (in a version 3 package, also its `.in`,
+`.args`, or fixture files) won't match the package's case, and it is reported
+to your instructor.
 
-Pasting into the console or test-case picker is blocked and recorded the same
-way as in the editor. The record shows only what happened inside Rustrace; it
+Pasting into the console or test-case picker is blocked and recorded, like a
+blocked paste in the editor; from Rustrace 0.1.8 the record says the paste was
+outside the editor. The record shows only what happened inside Rustrace; it
 cannot show how files you produced elsewhere were made.
 
 ### Version 3 cases in the picker
