@@ -2807,9 +2807,12 @@ fn activate_command_menu_entry(
                     console_line.take();
                     String::from("confirm overwrite; output remains untouched")
                 }
-                Err(_) => String::from(
+                // A busy runner or pending decision keeps the generic notice;
+                // a refusal of the Run itself says why, as typed Runs do.
+                Err(error) if error.is::<crate::session::CommandUnavailable>() => String::from(
                     "Command unavailable; finish recovery/modal or check configured tools",
                 ),
+                Err(error) => format!("console command rejected: {error}"),
             });
         }
         CommandMenuAction::Check
@@ -2964,7 +2967,7 @@ fn command_completion_status(status: &str, save_triggered_check: &mut bool) -> S
 
 #[allow(clippy::too_many_arguments)]
 fn command_tick_status(
-    tick_error: Option<&dyn Error>,
+    tick_error: Option<&(dyn Error + 'static)>,
     completed_test_case: bool,
     was_command_active: bool,
     command_active: bool,
@@ -2973,6 +2976,10 @@ fn command_tick_status(
     save_triggered_check: &mut bool,
 ) -> Option<String> {
     if let Some(error) = tick_error {
+        // Nothing started, so say why rather than pointing at evidence.
+        if error.is::<crate::session::RunRefused>() {
+            return Some(format!("Run rejected before it started: {error}"));
+        }
         return Some(if was_command_active && *save_triggered_check {
             *save_triggered_check = false;
             String::new()
@@ -4977,6 +4984,37 @@ format = ["cargo", "fmt"]
                 &mut save_triggered_check,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn a_run_refused_before_launch_says_why_as_an_error_toast() {
+        let refused = crate::session::RunRefused(
+            "the files in lab2.test-cases/files changed while the run was starting; run it again"
+                .into(),
+        );
+        let mut save_triggered_check = false;
+        let status = command_tick_status(
+            Some(&refused),
+            true,
+            true,
+            false,
+            false,
+            "test case finished",
+            &mut save_triggered_check,
+        )
+        .unwrap();
+        assert_eq!(
+            status,
+            "Run rejected before it started: the files in lab2.test-cases/files changed while the run was starting; run it again"
+        );
+        assert_eq!(
+            toast_for_status(&status),
+            Some(ToastState::new(
+                ToastKind::Error,
+                "action failed",
+                status.clone()
+            ))
         );
     }
 

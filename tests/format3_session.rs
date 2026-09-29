@@ -776,7 +776,7 @@ fn format3_fixture_change_during_start_child() {
         let result = session.take_test_case_result().unwrap();
         assert_eq!(
             result.outcome,
-            TestCaseOutcome::Error("could not start".into())
+            TestCaseOutcome::Error(format!("could not start: {expected}"))
         );
         undo();
     }

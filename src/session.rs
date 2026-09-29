@@ -86,6 +86,35 @@ pub enum ConsoleStart {
     OverwriteConfirmation { path: WorkspacePath },
 }
 
+/// Why a command cannot start right now, as opposed to a refusal of the
+/// command itself: another command owns the runner, a modal or recovery
+/// decision is pending, or the session needs recovery. Editors may show a
+/// generic "unavailable" notice for this and the specific reason otherwise.
+#[derive(Debug)]
+pub struct CommandUnavailable(String);
+
+impl std::fmt::Display for CommandUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Error for CommandUnavailable {}
+
+/// A console Run or test case refused after its tools resolved, just before
+/// launch, because what it would start with changed or could not be opened.
+/// Nothing ran, and the runner is free again.
+#[derive(Debug)]
+pub struct RunRefused(pub(crate) String);
+
+impl std::fmt::Display for RunRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Error for RunRefused {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExplicitSaveOutcome {
     CheckStarted,
@@ -2748,7 +2777,9 @@ impl ProductionSession {
     }
     fn require_command_idle(&self) -> Result<()> {
         if self.effects.0.borrow().command_active || self.command.pending_console.is_some() {
-            Err("command owns workspace; cancel or wait for its durable post-boundary".into())
+            Err(Box::new(CommandUnavailable(
+                "command owns workspace; cancel or wait for its durable post-boundary".into(),
+            )))
         } else {
             Ok(())
         }

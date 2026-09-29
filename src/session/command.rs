@@ -769,10 +769,16 @@ impl ProductionSession {
     }
 
     fn command_manifest(&self) -> Result<AssignmentManifest> {
-        self.effects.0.borrow().healthy()?;
+        self.effects
+            .0
+            .borrow()
+            .healthy()
+            .map_err(|error| CommandUnavailable(error.to_string()))?;
         self.verify_command_context()?;
         if self.command.modal || self.workspace.confirmation_pending() || self.external_pending() {
-            return Err("finish the current modal or recovery decision before a command".into());
+            return Err(Box::new(CommandUnavailable(
+                "finish the current modal or recovery decision before a command".into(),
+            )));
         }
         let bytes = self
             .effects
@@ -1786,8 +1792,12 @@ impl ProductionSession {
             Ok(console) => console,
             Err(error) => {
                 self.clear_command_ownership()?;
-                self.complete_test_case_error("could not start");
-                return Err(error);
+                let reason = error.to_string();
+                self.complete_test_case_error(&crate::display::label_fmt(
+                    format_args!("could not start: {reason}"),
+                    256,
+                ));
+                return Err(Box::new(RunRefused(reason)));
             }
         };
         let mut a = self.effects.0.borrow_mut();
