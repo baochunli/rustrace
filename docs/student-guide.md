@@ -986,13 +986,13 @@ Result     FAIL at line 2
 - **Arguments** are the lines of `NAME.args`, in order, each between `«` and
   `»`. The marks are not part of the argument; they show where it starts and
   ends, so a space inside an argument or at either end is visible. Control
-  characters, invisible and zero-width characters such as U+200B, characters
-  that change the direction of text such as U+202E, whitespace other than an
-  ordinary space such as U+00A0, and the marks themselves appear as escapes
-  such as `\u{202e}`. Every other character, including `\`, quotes, `*`, and
-  `$`, appears as itself and reaches your program unchanged. A case without
-  `NAME.args` shows `none`. If `NAME.args` cannot be read, the row says why, and
-  running the case reports `ERROR (could not start: ...)`.
+  characters, invisible and zero-width characters such as U+200B, joiners and
+  variation selectors such as U+200D and U+FE0F, characters that change the
+  direction of text such as U+202E, whitespace other than an ordinary space
+  such as U+00A0, and the marks themselves appear as escapes such as
+  `\u{202e}`. Every other character, including `\`, quotes, `*`, and `$`,
+  appears as itself and reaches your program unchanged. A case without
+  `NAME.args` shows `none`.
 - **Input** is `NAME.in` with its size, or `no input (stdin closed)` for a case
   without it.
 - **Runs in** is the folder your program starts in, such as
@@ -1000,14 +1000,22 @@ Result     FAIL at line 2
   program runs](#where-a-version-3-program-runs). If the package has no fixture
   files, it names your workspace folder instead.
 - **Files** lists the files in that folder, relative to it and as they are on
-  disk now, in name order. Every case in the assignment runs with the same
-  files. When the list does not fit, it ends with `… and N more`; a taller
-  terminal shows more of it.
+  disk now, in name order, with the same escapes as arguments. Every case in
+  the assignment runs with the same files. When the list does not fit, it ends
+  with `… and N more`; a taller terminal shows more of it.
 - **Result** is `not run yet`, `PASS`, `FAIL at line N` followed by the expected
   and actual previews that the output pane shows, or `ERROR` with its reason.
 
 When `Run all` is selected, the picker shows the folder, its files, and a tally
 such as `3 cases: 2 PASS, 1 FAIL, 0 ERROR, 0 not run yet`.
+
+A red `cannot start:` row, with the reason, marks a case that a run would
+refuse, so you can fix it first. It appears under **Arguments** when
+`NAME.args` does not parse, and under **Arguments** or **Input** when
+`NAME.args` or `NAME.in` is a link, a folder, or another special file rather
+than an ordinary file, or when `NAME.in` is larger than 1 MiB. It appears under
+**Runs in** when a `.cargo` folder or file is in your workspace, the test-case
+folder, or `files/`. Running such a case reports `ERROR (could not start: ...)`.
 
 If the files in the folder differ from the package, a yellow row under
 **Runs in** says `changed from the package; a run with them will not verify`,
@@ -1034,7 +1042,10 @@ For the case shown above, `cargo run -- -n fn main tests/grep.md` would not be
 the same: `fn main` is one argument with a space, which the console cannot
 type, because it has no quoting and a backslash does not escape a space. A
 case such as `«-n» «fn» «tests/grep.md»` with input `grep_n.in` is typed as
-`cargo run -- -n fn tests/grep.md < grep_n.in`. Without `< NAME.in`, the
+`cargo run -- -n fn tests/grep.md < grep_n.in`. An argument shown with an
+escape such as `\u{a0}` cannot be typed that way either: the console does not
+read escapes, so typing `\u{a0}` passes those six characters rather than the
+no-break space; run such a case from the picker. Without `< NAME.in`, the
 console gives your program the prompt as its standard input rather than
 closing it, so a program that reads standard input waits for you to type;
 Ctrl-C stops it.
