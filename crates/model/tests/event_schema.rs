@@ -147,6 +147,7 @@ fn every_v1_event_variant_has_exact_golden_json_and_round_trips() {
             expected_blake3: hash(12),
             actual_blake3: Some(hash(12)),
             outcome: TestCaseComparisonOutcome::Pass,
+            invocation: None,
         }),
         Event::TestCaseCompared(TestCaseCompared {
             command_id: command_id(),
@@ -158,6 +159,7 @@ fn every_v1_event_variant_has_exact_golden_json_and_round_trips() {
                 expected_len: 3,
                 actual_len: 4,
             },
+            invocation: None,
         }),
         Event::TestCaseCompared(TestCaseCompared {
             command_id: command_id(),
@@ -167,6 +169,7 @@ fn every_v1_event_variant_has_exact_golden_json_and_round_trips() {
             outcome: TestCaseComparisonOutcome::Error {
                 reason: TestCaseComparisonError::LaunchFailed,
             },
+            invocation: None,
         }),
         Event::FileCreated(FileCreated {
             document_id: document_id(),

@@ -424,8 +424,28 @@ limit of 1 MiB per case file and 10 MiB across all case files. The `.rta` file
 itself must be no larger than 32 MiB. Version 1 packages remain accepted
 unchanged and do not contain packaged test cases.
 
+Version 3 packages extend these cases for programs that take command-line
+arguments or read files. `NAME.expected` is still required, but `NAME.in` is
+optional: a case without it runs with standard input closed. A case may also
+have `NAME.args`, which lists the program's arguments one per line, exactly as
+written, without shell quoting. A version 3 package may include a
+`test-cases/files/` folder of files for the cases to read. Its files count
+toward the same 1 MiB and 10 MiB limits. Case names that differ only in letter
+case, `.cargo` folders, and system files such as `.DS_Store` are not allowed.
+
 For a version 2 package, Rustrace places the cases next to the workspace as
 `WORKSPACE_PARENT/test-cases/`; it does not put them inside `assignment.work`.
+A version 3 package gets its own folder next to the workspace instead, named
+after it: `lab2.work` gets `lab2.test-cases/`, with any `files/` folder inside
+it, so two version 3 assignments in one folder keep their cases apart. A
+workspace name without `.work` gets `.test-cases` added to the whole name.
+Rustrace refuses a version 3 workspace named `test-cases`, ending in
+`.test-cases`, or containing `{` or `}`. The folder's `.rustrace-cases.json`
+records which workspace and package it belongs to, so `lab2` cannot reuse the
+folder of `lab2.work`, and a folder from another package version is refused;
+move such a folder aside and run the command again. Rustrace never uses a
+workspace as a test-case folder. Opening these folders in Finder is fine; its
+`.DS_Store` files are ignored.
 Rustrace checks every packaged case path before publishing a fresh workspace.
 It never replaces a different file, symlink, directory, or other special entry.
 If the sibling directory already contains the exact packaged bytes, startup

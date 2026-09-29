@@ -101,7 +101,10 @@ fn v2_returns_sorted_complete_cases_without_extracting_them_into_the_workspace()
     let suite = extracted.test_cases.expect("v2 suite");
     assert_eq!(suite.cases.len(), 2);
     assert_eq!(suite.cases[0].name, "a_first");
-    assert_eq!(suite.cases[0].input, b"a-in\n");
+    assert_eq!(suite.cases[0].input.as_deref(), Some(&b"a-in\n"[..]));
+    assert_eq!(suite.cases[0].args_file, None);
+    assert!(suite.cases[0].args.is_empty());
+    assert_eq!(suite.fixtures, None);
     assert_eq!(suite.cases[0].expected, b"a-out\n");
     assert_eq!(suite.cases[1].name, "z-last");
     assert_eq!(suite.total_bytes, 22);
@@ -167,7 +170,7 @@ fn v2_requires_a_nonempty_complete_suite() {
 
         assert!(matches!(
             error,
-            AssignmentPackageError::MissingTestCases
+            AssignmentPackageError::MissingTestCases { format_version: 2 }
                 | AssignmentPackageError::IncompleteTestCase { .. }
         ));
         assert!(error.to_string().contains(expected));
@@ -449,6 +452,38 @@ fn suite_hash_is_order_independent_and_changes_for_input_or_expected_bytes() {
     assert_ne!(
         baseline,
         hash(archive(b"input", b"expecteD", false), "expected-change")
+    );
+}
+
+#[test]
+fn v1_suite_hash_domain_has_a_fixed_golden_value() {
+    // Lab 1-style format 2 suite. This value must never change: sessions,
+    // `.rprov` manifests, and verify references all carry it.
+    let manifest = manifest_v2();
+    let mut entries = base_entries(&manifest);
+    entries.extend([
+        Entry::file("test-cases/01-opening.in", b"d3\n"),
+        Entry::file(
+            "test-cases/01-opening.expected",
+            b"  abcdefgh\n1 ........\n",
+        ),
+        Entry::file("test-cases/02-empty.in", b""),
+        Entry::file("test-cases/02-empty.expected", b""),
+    ]);
+    let root = TempRoot::new();
+    let suite = extract_assignment_package(
+        Cursor::new(package(&entries)),
+        &root.path().join("golden"),
+        ExtractionLimits::default(),
+    )
+    .unwrap()
+    .test_cases
+    .unwrap();
+
+    assert_eq!(
+        suite.hash.to_string(),
+        "2a2c2ebb5154361b9b552fa8c35b94989fa9db1c34d1234b906c32989d3d9fc8",
+        "the format 2 suite hash (rustrace.test-case-suite.v1) changed"
     );
 }
 

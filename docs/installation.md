@@ -87,7 +87,7 @@ Release metadata is available at
 once a release is published. It identifies the source repository and tag; its
 `targets` map is empty. `package_format` is the provenance container version
 (`.rprov`, currently 1). `assignment_format` is the highest accepted assignment
-package version (`.rta`, currently 2). `event_format` identifies the event
+package version (`.rta`, currently 3). `event_format` identifies the event
 envelope version (currently 1). These fields match `rustrace --version --verbose`.
 Together, these fields define the release manifest contract used by installation
 and update checks.

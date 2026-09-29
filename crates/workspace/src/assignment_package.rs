@@ -18,8 +18,15 @@ use rustix::fs::{
 use rustix::io::Errno;
 
 use rustrace_model::assignment::{AssignmentManifest, AssignmentManifestError, MAX_MANIFEST_BYTES};
-use rustrace_model::{Hash, WorkspacePath, WorkspacePathError};
+use rustrace_model::{
+    Hash, MAX_TEST_CASE_ARGS_FILE_BYTES, TestCaseArgsError, WorkspacePath, WorkspacePathError,
+    parse_test_case_args,
+};
 
+use crate::fixture_tree::{
+    FIXTURE_ROOT, FixturePathProblem, FixtureTree, FixtureTreeError, fixture_path_problem,
+    has_cargo_configuration_component,
+};
 use crate::hash::{
     MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_FILES, MAX_WORKSPACE_TOTAL_BYTES, PinnedWorkspaceRoot,
 };
@@ -34,7 +41,8 @@ pub const HARD_MAX_ENTRIES: usize = 4096;
 pub const MAX_TEST_CASES: usize = 256;
 /// Maximum number of bytes in one packaged test-case file.
 pub const MAX_TEST_CASE_FILE_BYTES: u64 = 1024 * 1024;
-/// Maximum combined bytes across all packaged test-case files.
+/// Maximum combined bytes across all packaged test-case files, including
+/// format 3 `NAME.args` files and fixture files.
 pub const MAX_TEST_CASE_TOTAL_BYTES: u64 = 10 * 1024 * 1024;
 /// Maximum expanded bytes: manifest plus independent starter and case limits.
 pub const HARD_MAX_EXPANDED_BYTES: u64 =
@@ -127,7 +135,13 @@ pub struct ExtractedAssignment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedTestCaseSuite {
+    /// The package's `format_version` (2 or 3), which selects where the cases
+    /// are deployed and which files make a case.
+    pub format_version: u32,
     pub cases: Vec<ExtractedTestCase>,
+    /// The format 3 `test-cases/files/` tree; always `None` for format 2.
+    pub fixtures: Option<FixtureTree>,
+    /// `rustrace.test-case-suite.v1` for format 2, `.v2` for format 3.
     pub hash: Hash,
     pub total_bytes: u64,
 }
@@ -135,8 +149,27 @@ pub struct ExtractedTestCaseSuite {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedTestCase {
     pub name: String,
-    pub input: Vec<u8>,
+    /// `NAME.in`: required in format 2, optional in format 3 (absent means
+    /// the program runs with standard input closed).
+    pub input: Option<Vec<u8>>,
+    /// The exact `NAME.args` bytes of a format 3 case, validated.
+    pub args_file: Option<Vec<u8>>,
+    /// The parsed program arguments; empty without a `NAME.args` file.
+    pub args: Vec<String>,
     pub expected: Vec<u8>,
+}
+
+impl ExtractedTestCase {
+    /// A format 2 case: input and expected output only.
+    pub fn paired(name: impl Into<String>, input: Vec<u8>, expected: Vec<u8>) -> Self {
+        Self {
+            name: name.into(),
+            input: Some(input),
+            args_file: None,
+            args: Vec::new(),
+            expected,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -186,12 +219,14 @@ impl std::error::Error for PublishPreparedWorkspaceError {
 #[derive(Default)]
 struct PartialTestCase {
     input: Option<Vec<u8>>,
+    args: Option<Vec<u8>>,
     expected: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy)]
 enum TestCaseFileKind {
     Input,
+    Args,
     Expected,
 }
 
@@ -357,6 +392,7 @@ fn extract_supported<R: Read>(
     let mut starter_bytes = 0_u64;
     let mut test_cases = BTreeMap::<String, PartialTestCase>::new();
     let mut test_case_bytes = 0_u64;
+    let mut fixtures = None::<FixtureTree>;
     let mut entry_count = 0_usize;
     let mut expanded_bytes = 0_u64;
 
@@ -519,12 +555,55 @@ fn extract_supported<R: Read>(
                 starter_bytes = attempted_bytes;
             }
             PackageEntry::TestCasesRoot => {}
-            PackageEntry::TestCaseFile { name, kind } => {
+            PackageEntry::FixturesRoot => {
+                fixtures.get_or_insert_default();
+            }
+            PackageEntry::FixtureDirectory(relative) => {
+                fixtures
+                    .get_or_insert_default()
+                    .insert_directory(relative)
+                    .map_err(|source| AssignmentPackageError::Fixtures { source })?;
+            }
+            PackageEntry::FixtureFile(relative) => {
                 if size > MAX_TEST_CASE_FILE_BYTES {
                     return Err(AssignmentPackageError::TestCaseFileSizeLimitExceeded {
                         path,
                         actual: size,
                         limit: MAX_TEST_CASE_FILE_BYTES,
+                    });
+                }
+                let attempted_bytes = test_case_bytes.checked_add(size).ok_or(
+                    AssignmentPackageError::TestCaseTotalSizeLimitExceeded {
+                        attempted: u64::MAX,
+                        limit: MAX_TEST_CASE_TOTAL_BYTES,
+                    },
+                )?;
+                if attempted_bytes > MAX_TEST_CASE_TOTAL_BYTES {
+                    return Err(AssignmentPackageError::TestCaseTotalSizeLimitExceeded {
+                        attempted: attempted_bytes,
+                        limit: MAX_TEST_CASE_TOTAL_BYTES,
+                    });
+                }
+                let mut contents = vec![0_u8; size as usize];
+                read_exact_content(&mut source, &mut contents, &path)?;
+                fixtures
+                    .get_or_insert_default()
+                    .insert_file(relative, contents)
+                    .map_err(|source| AssignmentPackageError::Fixtures { source })?;
+                test_case_bytes = attempted_bytes;
+            }
+            PackageEntry::TestCaseFile { name, kind } => {
+                let file_limit = match kind {
+                    TestCaseFileKind::Args => MAX_TEST_CASE_ARGS_FILE_BYTES as u64,
+                    TestCaseFileKind::Input | TestCaseFileKind::Expected => {
+                        MAX_TEST_CASE_FILE_BYTES
+                    }
+                };
+                if size > file_limit {
+                    return Err(AssignmentPackageError::TestCaseFileSizeLimitExceeded {
+                        path,
+                        actual: size,
+                        limit: file_limit,
                     });
                 }
                 let is_new_case = !test_cases.contains_key(&name);
@@ -552,6 +631,7 @@ fn extract_supported<R: Read>(
                 let case = test_cases.entry(name).or_default();
                 match kind {
                     TestCaseFileKind::Input => case.input = Some(contents),
+                    TestCaseFileKind::Args => case.args = Some(contents),
                     TestCaseFileKind::Expected => case.expected = Some(contents),
                 }
                 test_case_bytes = attempted_bytes;
@@ -565,19 +645,41 @@ fn extract_supported<R: Read>(
     if starter_files == 0 {
         return Err(AssignmentPackageError::MissingStarterFiles);
     }
-    let test_cases = if manifest.format_version == 2 {
-        if test_cases.is_empty() {
-            return Err(AssignmentPackageError::MissingTestCases);
+    let test_cases = match manifest.format_version {
+        2 => {
+            if test_cases.is_empty() {
+                return Err(AssignmentPackageError::MissingTestCases { format_version: 2 });
+            }
+            let cases = complete_test_cases(test_cases)?;
+            let hash = hash_test_case_suite(&cases);
+            Some(ExtractedTestCaseSuite {
+                format_version: 2,
+                cases,
+                fixtures: None,
+                hash,
+                total_bytes: test_case_bytes,
+            })
         }
-        let cases = complete_test_cases(test_cases)?;
-        let hash = hash_test_case_suite(&cases);
-        Some(ExtractedTestCaseSuite {
-            cases,
-            hash,
-            total_bytes: test_case_bytes,
-        })
-    } else {
-        None
+        3 => {
+            if test_cases.is_empty() {
+                return Err(AssignmentPackageError::MissingTestCases { format_version: 3 });
+            }
+            let cases = complete_format3_test_cases(test_cases)?;
+            if let Some(fixtures) = &fixtures {
+                fixtures
+                    .reject_host_aliases()
+                    .map_err(|source| AssignmentPackageError::Fixtures { source })?;
+            }
+            let hash = hash_test_case_suite_v2(&cases, fixtures.as_ref());
+            Some(ExtractedTestCaseSuite {
+                format_version: 3,
+                cases,
+                fixtures,
+                hash,
+                total_bytes: test_case_bytes,
+            })
+        }
+        _ => None,
     };
     validate_starter_manifest(starter_manifest.as_deref())?;
     let _published = staging.publish()?;
@@ -715,10 +817,26 @@ pub enum AssignmentPackageError {
     StarterPackageStructure {
         reason: String,
     },
-    MissingTestCases,
+    MissingTestCases {
+        format_version: u32,
+    },
     IncompleteTestCase {
         name: String,
         missing: &'static str,
+    },
+    InvalidTestCaseArgs {
+        name: String,
+        source: TestCaseArgsError,
+    },
+    TestCaseNameConflict {
+        name: String,
+        other: String,
+    },
+    StarterCargoConfiguration {
+        path: String,
+    },
+    Fixtures {
+        source: FixtureTreeError,
     },
     WouldOverwrite {
         path: PathBuf,
@@ -862,13 +980,28 @@ impl fmt::Display for AssignmentPackageError {
                 formatter,
                 "assignment starter must be a self-contained package: {reason}"
             ),
-            Self::MissingTestCases => write!(
+            Self::MissingTestCases { format_version } => write!(
                 formatter,
-                "assignment package format_version 2 has no test cases; a nonempty test-cases/ suite is required"
+                "assignment package format_version {format_version} has no test cases; a nonempty test-cases/ suite is required"
             ),
             Self::IncompleteTestCase { name, missing } => write!(
                 formatter,
                 "assignment package test case `{name}` is missing `{missing}`"
+            ),
+            Self::InvalidTestCaseArgs { name, source } => write!(
+                formatter,
+                "assignment package test case file `test-cases/{name}.args` {source}"
+            ),
+            Self::Fixtures { source } => {
+                write!(formatter, "assignment package test-cases/{source}")
+            }
+            Self::StarterCargoConfiguration { path } => write!(
+                formatter,
+                "assignment package format_version 3 cannot include Cargo configuration `{path}`: programs run from test-cases/files/, where Cargo does not read it"
+            ),
+            Self::TestCaseNameConflict { name, other } => write!(
+                formatter,
+                "assignment package test cases `{other}` and `{name}` differ only in letter case"
             ),
             Self::WouldOverwrite { path } => write!(
                 formatter,
@@ -909,6 +1042,8 @@ impl std::error::Error for AssignmentPackageError {
             Self::InvalidStarterPath { source, .. } => Some(source),
             Self::Manifest { source } => Some(source),
             Self::PathPolicy { source } => Some(source),
+            Self::InvalidTestCaseArgs { source, .. } => Some(source),
+            Self::Fixtures { source } => Some(source),
             _ => None,
         }
     }
@@ -943,6 +1078,9 @@ enum PackageEntry {
         name: String,
         kind: TestCaseFileKind,
     },
+    FixturesRoot,
+    FixtureDirectory(WorkspacePath),
+    FixtureFile(WorkspacePath),
 }
 
 fn validate_header(header: &[u8; BLOCK_SIZE], entry: usize) -> Result<(), AssignmentPackageError> {
@@ -1136,21 +1274,63 @@ fn classify_entry(
                 ))
             };
         }
+        let relative = &path["test-cases/".len()..];
+        if format_version == Some(3) {
+            if relative == FIXTURE_ROOT {
+                return if kind == EntryKind::Directory {
+                    Ok(PackageEntry::FixturesRoot)
+                } else {
+                    Err(invalid_test_case_path(
+                        path,
+                        "test-cases/files must be a directory",
+                    ))
+                };
+            }
+            if let Some(fixture) = relative.strip_prefix("files/") {
+                let not_canonical = || {
+                    invalid_test_case_path(
+                        path,
+                        "fixture paths must be canonical NFC workspace paths without control characters",
+                    )
+                };
+                let fixture = WorkspacePath::new(fixture).map_err(|_| not_canonical())?;
+                match fixture_path_problem(&fixture) {
+                    None => {}
+                    Some(FixturePathProblem::NotCanonical) => return Err(not_canonical()),
+                    Some(problem) => return Err(invalid_test_case_path(path, problem.reason())),
+                }
+                return Ok(match kind {
+                    EntryKind::File => PackageEntry::FixtureFile(fixture),
+                    EntryKind::Directory => PackageEntry::FixtureDirectory(fixture),
+                });
+            }
+        }
         if kind == EntryKind::Directory {
             return Err(invalid_test_case_path(
                 path,
-                "directories below test-cases/ are not allowed",
+                if format_version == Some(3) {
+                    "directories below test-cases/ are allowed only in test-cases/files/"
+                } else {
+                    "directories below test-cases/ are not allowed"
+                },
             ));
         }
-        let relative = &path["test-cases/".len()..];
         let (name, kind) = if let Some(name) = relative.strip_suffix(".expected") {
             (name, TestCaseFileKind::Expected)
         } else if let Some(name) = relative.strip_suffix(".in") {
             (name, TestCaseFileKind::Input)
+        } else if format_version == Some(3)
+            && let Some(name) = relative.strip_suffix(".args")
+        {
+            (name, TestCaseFileKind::Args)
         } else {
             return Err(invalid_test_case_path(
                 path,
-                "expected NAME.in or NAME.expected",
+                if format_version == Some(3) {
+                    "expected NAME.in, NAME.args, NAME.expected, or a path in files/"
+                } else {
+                    "expected NAME.in or NAME.expected"
+                },
             ));
         };
         if name.is_empty() || name.len() > 64 {
@@ -1188,6 +1368,14 @@ fn classify_entry(
             source,
         },
     })?;
+    // Format 3 runs a program from test-cases/files/, where Cargo does not read
+    // the workspace's `.cargo` configuration, so F7 builds and fixture runs
+    // would build differently.
+    if format_version == Some(3) && has_cargo_configuration_component(&relative) {
+        return Err(AssignmentPackageError::StarterCargoConfiguration {
+            path: path.to_owned(),
+        });
+    }
     Ok(match kind {
         EntryKind::File => PackageEntry::StarterFile(relative),
         EntryKind::Directory => PackageEntry::StarterDirectory(relative),
@@ -1219,9 +1407,51 @@ fn complete_test_cases(
                         name: name.clone(),
                         missing: ".expected",
                     })?;
+            Ok(ExtractedTestCase::paired(name, input, expected))
+        })
+        .collect()
+}
+
+/// Format 3 cases require `NAME.expected`; `NAME.in` and `NAME.args` are
+/// optional, and a present `NAME.args` must parse.
+fn complete_format3_test_cases(
+    cases: BTreeMap<String, PartialTestCase>,
+) -> Result<Vec<ExtractedTestCase>, AssignmentPackageError> {
+    // Case files share one deployed folder; names that differ only in ASCII
+    // letter case would merge on case-insensitive filesystems such as macOS.
+    let mut folded = BTreeMap::<String, &str>::new();
+    for name in cases.keys() {
+        if let Some(other) = folded.insert(name.to_ascii_lowercase(), name) {
+            return Err(AssignmentPackageError::TestCaseNameConflict {
+                name: name.clone(),
+                other: other.to_owned(),
+            });
+        }
+    }
+    cases
+        .into_iter()
+        .map(|(name, case)| {
+            let expected =
+                case.expected
+                    .ok_or_else(|| AssignmentPackageError::IncompleteTestCase {
+                        name: name.clone(),
+                        missing: ".expected",
+                    })?;
+            let args = case
+                .args
+                .as_deref()
+                .map(parse_test_case_args)
+                .transpose()
+                .map_err(|source| AssignmentPackageError::InvalidTestCaseArgs {
+                    name: name.clone(),
+                    source,
+                })?
+                .unwrap_or_default();
             Ok(ExtractedTestCase {
                 name,
-                input,
+                input: case.input,
+                args_file: case.args,
+                args,
                 expected,
             })
         })
@@ -1239,8 +1469,58 @@ fn hash_test_case_suite(cases: &[ExtractedTestCase]) -> Hash {
         let name_length = u32::try_from(case.name.len()).expect("case name limit fits in a u32");
         hasher.update(&name_length.to_be_bytes());
         hasher.update(case.name.as_bytes());
-        hash_bytes(&mut hasher, &case.input);
+        hash_bytes(
+            &mut hasher,
+            case.input.as_deref().expect("format 2 cases have input"),
+        );
         hash_bytes(&mut hasher, &case.expected);
+    }
+    Hash::from_bytes(*hasher.finalize().as_bytes())
+}
+
+/// The format 3 suite hash. In order: the byte string
+/// `rustrace.test-case-suite.v2`; the case count as a big-endian `u32`; for
+/// each case in bytewise `NAME` order, the name length as a big-endian `u32`
+/// and the name bytes, then its `.args`, `.in`, and `.expected` files in that
+/// fixed role order, each as a presence byte (0 absent, 1 present) followed,
+/// when present, by its length as a big-endian `u64` and its bytes; finally a
+/// fixture presence byte followed, when present, by the 32-byte
+/// [`FixtureTree::hash`].
+fn hash_test_case_suite_v2(cases: &[ExtractedTestCase], fixtures: Option<&FixtureTree>) -> Hash {
+    const PREFIX: &[u8] = b"rustrace.test-case-suite.v2";
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(PREFIX);
+    let count = u32::try_from(cases.len()).expect("test-case limit fits in a u32");
+    hasher.update(&count.to_be_bytes());
+    for case in cases {
+        let name_length = u32::try_from(case.name.len()).expect("case name limit fits in a u32");
+        hasher.update(&name_length.to_be_bytes());
+        hasher.update(case.name.as_bytes());
+        for role in [
+            case.args_file.as_deref(),
+            case.input.as_deref(),
+            Some(case.expected.as_slice()),
+        ] {
+            match role {
+                Some(bytes) => {
+                    hasher.update(&[1]);
+                    hash_bytes(&mut hasher, bytes);
+                }
+                None => {
+                    hasher.update(&[0]);
+                }
+            }
+        }
+    }
+    match fixtures {
+        Some(fixtures) => {
+            hasher.update(&[1]);
+            hasher.update(fixtures.hash().as_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
     }
     Hash::from_bytes(*hasher.finalize().as_bytes())
 }

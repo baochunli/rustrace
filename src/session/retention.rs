@@ -332,12 +332,35 @@ pub fn run_revise(args: &[String], output: &mut impl Write) -> Result<()> {
         return Err("revision assignment package differs from the finalized parent".into());
     }
 
+    // A format 3 revision gets its own NEW.test-cases/ folder, like `work`:
+    // refuse an unusable name or a folder owned by something else first.
+    let format3_suite = extracted
+        .test_cases
+        .as_ref()
+        .filter(|suite| suite.format_version == 3);
+    if let Some(suite) = format3_suite {
+        work::preflight_test_case_suite(&new_workspace, suite)?;
+    }
+
     materialize_revision(&new_workspace, receipt.final_workspace())?;
-    let session =
-        ProductionSession::start_revision(&parent, &new_workspace, &extracted.manifest_bytes)?;
+    let session = ProductionSession::start_revision_with_fixtures(
+        &parent,
+        &new_workspace,
+        &extracted.manifest_bytes,
+        crate::session::packaged_fixtures_hash(&extracted),
+    )?;
     let child_id = session.session_id().clone();
     let parent_id = receipt.manifest().latest_session_id.clone();
     session.quit()?;
+    if let Some(suite) = format3_suite
+        && let Err(error) = work::deploy_test_case_suite(&new_workspace, suite)
+    {
+        return Err(format!(
+            "started linked revision {child_id} at {}, but {error}; run `rustrace work ASSIGNMENT.rta --workspace NEW_WORKSPACE --resume` to deploy the test cases again",
+            safe_path(&new_workspace)
+        )
+        .into());
+    }
     writeln!(
         output,
         "Started linked revision {child_id} at {}; immutable parent {parent_id} remains unchanged at {}.",

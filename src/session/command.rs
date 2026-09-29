@@ -612,14 +612,23 @@ impl ProductionSession {
     }
 
     pub fn list_test_cases(&self) -> Result<Vec<TestCase>> {
-        TestCaseDirectory::open(self.workspace.root())?.list_cases()
+        TestCaseDirectory::open(
+            self.workspace.root(),
+            self.test_case_layout(),
+            self.metadata.test_case_suite_hash,
+        )?
+        .list_cases()
     }
 
     pub fn start_test_case(&mut self, case: TestCase) -> Result<()> {
         self.clear_completion();
         self.require_command_idle()?;
         let manifest = self.command_manifest()?;
-        let cases = TestCaseDirectory::open(self.workspace.root())?;
+        let cases = TestCaseDirectory::open(
+            self.workspace.root(),
+            self.test_case_layout(),
+            self.metadata.test_case_suite_hash,
+        )?;
         let input = cases.open_input(&case.input_path())?;
         // Reject bad expected files before launch by design. ExpectedUnreadable and
         // ExpectedOversized remain in the closed vocabulary for stream acceptance only.
@@ -674,7 +683,13 @@ impl ProductionSession {
     fn prepare_console_launch(&self, request: ConsoleCommand) -> Result<ConsoleLaunch> {
         let needs_cases = request.stdin.is_some() || request.stdout.is_some();
         let cases = needs_cases
-            .then(|| TestCaseDirectory::open(self.workspace.root()))
+            .then(|| {
+                TestCaseDirectory::open(
+                    self.workspace.root(),
+                    self.test_case_layout(),
+                    self.metadata.test_case_suite_hash,
+                )
+            })
             .transpose()?;
         let input = match (&cases, &request.stdin) {
             (Some(cases), Some(path)) => Some(cases.open_input(path)?),
@@ -988,11 +1003,13 @@ impl ProductionSession {
                 .clone(),
             deadline_millis,
             output_limit: 1,
-            console: case.map(|case| ConsoleCommandRoute {
-                stdin: ConsoleStdinRoute::File {
-                    path: WorkspacePath::new(format!("{case}.in")).unwrap(),
-                },
-                stdout: ConsoleStdoutRoute::Console,
+            console: case.map(|case| {
+                ConsoleCommandRoute::new(
+                    ConsoleStdinRoute::File {
+                        path: WorkspacePath::new(format!("{case}.in")).unwrap(),
+                    },
+                    ConsoleStdoutRoute::Console,
+                )
             }),
         };
         if case.is_some() {
@@ -2478,6 +2495,7 @@ fn test_case_event(
         expected_blake3,
         actual_blake3: comparison.actual_blake3,
         outcome,
+        invocation: None,
     };
     event.validate()?;
     Ok(event)
@@ -2513,17 +2531,17 @@ fn prepare_console_io(mut launch: ConsoleLaunch) -> Result<ConsoleIo> {
     } else {
         (ProcessStdin::Closed, None)
     };
-    let route = ConsoleCommandRoute {
-        stdin: match &launch.request.stdin {
+    let route = ConsoleCommandRoute::new(
+        match &launch.request.stdin {
             Some(path) => ConsoleStdinRoute::File { path: path.clone() },
             None if launch.request.action == CargoAction::Run => ConsoleStdinRoute::Submitted,
             None => ConsoleStdinRoute::Closed,
         },
-        stdout: match &launch.request.stdout {
+        match &launch.request.stdout {
             Some(path) => ConsoleStdoutRoute::File { path: path.clone() },
             None => ConsoleStdoutRoute::Console,
         },
-    };
+    );
     let live = LiveOutput::new(command_process::MAX_LIVE_OUTPUT_BYTES);
     Ok(ConsoleIo {
         route,

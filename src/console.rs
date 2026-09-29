@@ -1,11 +1,12 @@
 //! Small local state for the embedded piped Cargo console.
 
-use rustrace_model::{Hash, WorkspacePath};
+use rustrace_model::{Hash, MAX_TEST_CASE_ARGS_FILE_BYTES, WorkspacePath, parse_test_case_args};
 use rustrace_workspace::hash::PinnedWorkspaceRoot;
 use rustrace_workspace::{
     OpenedRegularFile,
     assignment_package::{MAX_TEST_CASE_FILE_BYTES, MAX_TEST_CASE_TOTAL_BYTES, MAX_TEST_CASES},
     create_external_regular_file_in, external_regular_file_exists_in,
+    fixture_tree::{FIXTURE_ROOT, FixtureTree, read_deployed_fixture_tree},
     list_external_regular_files_in_with_filter, open_external_regular_file_read_in,
     open_external_regular_file_write_in,
 };
@@ -14,7 +15,7 @@ use std::{
     error::Error,
     fs,
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -36,26 +37,256 @@ pub(crate) enum OutputDisposition {
     Overwrite,
 }
 
+/// The one case folder beside every format 1 or 2 workspace.
+pub(crate) const FIXED_TEST_CASE_FOLDER: &str = "test-cases";
+/// The suffix of a format 3 workspace's own case folder.
+pub(crate) const TEST_CASE_FOLDER_SUFFIX: &str = ".test-cases";
+const WORKSPACE_SUFFIX: &str = ".work";
+const MAX_FOLDER_NAME_BYTES: usize = 255;
+
+/// Where a session's packaged cases live and which files make a case.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TestCaseLayout {
+    /// Formats 1 and 2: the shared sibling `test-cases/`, where a case is a
+    /// complete `NAME.in` and `NAME.expected` pair.
+    Paired,
+    /// Format 3: the workspace's own sibling `NAME.test-cases/`, where a case
+    /// is `NAME.expected` with optional `NAME.in` and `NAME.args`, beside an
+    /// optional `files/` fixture tree.
+    Extended,
+}
+
+impl TestCaseLayout {
+    pub(crate) fn for_format_version(format_version: u32) -> Self {
+        if format_version == 3 {
+            Self::Extended
+        } else {
+            Self::Paired
+        }
+    }
+
+    /// The case folder's name beside a workspace directory named
+    /// `workspace_name`. Format 3 derives it from the workspace: `lab2.work`
+    /// gets `lab2.test-cases`, and any other name gets `.test-cases`
+    /// appended. A name that could be another workspace's case folder, the
+    /// shared format 2 folder, or a Cargo template is refused.
+    pub(crate) fn folder_name(self, workspace_name: &std::ffi::OsStr) -> Result<String> {
+        match self {
+            Self::Paired => {
+                if workspace_name == FIXED_TEST_CASE_FOLDER {
+                    return Err(
+                        "the selected workspace cannot be the fixed sibling test-cases directory"
+                            .into(),
+                    );
+                }
+                Ok(FIXED_TEST_CASE_FOLDER.to_owned())
+            }
+            Self::Extended => {
+                let name = workspace_name
+                    .to_str()
+                    .ok_or("a format 3 workspace name must be valid UTF-8")?;
+                let lowercase = name.to_ascii_lowercase();
+                if lowercase == FIXED_TEST_CASE_FOLDER
+                    || lowercase.ends_with(TEST_CASE_FOLDER_SUFFIX)
+                {
+                    return Err(format!(
+                        "a format 3 workspace cannot be named `{FIXED_TEST_CASE_FOLDER}` or end in `{TEST_CASE_FOLDER_SUFFIX}`, which name test-case folders"
+                    )
+                    .into());
+                }
+                if name.contains(['{', '}']) {
+                    return Err(
+                        "a format 3 workspace name cannot contain `{` or `}`, which Cargo reads as build-directory template variables"
+                            .into(),
+                    );
+                }
+                let stem = name.strip_suffix(WORKSPACE_SUFFIX).unwrap_or(name);
+                if stem.is_empty() {
+                    return Err("a format 3 workspace needs a name before `.work`".into());
+                }
+                let folder = format!("{stem}{TEST_CASE_FOLDER_SUFFIX}");
+                if folder.len() > MAX_FOLDER_NAME_BYTES {
+                    return Err(format!(
+                        "the test-case folder name `{folder}` would exceed {MAX_FOLDER_NAME_BYTES} bytes"
+                    )
+                    .into());
+                }
+                Ok(folder)
+            }
+        }
+    }
+}
+
+/// The sibling case folder of `workspace_root` for this layout.
+pub(crate) fn test_case_folder(workspace_root: &Path, layout: TestCaseLayout) -> Result<PathBuf> {
+    let name = workspace_root
+        .file_name()
+        .ok_or("the workspace must name a directory")?;
+    let parent = workspace_root
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or("workspace has no parent for sibling test-cases")?;
+    Ok(parent.join(layout.folder_name(name)?))
+}
+
+/// Rustrace's ownership record at the top of a format 3 case folder. Its name
+/// is not a case file, so packages cannot contain it and listings skip it, and
+/// it lies outside `files/`, so the fixture-tree hash never covers it.
+pub(crate) const CASE_FOLDER_MARKER: &str = ".rustrace-cases.json";
+const MAX_CASE_FOLDER_MARKER_BYTES: u64 = 4096;
+
+/// Which workspace and packaged suite a format 3 case folder belongs to.
+/// `lab2` and `lab2.work` both map to `lab2.test-cases`, and one workspace
+/// name can meet two package versions, so deployment and opening check it.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CaseFolderMarker {
+    pub version: u32,
+    /// The owning workspace directory's name.
+    pub workspace: String,
+    pub test_case_suite_hash: Hash,
+}
+
+impl CaseFolderMarker {
+    pub(crate) fn new(workspace: &str, test_case_suite_hash: Hash) -> Self {
+        Self {
+            version: 1,
+            workspace: workspace.to_owned(),
+            test_case_suite_hash,
+        }
+    }
+
+    /// Compact JSON followed by one LF.
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(self).expect("marker fields serialize");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    /// Reads the marker of a case folder, or `None` when it has none.
+    pub(crate) fn read(root: &PinnedWorkspaceRoot) -> Result<Option<Self>> {
+        let path = WorkspacePath::new(CASE_FOLDER_MARKER).expect("valid marker name");
+        if !external_regular_file_exists_in(root, &path)? {
+            return Ok(None);
+        }
+        let mut opened = open_external_regular_file_read_in(root, &path)?;
+        let mut bytes = Vec::new();
+        opened
+            .file_mut()
+            .take(MAX_CASE_FOLDER_MARKER_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        root.verify_binding()?;
+        let marker = serde_json::from_slice::<Self>(&bytes)
+            .ok()
+            .filter(|marker| {
+                bytes.len() as u64 <= MAX_CASE_FOLDER_MARKER_BYTES
+                    && marker.version == 1
+                    && marker.encode() == bytes
+            })
+            .ok_or_else(|| {
+                format!(
+                    "the test-case folder `{}` has an unreadable {CASE_FOLDER_MARKER}",
+                    root.path().display()
+                )
+            })?;
+        Ok(Some(marker))
+    }
+
+    /// Requires `root` to be a case folder Rustrace created for the workspace
+    /// named `workspace` and, when given, for the packaged suite `suite`.
+    pub(crate) fn require(
+        root: &PinnedWorkspaceRoot,
+        workspace: &str,
+        suite: Option<Hash>,
+    ) -> Result<()> {
+        let folder = root.path().display();
+        let marker = Self::read(root)?.ok_or_else(|| {
+            format!(
+                "the test-case folder `{folder}` was not created by Rustrace for this workspace; move it aside and run the same command again"
+            )
+        })?;
+        if marker.workspace != workspace {
+            return Err(format!(
+                "the test-case folder `{folder}` belongs to the workspace `{}`, not `{workspace}`; choose another workspace name",
+                crate::display::label(&marker.workspace, 256)
+            )
+            .into());
+        }
+        if suite.is_some_and(|suite| suite != marker.test_case_suite_hash) {
+            return Err(format!(
+                "the test-case folder `{folder}` holds the cases of a different assignment package; move it aside and run the same command again"
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+/// Refuses a would-be case folder that is itself a Rustrace workspace.
+pub(crate) fn refuse_workspace_as_case_folder(folder: &Path) -> Result<()> {
+    match fs::symlink_metadata(folder.join(".rustrace")) {
+        Ok(_) => Err(format!(
+            "`{}` is a Rustrace workspace, not a test-case folder",
+            folder.display()
+        )
+        .into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The name a case-folder marker records for a workspace: its name on disk
+/// when it exists, so a differently cased spelling on macOS still matches.
+pub(crate) fn case_folder_owner(workspace_root: &Path) -> Result<String> {
+    let resolved = match fs::canonicalize(workspace_root) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => workspace_root.to_owned(),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(resolved
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("a format 3 workspace name must be valid UTF-8")?
+        .to_owned())
+}
+
+/// How a deployed fixture tree compares with the one the package declared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Checked before each format 3 launch in T10.50.
+pub(crate) enum FixtureTreeCheck {
+    /// The package has no fixture tree, so the program runs in the workspace.
+    /// `deployed` reports whether a `files/` folder exists anyway.
+    NotPackaged { deployed: bool },
+    /// The deployed tree hashes exactly as packaged.
+    Matches { fixtures_blake3: Hash },
+    /// The deployed tree is missing or differs; warn, and record `deployed`.
+    Differs {
+        packaged: Hash,
+        deployed: Option<Hash>,
+    },
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct TestCase {
     name: String,
     pair_blake3: Option<Hash>,
+    has_input: bool,
+    /// Parsed `NAME.args`; empty without the file, `None` when a present file
+    /// cannot be read or parsed. Format 2 cases never have arguments.
+    args: Option<Vec<String>>,
 }
 
 impl TestCase {
     pub(crate) fn new(name: impl Into<String>) -> Result<Self> {
         let name = name.into();
-        if name.is_empty()
-            || name.len() > rustrace_model::MAX_TEST_CASE_NAME_BYTES
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
+        if !rustrace_model::is_valid_test_case_name(&name) {
             return Err("invalid packaged test-case name".into());
         }
         Ok(Self {
             name,
             pair_blake3: None,
+            has_input: true,
+            args: Some(Vec::new()),
         })
     }
 
@@ -63,8 +294,24 @@ impl TestCase {
         &self.name
     }
 
+    /// Whether the case has a `NAME.in`; without one it runs with stdin closed.
+    #[allow(dead_code)] // Read by the format 3 runner and picker (T10.50/T10.51).
+    pub(crate) fn has_input(&self) -> bool {
+        self.has_input
+    }
+
+    /// The case's program arguments, or `None` when its `NAME.args` is invalid.
+    #[allow(dead_code)] // Read by the format 3 runner and picker (T10.50/T10.51).
+    pub(crate) fn args(&self) -> Option<&[String]> {
+        self.args.as_deref()
+    }
+
     pub(crate) fn input_path(&self) -> WorkspacePath {
         WorkspacePath::new(format!("{}.in", self.name)).expect("validated test-case path")
+    }
+
+    pub(crate) fn args_path(&self) -> WorkspacePath {
+        WorkspacePath::new(format!("{}.args", self.name)).expect("validated test-case path")
     }
 
     pub(crate) fn expected_path(&self) -> WorkspacePath {
@@ -112,14 +359,17 @@ pub(crate) struct TestCaseDirectory {
 }
 
 impl TestCaseDirectory {
-    pub(crate) fn open(workspace_root: &Path) -> Result<Self> {
+    /// Opens the session's case folder: the fixed `test-cases/` for formats
+    /// 1 and 2, or the workspace's own `NAME.test-cases/` for format 3, whose
+    /// marker must name this workspace and, when given, the session's suite.
+    /// A folder that is itself a Rustrace workspace is refused in any format.
+    pub(crate) fn open(
+        workspace_root: &Path,
+        layout: TestCaseLayout,
+        suite: Option<Hash>,
+    ) -> Result<Self> {
         let workspace = PinnedWorkspaceRoot::open(workspace_root)?;
-        let parent = workspace
-            .path()
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .ok_or("workspace has no parent for sibling test-cases")?;
-        let expected = parent.join("test-cases");
+        let expected = test_case_folder(workspace.path(), layout)?;
         let metadata = fs::symlink_metadata(&expected)?;
         if metadata.file_type().is_symlink() {
             return Err("the fixed sibling test-cases root must not be a symlink".into());
@@ -133,15 +383,209 @@ impl TestCaseDirectory {
         if root.is_same_directory(&workspace) {
             return Err("the fixed sibling test-cases root aliases the selected workspace".into());
         }
+        refuse_workspace_as_case_folder(root.path())?;
+        if layout == TestCaseLayout::Extended {
+            let owner = workspace
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("a format 3 workspace name must be valid UTF-8")?;
+            CaseFolderMarker::require(&root, owner, suite)?;
+        }
+        root.verify_binding()?;
         Ok(Self { root })
     }
 
     pub(crate) fn list(&self) -> Result<Vec<WorkspacePath>> {
-        Ok(list_external_regular_files_in_with_filter(
-            &self.root,
-            MAX_TEST_CASES * 2,
-            is_test_case_candidate,
-        )?)
+        self.list_for(TestCaseLayout::Paired)
+    }
+
+    fn list_for(&self, layout: TestCaseLayout) -> Result<Vec<WorkspacePath>> {
+        Ok(match layout {
+            TestCaseLayout::Paired => list_external_regular_files_in_with_filter(
+                &self.root,
+                MAX_TEST_CASES * 2,
+                is_test_case_candidate,
+            )?,
+            TestCaseLayout::Extended => list_external_regular_files_in_with_filter(
+                &self.root,
+                MAX_TEST_CASES * 3,
+                is_extended_test_case_candidate,
+            )?,
+        })
+    }
+
+    /// Lists live cases for one assignment format. Format 2 lists complete
+    /// `.in`/`.expected` pairs exactly as [`Self::list_cases`] does.
+    #[allow(dead_code)] // The picker selects the format 3 layout in T10.51.
+    pub(crate) fn list_cases_for(&self, layout: TestCaseLayout) -> Result<Vec<TestCase>> {
+        match layout {
+            TestCaseLayout::Paired => self.list_cases(),
+            TestCaseLayout::Extended => self.list_extended_cases(),
+        }
+    }
+
+    fn list_extended_cases(&self) -> Result<Vec<TestCase>> {
+        #[derive(Default)]
+        struct Files {
+            input: bool,
+            args: bool,
+            expected: bool,
+        }
+
+        let mut groups = BTreeMap::<String, Files>::new();
+        for path in self.list_for(TestCaseLayout::Extended)? {
+            let Some((name, suffix)) = path.as_str().rsplit_once('.') else {
+                continue;
+            };
+            if path.as_str().contains('/') || TestCase::new(name).is_err() {
+                continue;
+            }
+            let files = groups.entry(name.to_owned()).or_default();
+            match suffix {
+                "in" => files.input = true,
+                "args" => files.args = true,
+                "expected" => files.expected = true,
+                _ => {}
+            }
+        }
+        let refresh_id = TEST_CASE_REFRESH_ID.fetch_add(1, Ordering::Relaxed);
+        let mut remaining_identity_bytes = MAX_TEST_CASE_TOTAL_BYTES;
+        let mut cases = Vec::new();
+        for (name, files) in groups {
+            if !files.expected {
+                continue;
+            }
+            let mut case = TestCase {
+                pair_blake3: Some(refresh_identity(refresh_id, &name)),
+                name,
+                has_input: files.input,
+                args: Some(Vec::new()),
+            };
+            if files.args {
+                case.args = self.read_args(&case).ok();
+            }
+            if remaining_identity_bytes > 0
+                && let Ok(identity) =
+                    self.extended_identity(&case, files.args, &mut remaining_identity_bytes)
+            {
+                case.pair_blake3 = Some(identity);
+            }
+            cases.push(case);
+        }
+        Ok(cases)
+    }
+
+    /// Reads and parses the live `NAME.args` with the package rules.
+    pub(crate) fn read_args(&self, case: &TestCase) -> Result<Vec<String>> {
+        let mut opened = open_external_regular_file_read_in(&self.root, &case.args_path())?;
+        let mut bytes = Vec::with_capacity(MAX_TEST_CASE_ARGS_FILE_BYTES);
+        opened
+            .file_mut()
+            .take(MAX_TEST_CASE_ARGS_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        self.root.verify_binding()?;
+        Ok(parse_test_case_args(&bytes).map_err(|error| format!("test-case arguments {error}"))?)
+    }
+
+    /// The deployed fixture root that a format 3 case runs from.
+    #[allow(dead_code)] // The fixture working directory is launched in T10.50.
+    pub(crate) fn fixtures_path(&self) -> PathBuf {
+        self.root.path().join(FIXTURE_ROOT)
+    }
+
+    /// Reads the deployed `files/` tree without following links, or `None`
+    /// when it is absent. Symlinks, special files, and oversized trees fail.
+    pub(crate) fn fixture_tree(&self) -> Result<Option<FixtureTree>> {
+        Ok(read_deployed_fixture_tree(&self.root)?)
+    }
+
+    /// The hash to record for a fixture working directory, computed from the
+    /// deployed bytes immediately before launch.
+    #[allow(dead_code)] // Verified before launch in T10.50.
+    pub(crate) fn fixture_tree_hash(&self) -> Result<Option<Hash>> {
+        Ok(self.fixture_tree()?.map(|tree| tree.hash()))
+    }
+
+    /// Compares the deployed `files/` tree with the packaged fixture-tree
+    /// hash that the session recorded at startup, so a run can warn when a
+    /// student's copy differs. An unreadable tree (for example one holding a
+    /// symlink) is an error rather than a difference.
+    #[allow(dead_code)] // Checked before each format 3 launch in T10.50.
+    pub(crate) fn check_fixture_tree(&self, packaged: Option<Hash>) -> Result<FixtureTreeCheck> {
+        let deployed = self.fixture_tree_hash()?;
+        Ok(match (packaged, deployed) {
+            (None, deployed) => FixtureTreeCheck::NotPackaged {
+                deployed: deployed.is_some(),
+            },
+            (Some(packaged), Some(deployed)) if packaged == deployed => FixtureTreeCheck::Matches {
+                fixtures_blake3: deployed,
+            },
+            (Some(packaged), deployed) => FixtureTreeCheck::Differs { packaged, deployed },
+        })
+    }
+
+    /// Refuses a `.cargo` entry in the case folder or its `files/`. Cargo
+    /// reads `.cargo/config.toml` from the directory a command runs in and
+    /// from every parent, so a Run from `files/` must not start while one is
+    /// there. Parents above the case folder are shared with the workspace.
+    #[allow(dead_code)] // Called before each fixture-directory launch in T10.50.
+    pub(crate) fn reject_cargo_configuration(&self) -> Result<()> {
+        for relative in [".cargo".to_owned(), format!("{FIXTURE_ROOT}/.cargo")] {
+            match fs::symlink_metadata(self.root.path().join(&relative)) {
+                Ok(_) => {
+                    return Err(format!(
+                        "remove `{relative}` from the test-case folder: Cargo would read it as configuration"
+                    )
+                    .into());
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        self.root.verify_binding()?;
+        Ok(())
+    }
+
+    fn extended_identity(
+        &self,
+        case: &TestCase,
+        has_args: bool,
+        remaining_bytes: &mut u64,
+    ) -> Result<Hash> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"rustrace.live-test-case.v2");
+        for (present, path, oversized) in [
+            (
+                has_args,
+                case.args_path(),
+                "test arguments exceed the 1048576-byte limit",
+            ),
+            (
+                case.has_input,
+                case.input_path(),
+                "test input exceeds the 1048576-byte limit",
+            ),
+            (
+                true,
+                case.expected_path(),
+                "expected output exceeds the 1048576-byte limit",
+            ),
+        ] {
+            if present {
+                let bytes = self.read_case_file_for_identity(&path, oversized, remaining_bytes)?;
+                hasher.update(&[1]);
+                hasher.update(&(bytes.len() as u64).to_le_bytes());
+                hasher.update(&bytes);
+            } else {
+                hasher.update(&[0]);
+            }
+        }
+        Ok(Hash::from_bytes(*hasher.finalize().as_bytes()))
     }
 
     pub(crate) fn list_cases(&self) -> Result<Vec<TestCase>> {
@@ -181,6 +625,8 @@ impl TestCaseDirectory {
                 (pair.input && pair.expected).then(|| TestCase {
                     pair_blake3: Some(refresh_identity(refresh_id, &name)),
                     name,
+                    has_input: true,
+                    args: Some(Vec::new()),
                 })
             })
             .collect::<Vec<_>>();
@@ -199,6 +645,29 @@ impl TestCaseDirectory {
 
     pub(crate) fn open_input(&self, path: &WorkspacePath) -> Result<OpenedRegularFile> {
         Ok(open_external_regular_file_read_in(&self.root, path)?)
+    }
+
+    /// Opens a format 3 case's `NAME.in`, hashes its bytes (at most the 1 MiB
+    /// case-file limit), and rewinds it so the program reads from the start.
+    /// The hash is the `stdin.blake3` a comparison's invocation records.
+    #[allow(dead_code)] // Launched by the format 3 runner in T10.50.
+    pub(crate) fn open_input_with_blake3(
+        &self,
+        case: &TestCase,
+    ) -> Result<(OpenedRegularFile, Hash)> {
+        use std::io::{Seek, SeekFrom};
+
+        let mut opened = self.open_input(&case.input_path())?;
+        let mut bytes = Vec::new();
+        (&mut opened.file_mut())
+            .take(MAX_TEST_CASE_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_TEST_CASE_FILE_BYTES {
+            return Err("test input exceeds the 1048576-byte limit".into());
+        }
+        opened.file_mut().seek(SeekFrom::Start(0))?;
+        self.root.verify_binding()?;
+        Ok((opened, hash_bytes(&bytes)))
     }
 
     pub(crate) fn read_expected(&self, case: &TestCase) -> Result<Vec<u8>> {
@@ -305,6 +774,16 @@ fn is_test_case_candidate(path: &WorkspacePath) -> bool {
         .strip_suffix(".in")
         .or_else(|| value.strip_suffix(".expected"))
         .is_some_and(|name| TestCase::new(name).is_ok())
+}
+
+/// Format 3 case files are top-level; nothing below `files/` is a case.
+fn is_extended_test_case_candidate(path: &WorkspacePath) -> bool {
+    is_test_case_candidate(path)
+        || !path.as_str().contains('/')
+            && path
+                .as_str()
+                .strip_suffix(".args")
+                .is_some_and(|name| TestCase::new(name).is_ok())
 }
 
 pub(crate) fn hash_bytes(bytes: &[u8]) -> Hash {
@@ -617,7 +1096,12 @@ mod tests {
         fs::write(parent.join("test-cases/Alpha.expected"), b"expected two").unwrap();
         fs::write(parent.join("test-cases/unpaired.in"), b"ignored").unwrap();
         fs::write(parent.join("test-cases/output.txt"), b"preserve").unwrap();
-        let cases = TestCaseDirectory::open(&parent.join("assignment.work")).unwrap();
+        let cases = TestCaseDirectory::open(
+            &parent.join("assignment.work"),
+            TestCaseLayout::Paired,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             cases
                 .list_cases()
@@ -666,10 +1150,14 @@ mod tests {
             b"ordinary generated output",
         )
         .unwrap();
-        let cases = TestCaseDirectory::open(&parent.join("assignment.work"))
-            .unwrap()
-            .list_cases()
-            .unwrap();
+        let cases = TestCaseDirectory::open(
+            &parent.join("assignment.work"),
+            TestCaseLayout::Paired,
+            None,
+        )
+        .unwrap()
+        .list_cases()
+        .unwrap();
         assert_eq!(cases.len(), MAX_TEST_CASES);
         assert_eq!(cases.first().unwrap().name(), "case-000");
         assert_eq!(cases.last().unwrap().name(), "case-255");
@@ -683,7 +1171,12 @@ mod tests {
         fs::create_dir(parent.join("test-cases")).unwrap();
         fs::write(parent.join("test-cases/sample.in"), b"input one").unwrap();
         fs::write(parent.join("test-cases/sample.expected"), b"output one").unwrap();
-        let directory = TestCaseDirectory::open(&parent.join("assignment.work")).unwrap();
+        let directory = TestCaseDirectory::open(
+            &parent.join("assignment.work"),
+            TestCaseLayout::Paired,
+            None,
+        )
+        .unwrap();
         let original = directory.list_cases().unwrap().pop().unwrap();
 
         fs::write(parent.join("test-cases/sample.in"), b"input two").unwrap();
@@ -702,14 +1195,26 @@ mod tests {
         let parent = fixture("symlink-root");
         fs::create_dir(parent.join("actual-cases")).unwrap();
         symlink("actual-cases", parent.join("test-cases")).unwrap();
-        assert!(TestCaseDirectory::open(&parent.join("assignment.work")).is_err());
+        assert!(
+            TestCaseDirectory::open(
+                &parent.join("assignment.work"),
+                TestCaseLayout::Paired,
+                None
+            )
+            .is_err()
+        );
         fs::remove_dir_all(&parent).unwrap();
 
         let parent = fixture("symlink-entry");
         fs::create_dir(parent.join("test-cases")).unwrap();
         fs::write(parent.join("outside"), b"outside").unwrap();
         symlink("../outside", parent.join("test-cases/unsafe")).unwrap();
-        let cases = TestCaseDirectory::open(&parent.join("assignment.work")).unwrap();
+        let cases = TestCaseDirectory::open(
+            &parent.join("assignment.work"),
+            TestCaseLayout::Paired,
+            None,
+        )
+        .unwrap();
         assert!(cases.list_cases().unwrap().is_empty());
         assert!(
             cases
@@ -726,7 +1231,10 @@ mod tests {
         fs::remove_dir(parent.join("assignment.work")).unwrap();
         fs::create_dir(parent.join("test-cases")).unwrap();
         fs::write(parent.join("test-cases/managed.rs"), b"preserve").unwrap();
-        assert!(TestCaseDirectory::open(&parent.join("test-cases")).is_err());
+        assert!(
+            TestCaseDirectory::open(&parent.join("test-cases"), TestCaseLayout::Paired, None)
+                .is_err()
+        );
         assert_eq!(
             fs::read(parent.join("test-cases/managed.rs")).unwrap(),
             b"preserve"
@@ -759,7 +1267,12 @@ mod tests {
         fs::write(parent.join("test-cases/nested/hidden.in"), b"ignored").unwrap();
         fs::write(parent.join("test-cases/nested/hidden.expected"), b"ignored").unwrap();
 
-        let cases = TestCaseDirectory::open(&parent.join("assignment.work")).unwrap();
+        let cases = TestCaseDirectory::open(
+            &parent.join("assignment.work"),
+            TestCaseLayout::Paired,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             cases
                 .list_cases()
@@ -769,6 +1282,423 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["0", "a-b_C9"]
         );
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn format3_listing_accepts_optional_input_and_args_and_ignores_fixtures() {
+        let parent = fixture("format3-listing");
+        let cases_root = own_case_folder(&parent);
+        for (path, bytes) in [
+            ("usage.expected", &b"usage\n"[..]),
+            ("count.args", b"-c\nfn main\n"),
+            ("count.expected", b"2\n"),
+            ("stdin.in", b"alpha\n"),
+            ("stdin.expected", b"alpha\n"),
+            ("broken.args", b"no final newline"),
+            ("broken.expected", b""),
+            ("orphan.args", b"x\n"),
+            ("orphan.in", b"x\n"),
+            ("notes.txt", b"ignored"),
+        ] {
+            fs::write(cases_root.join(path), bytes).unwrap();
+        }
+        fs::create_dir_all(cases_root.join("files/nested")).unwrap();
+        fs::write(cases_root.join("files/hidden.expected"), b"fixture").unwrap();
+        fs::write(cases_root.join("files/hidden.in"), b"fixture").unwrap();
+        fs::write(cases_root.join("files/nested/deep.expected"), b"fixture").unwrap();
+
+        let directory = TestCaseDirectory::open(
+            &parent.join("assignment.work"),
+            TestCaseLayout::Extended,
+            None,
+        )
+        .unwrap();
+        let cases = directory.list_cases_for(TestCaseLayout::Extended).unwrap();
+        let summary = cases
+            .iter()
+            .map(|case| {
+                (
+                    case.name(),
+                    case.has_input(),
+                    case.args().map(<[String]>::to_vec),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                ("broken", false, None),
+                (
+                    "count",
+                    false,
+                    Some(vec!["-c".to_owned(), "fn main".to_owned()])
+                ),
+                ("stdin", true, Some(Vec::new())),
+                ("usage", false, Some(Vec::new())),
+            ]
+        );
+        assert!(
+            directory
+                .read_args(&cases[0])
+                .unwrap_err()
+                .to_string()
+                .contains("must end every argument line with LF")
+        );
+
+        // Format 2 listing is unchanged: complete pairs only, no `.args`.
+        assert_eq!(
+            directory
+                .list_cases_for(TestCaseLayout::Paired)
+                .unwrap()
+                .iter()
+                .map(TestCase::name)
+                .collect::<Vec<_>>(),
+            ["stdin"]
+        );
+        for (format_version, layout) in [
+            (1, TestCaseLayout::Paired),
+            (2, TestCaseLayout::Paired),
+            (3, TestCaseLayout::Extended),
+        ] {
+            assert_eq!(TestCaseLayout::for_format_version(format_version), layout);
+        }
+
+        // Argument, input, and expected changes all refresh the identity.
+        let identity = |directory: &TestCaseDirectory| {
+            directory
+                .list_cases_for(TestCaseLayout::Extended)
+                .unwrap()
+                .into_iter()
+                .find(|case| case.name() == "count")
+                .unwrap()
+        };
+        let original = identity(&directory);
+        fs::write(cases_root.join("count.args"), b"-c\nfn  main\n").unwrap();
+        let changed_args = identity(&directory);
+        assert_ne!(changed_args, original);
+        fs::write(cases_root.join("count.in"), b"").unwrap();
+        let added_input = identity(&directory);
+        assert_ne!(added_input, changed_args);
+        assert!(added_input.has_input());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn format3_input_is_hashed_then_rewound_for_the_program() {
+        let parent = fixture("input-hash");
+        let cases_root = own_case_folder(&parent);
+        fs::write(cases_root.join("case.in"), b"alpha\nbeta\n").unwrap();
+        fs::write(cases_root.join("case.expected"), b"").unwrap();
+        fs::write(
+            cases_root.join("large.in"),
+            vec![b'x'; MAX_TEST_CASE_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        fs::write(cases_root.join("large.expected"), b"").unwrap();
+        let directory = TestCaseDirectory::open(
+            &parent.join("assignment.work"),
+            TestCaseLayout::Extended,
+            None,
+        )
+        .unwrap();
+        let cases = directory.list_cases_for(TestCaseLayout::Extended).unwrap();
+
+        let (mut input, blake3) = directory.open_input_with_blake3(&cases[0]).unwrap();
+        assert_eq!(blake3, hash_bytes(b"alpha\nbeta\n"));
+        let mut read = Vec::new();
+        input.file_mut().read_to_end(&mut read).unwrap();
+        assert_eq!(read, b"alpha\nbeta\n");
+        assert!(
+            directory
+                .open_input_with_blake3(&cases[1])
+                .unwrap_err()
+                .to_string()
+                .contains("1048576-byte limit")
+        );
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixture_tree_hash_reads_the_deployed_tree_or_reports_its_absence() {
+        let parent = fixture("fixture-hash");
+        let cases_root = own_case_folder(&parent);
+        fs::write(cases_root.join("case.expected"), b"").unwrap();
+        let directory = TestCaseDirectory::open(
+            &parent.join("assignment.work"),
+            TestCaseLayout::Extended,
+            None,
+        )
+        .unwrap();
+        assert_eq!(directory.fixture_tree_hash().unwrap(), None);
+        assert_eq!(directory.fixtures_path(), cases_root.join("files"));
+
+        fs::create_dir_all(cases_root.join("files/src")).unwrap();
+        fs::write(cases_root.join("files/src/lib.rs"), b"fn a() {}\n").unwrap();
+        let expected = FixtureTree::from_parts(
+            [],
+            [(
+                WorkspacePath::new("src/lib.rs").unwrap(),
+                b"fn a() {}\n".to_vec(),
+            )],
+        )
+        .unwrap()
+        .hash();
+        assert_eq!(directory.fixture_tree_hash().unwrap(), Some(expected));
+
+        assert_eq!(
+            directory.check_fixture_tree(Some(expected)).unwrap(),
+            FixtureTreeCheck::Matches {
+                fixtures_blake3: expected
+            }
+        );
+        assert_eq!(
+            directory.check_fixture_tree(None).unwrap(),
+            FixtureTreeCheck::NotPackaged { deployed: true }
+        );
+        fs::write(cases_root.join("files/src/lib.rs"), b"edited\n").unwrap();
+        let edited = directory.fixture_tree_hash().unwrap();
+        assert_eq!(
+            directory.check_fixture_tree(Some(expected)).unwrap(),
+            FixtureTreeCheck::Differs {
+                packaged: expected,
+                deployed: edited
+            }
+        );
+        fs::remove_dir_all(cases_root.join("files")).unwrap();
+        assert_eq!(
+            directory.check_fixture_tree(Some(expected)).unwrap(),
+            FixtureTreeCheck::Differs {
+                packaged: expected,
+                deployed: None
+            }
+        );
+        assert_eq!(
+            directory.check_fixture_tree(None).unwrap(),
+            FixtureTreeCheck::NotPackaged { deployed: false }
+        );
+        fs::create_dir_all(cases_root.join("files/src")).unwrap();
+
+        symlink("../../outside", cases_root.join("files/src/escape")).unwrap();
+        assert!(directory.fixture_tree_hash().is_err());
+        assert!(directory.check_fixture_tree(Some(expected)).is_err());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_configuration_in_the_case_folder_or_fixtures_is_refused() {
+        let parent = fixture("cargo-configuration");
+        let cases_root = own_case_folder(&parent);
+        fs::create_dir(cases_root.join("files")).unwrap();
+        let directory = TestCaseDirectory::open(
+            &parent.join("assignment.work"),
+            TestCaseLayout::Extended,
+            None,
+        )
+        .unwrap();
+        directory.reject_cargo_configuration().unwrap();
+        for (path, directory_entry) in [
+            (".cargo", true),
+            ("files/.cargo", true),
+            (".cargo", false),
+            ("files/.cargo", false),
+        ] {
+            if directory_entry {
+                fs::create_dir(cases_root.join(path)).unwrap();
+            } else {
+                fs::write(cases_root.join(path), b"").unwrap();
+            }
+            let error = directory.reject_cargo_configuration().unwrap_err();
+            assert!(error.to_string().contains(path), "{error}");
+            if directory_entry {
+                fs::remove_dir(cases_root.join(path)).unwrap();
+            } else {
+                fs::remove_file(cases_root.join(path)).unwrap();
+            }
+        }
+        symlink("../elsewhere", cases_root.join(".cargo")).unwrap();
+        assert!(directory.reject_cargo_configuration().is_err());
+        fs::remove_file(cases_root.join(".cargo")).unwrap();
+        fs::remove_dir(cases_root.join("files")).unwrap();
+        fs::write(cases_root.join("files"), b"").unwrap();
+        directory.reject_cargo_configuration().unwrap();
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn format3_case_folder_is_named_after_the_workspace() {
+        let folder = |name: &str| {
+            TestCaseLayout::Extended
+                .folder_name(std::ffi::OsStr::new(name))
+                .map_err(|error| error.to_string())
+        };
+        assert_eq!(folder("lab2.work").unwrap(), "lab2.test-cases");
+        assert_eq!(folder("Lab 2.work").unwrap(), "Lab 2.test-cases");
+        assert_eq!(folder("lab2").unwrap(), "lab2.test-cases");
+        assert_eq!(folder("lab2.work.work").unwrap(), "lab2.work.test-cases");
+        assert_eq!(folder("lab2.WORK").unwrap(), "lab2.WORK.test-cases");
+        for (name, reason) in [
+            ("test-cases", "end in `.test-cases`"),
+            ("Test-Cases", "end in `.test-cases`"),
+            ("lab2.test-cases", "end in `.test-cases`"),
+            ("lab2.TEST-CASES", "end in `.test-cases`"),
+            (".work", "needs a name before `.work`"),
+            ("lab{2}.work", "`{` or `}`"),
+            ("lab}.work", "`{` or `}`"),
+        ] {
+            let error = folder(name).unwrap_err();
+            assert!(error.contains(reason), "{name}: {error}");
+        }
+        assert!(folder(&format!("{}.work", "x".repeat(245))).is_err());
+        assert_eq!(
+            folder(&format!("{}.work", "x".repeat(244))).unwrap().len(),
+            255
+        );
+
+        // Formats 1 and 2 keep the one fixed folder.
+        for name in ["lab1.work", "lab2.test-cases", "{x}"] {
+            assert_eq!(
+                TestCaseLayout::Paired
+                    .folder_name(std::ffi::OsStr::new(name))
+                    .unwrap(),
+                "test-cases"
+            );
+        }
+        assert!(
+            TestCaseLayout::Paired
+                .folder_name(std::ffi::OsStr::new("test-cases"))
+                .is_err()
+        );
+        assert_eq!(
+            test_case_folder(Path::new("/course/lab2.work"), TestCaseLayout::Extended).unwrap(),
+            Path::new("/course/lab2.test-cases")
+        );
+        assert_eq!(
+            test_case_folder(Path::new("/course/lab1.work"), TestCaseLayout::Paired).unwrap(),
+            Path::new("/course/test-cases")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn format2_and_format3_sessions_open_different_case_folders() {
+        let parent = fixture("folder-by-format");
+        fs::create_dir(parent.join("test-cases")).unwrap();
+        fs::write(parent.join("test-cases/shared.in"), b"").unwrap();
+        fs::write(parent.join("test-cases/shared.expected"), b"").unwrap();
+        let workspace = parent.join("assignment.work");
+        assert!(
+            TestCaseDirectory::open(&workspace, TestCaseLayout::Extended, None).is_err(),
+            "a format 3 session never falls back to the shared folder"
+        );
+        own_case_folder(&parent);
+        fs::write(parent.join("assignment.test-cases/own.expected"), b"").unwrap();
+        let names = |layout| {
+            TestCaseDirectory::open(&workspace, layout, Some(SUITE))
+                .unwrap()
+                .list_cases_for(layout)
+                .unwrap()
+                .iter()
+                .map(|case| case.name().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(TestCaseLayout::Paired), ["shared"]);
+        assert_eq!(names(TestCaseLayout::Extended), ["own"]);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    const SUITE: Hash = Hash::from_bytes([7; Hash::LENGTH]);
+
+    /// `assignment.test-cases`, owned by `assignment.work` for [`SUITE`].
+    fn own_case_folder(parent: &Path) -> std::path::PathBuf {
+        let folder = parent.join("assignment.test-cases");
+        fs::create_dir(&folder).unwrap();
+        fs::write(
+            folder.join(CASE_FOLDER_MARKER),
+            CaseFolderMarker::new("assignment.work", SUITE).encode(),
+        )
+        .unwrap();
+        folder
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn format3_case_folders_must_belong_to_their_workspace_and_suite() {
+        let parent = fixture("case-folder-owner");
+        let folder = own_case_folder(&parent);
+        fs::write(folder.join("case.expected"), b"").unwrap();
+        let workspace = parent.join("assignment.work");
+        let open = |suite| TestCaseDirectory::open(&workspace, TestCaseLayout::Extended, suite);
+        assert_eq!(
+            fs::read_to_string(folder.join(CASE_FOLDER_MARKER)).unwrap(),
+            format!(
+                "{{\"version\":1,\"workspace\":\"assignment.work\",\"test_case_suite_hash\":\"{}\"}}\n",
+                "07".repeat(32)
+            )
+        );
+        let directory = open(Some(SUITE)).unwrap();
+        let names = directory
+            .list_cases_for(TestCaseLayout::Extended)
+            .unwrap()
+            .iter()
+            .map(|case| case.name().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["case"], "the marker is never a case");
+        open(None).unwrap();
+        let error = open(Some(Hash::from_bytes([8; Hash::LENGTH]))).unwrap_err();
+        assert!(
+            error.to_string().contains("different assignment package"),
+            "{error}"
+        );
+
+        // `assignment` would map to the same folder; its marker names another.
+        fs::create_dir(parent.join("assignment")).unwrap();
+        let error = TestCaseDirectory::open(
+            &parent.join("assignment"),
+            TestCaseLayout::Extended,
+            Some(SUITE),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("belongs to the workspace `assignment.work`"),
+            "{error}"
+        );
+
+        fs::remove_file(folder.join(CASE_FOLDER_MARKER)).unwrap();
+        assert!(open(Some(SUITE)).is_err(), "missing marker");
+        for (label, bytes) in [
+            ("malformed", &b"{"[..]),
+            (
+                "noncanonical",
+                br#"{ "version":1,"workspace":"assignment.work","test_case_suite_hash":"0707070707070707070707070707070707070707070707070707070707070707"}
+"#,
+            ),
+        ] {
+            fs::write(folder.join(CASE_FOLDER_MARKER), bytes).unwrap();
+            assert!(open(Some(SUITE)).is_err(), "{label}");
+        }
+
+        // A folder that is itself a workspace is never a case folder, in any
+        // format.
+        fs::write(
+            folder.join(CASE_FOLDER_MARKER),
+            CaseFolderMarker::new("assignment.work", SUITE).encode(),
+        )
+        .unwrap();
+        fs::create_dir(folder.join(".rustrace")).unwrap();
+        let error = open(Some(SUITE)).unwrap_err();
+        assert!(
+            error.to_string().contains("is a Rustrace workspace"),
+            "{error}"
+        );
+        fs::create_dir_all(parent.join("test-cases/.rustrace")).unwrap();
+        assert!(TestCaseDirectory::open(&workspace, TestCaseLayout::Paired, None).is_err());
         fs::remove_dir_all(parent).unwrap();
     }
 
@@ -953,7 +1883,12 @@ mod tests {
             vec![b'x'; MAX_TEST_CASE_FILE_BYTES as usize + 1],
         )
         .unwrap();
-        let cases = TestCaseDirectory::open(&parent.join("assignment.work")).unwrap();
+        let cases = TestCaseDirectory::open(
+            &parent.join("assignment.work"),
+            TestCaseLayout::Paired,
+            None,
+        )
+        .unwrap();
         let case = cases.list_cases().unwrap().pop().unwrap();
         assert!(
             cases

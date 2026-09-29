@@ -14,9 +14,9 @@ use rustrace_journal::{CheckpointSnapshot, StoredCheckpoint, decode_checkpoint};
 use rustrace_model::{
     DecodeOutcome, DecodePolicy, Event, EventEnvelope, Hash, MAX_ENVELOPE_BYTES,
     RprovCheckpointRef, RprovEntryKind, RprovEventIntegrityKind, RprovPackageState, RprovSegment,
-    WorkspacePath,
+    TestCaseInvocation, TestCaseStdin, WorkspacePath,
     assignment::{AssignmentManifest, MAX_MANIFEST_BYTES},
-    decode_envelope, rprov_raw_blake3,
+    decode_envelope, rprov_raw_blake3, test_case_args_blake3,
 };
 use rustrace_replay::ReplayEngine;
 use rustrace_workspace::{
@@ -629,7 +629,14 @@ struct ReplayFacts {
     test_case_mismatches: u64,
     test_case_errors: u64,
     first_failing_case: Option<TestCaseFailure>,
-    expected_hashes: Vec<(String, Hash)>,
+    comparisons: Vec<RecordedComparison>,
+}
+
+/// The packaged-case identity one recorded comparison claims.
+struct RecordedComparison {
+    case: String,
+    expected_blake3: Hash,
+    invocation: Option<TestCaseInvocation>,
 }
 
 impl ReplayFacts {
@@ -643,7 +650,7 @@ impl ReplayFacts {
             test_case_mismatches: 0,
             test_case_errors: 0,
             first_failing_case: None,
-            expected_hashes: Vec::new(),
+            comparisons: Vec::new(),
         }
     }
 }
@@ -830,9 +837,11 @@ fn replay_segments(
             })?;
             if let Event::TestCaseCompared(comparison) = &envelope.event {
                 facts.test_case_runs = facts.test_case_runs.saturating_add(1);
-                facts
-                    .expected_hashes
-                    .push((comparison.case.clone(), comparison.expected_blake3));
+                facts.comparisons.push(RecordedComparison {
+                    case: comparison.case.clone(),
+                    expected_blake3: comparison.expected_blake3,
+                    invocation: comparison.invocation.clone(),
+                });
                 match comparison.outcome {
                     rustrace_model::TestCaseComparisonOutcome::Pass => {
                         facts.test_case_passes = facts.test_case_passes.saturating_add(1);
@@ -1079,11 +1088,17 @@ struct AssignmentReference {
     starter_hash: Hash,
     test_case_suite_hash: Option<Hash>,
     test_case_expected: BTreeMap<String, ReferenceExpectedOutput>,
+    /// The packaged fixture-tree hash of a format 3 reference.
+    fixtures_blake3: Option<Hash>,
 }
 
 struct ReferenceExpectedOutput {
     blake3: Hash,
     bytes: Vec<u8>,
+    /// [`test_case_args_blake3`] of the packaged arguments (empty in format 2).
+    args_blake3: Hash,
+    /// BLAKE3 of the packaged `NAME.in`, absent for a closed-stdin case.
+    input_blake3: Option<Hash>,
 }
 
 fn compare_reference(
@@ -1157,27 +1172,66 @@ fn authenticate_test_case_reference(
         return;
     };
     if report.assignment_reference != AssignmentReferenceStatus::Ok
-        || reference.manifest.format_version != 2
+        || !matches!(reference.manifest.format_version, 2 | 3)
         || reference.test_case_suite_hash.is_none()
     {
         return;
     }
-    for (case, recorded) in &facts.expected_hashes {
-        if reference
-            .test_case_expected
-            .get(case)
-            .map(|expected| expected.blake3)
-            != Some(*recorded)
-        {
+    for recorded in &facts.comparisons {
+        if let Some(detail) = reference_case_mismatch(reference, recorded) {
             report.fail(
                 VerificationIssueKind::AssignmentReference,
                 VerificationIssueLocation::Decoder("assignment reference".to_owned()),
-                format!("expected output hash mismatch for test case {case}"),
+                detail,
             );
             return;
         }
     }
     report.test_case_evidence = Some(TestCaseEvidenceStatus::ReferenceVerified);
+}
+
+/// Compares one recorded comparison with its packaged case. Format 2 checks
+/// the expected output. Format 3 also checks the program arguments, the stdin
+/// source and its bytes, and the fixture tree the Run used.
+fn reference_case_mismatch(
+    reference: &AssignmentReference,
+    recorded: &RecordedComparison,
+) -> Option<String> {
+    let case = &recorded.case;
+    let packaged = reference
+        .test_case_expected
+        .get(case)
+        .filter(|packaged| packaged.blake3 == recorded.expected_blake3);
+    let Some(packaged) = packaged else {
+        return Some(format!(
+            "expected output hash mismatch for test case {case}"
+        ));
+    };
+    if reference.manifest.format_version != 3 {
+        return recorded.invocation.is_some().then(|| {
+            format!("test case {case} records format 3 invocation evidence for a format 2 suite")
+        });
+    }
+    let Some(invocation) = &recorded.invocation else {
+        return Some(format!(
+            "test case {case} lacks the arguments, input, and fixture evidence of a format 3 suite"
+        ));
+    };
+    if invocation.args_blake3 != packaged.args_blake3 {
+        return Some(format!("program arguments mismatch for test case {case}"));
+    }
+    let input_matches = match (&invocation.stdin, packaged.input_blake3) {
+        (TestCaseStdin::Closed, None) => true,
+        (TestCaseStdin::File { blake3 }, Some(packaged)) => *blake3 == packaged,
+        _ => false,
+    };
+    if !input_matches {
+        return Some(format!("standard input mismatch for test case {case}"));
+    }
+    if invocation.fixtures_blake3 != reference.fixtures_blake3 {
+        return Some(format!("fixture tree mismatch for test case {case}"));
+    }
+    None
 }
 
 fn read_assignment_reference(path: &Path) -> Result<AssignmentReference, String> {
@@ -1191,11 +1245,11 @@ fn read_assignment_reference(path: &Path) -> Result<AssignmentReference, String>
 fn read_manifest_reference(path: &Path) -> Result<AssignmentReference, String> {
     let manifest_bytes = read_bounded_file(path, MAX_MANIFEST_BYTES)?;
     let manifest = AssignmentManifest::parse(&manifest_bytes).map_err(|error| error.to_string())?;
-    if manifest.format_version == 2 {
-        return Err(
-            "format_version = 2 references must be an .rta archive so packaged test cases can be validated"
-                .to_owned(),
-        );
+    if manifest.format_version >= 2 {
+        return Err(format!(
+            "format_version = {} references must be an .rta archive so packaged test cases can be validated",
+            manifest.format_version
+        ));
     }
     let parent = path
         .parent()
@@ -1209,6 +1263,7 @@ fn read_manifest_reference(path: &Path) -> Result<AssignmentReference, String> {
         starter_hash,
         test_case_suite_hash: None,
         test_case_expected: BTreeMap::new(),
+        fixtures_blake3: None,
     })
 }
 
@@ -1223,31 +1278,36 @@ fn read_rta_reference(path: &Path) -> Result<AssignmentReference, String> {
     .map_err(|error| error.to_string())?;
     temporary.owned = true;
     let starter_hash = hash_workspace(&temporary.path).map_err(|error| error.to_string())?;
-    let (test_case_suite_hash, test_case_expected) = extracted.test_cases.map_or_else(
-        || (None, BTreeMap::new()),
-        |suite| {
-            let expected = suite
-                .cases
-                .into_iter()
-                .map(|case| {
-                    (
-                        case.name,
-                        ReferenceExpectedOutput {
-                            blake3: rprov_raw_blake3(&case.expected),
-                            bytes: case.expected,
-                        },
-                    )
-                })
-                .collect();
-            (Some(suite.hash), expected)
-        },
-    );
+    let (test_case_suite_hash, test_case_expected, fixtures_blake3) =
+        extracted.test_cases.map_or_else(
+            || (None, BTreeMap::new(), None),
+            |suite| {
+                let expected = suite
+                    .cases
+                    .into_iter()
+                    .map(|case| {
+                        (
+                            case.name,
+                            ReferenceExpectedOutput {
+                                blake3: rprov_raw_blake3(&case.expected),
+                                bytes: case.expected,
+                                args_blake3: test_case_args_blake3(&case.args),
+                                input_blake3: case.input.as_deref().map(rprov_raw_blake3),
+                            },
+                        )
+                    })
+                    .collect();
+                let fixtures = suite.fixtures.as_ref().map(|tree| tree.hash());
+                (Some(suite.hash), expected, fixtures)
+            },
+        );
     Ok(AssignmentReference {
         manifest: extracted.manifest,
         manifest_bytes: extracted.manifest_bytes,
         starter_hash,
         test_case_suite_hash,
         test_case_expected,
+        fixtures_blake3,
     })
 }
 

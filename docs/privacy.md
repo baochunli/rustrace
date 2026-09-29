@@ -102,8 +102,14 @@ The complete version 1 event vocabulary is:
   versions, before/after workspace links, resource limits, output bytes, and
   outcome. The environment summary records only which fixed environment names
   are retained and never their values. Console routing is also recorded when
-  present. Console Test filters and output-option spellings are part of the
-  recorded argument vector. `--no-capture` and its `--nocapture` alias disable
+  present. For a version 3 assignment, the route of a console Run can also
+  record the program's literal arguments, which also end the argument vector
+  after `--`; whether the program ran in the workspace or in the `files/`
+  folder of the assignment's test-case folder, with the BLAKE3 fixture-tree
+  hash of that folder; and the packaged case name for a test-case run. A run
+  in `files/` records `--manifest-path ../../WORKSPACE/Cargo.toml`, which
+  names only the workspace directory, not where it is on the computer. Console Test filters and output-option spellings are part
+  of the recorded argument vector. `--no-capture` and its `--nocapture` alias disable
   the Rust test harness's capture, not Rustrace's recording; `--show-output`
   exposes successful-test output after tests finish. Rustrace records output
   emitted by the process, not prints kept inside the harness. Stdout and stderr
@@ -125,7 +131,12 @@ The complete version 1 event vocabulary is:
   `capture_truncated`, `capture_unavailable`, `capture_read_failed`,
   `expected_unreadable`, or `expected_oversized`.
   Preceding LF bytes plus the expected line length must also fit the 1 MiB
-  expected-file limit.
+  expected-file limit. A version 3 comparison adds an `invocation` field with
+  `args_blake3` (a BLAKE3 digest of the argument list), `stdin` (closed, or the
+  BLAKE3 digest of the `NAME.in` bytes that were read), and, for a run in
+  `files/`, `fixtures_blake3`. These are digests; the argument text
+  itself is recorded in the command's argument vector and route. Version 2
+  comparisons never carry `invocation`.
 - Session lifecycle: `session_started`, `session_resumed`, and `session_ended`
   record the client/starter identity, resume position, and final workspace hash.
   See [`crates/model/src/event.rs`](../crates/model/src/event.rs).
@@ -188,7 +199,8 @@ The complete version 1 event vocabulary is:
   [`crates/model/src/event.rs`](../crates/model/src/event.rs).
 
 The package also carries the student-entered student ID, course/assignment
-identity and assignment manifest, the optional version 2 packaged-suite hash,
+identity and assignment manifest, the optional packaged-suite hash of a version
+2 or 3 assignment,
 original starter files, exact event streams, full checkpoints, runtime metadata,
 and referenced recovery evidence. Runtime
 metadata includes the selected toolchain, probe commands, bounded probe output,

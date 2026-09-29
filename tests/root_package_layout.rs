@@ -50,7 +50,7 @@ fn verbose_version_pins_cargo_version_formats_target_and_one_build_commit() {
         host => panic!("unsupported T10.25 validation host: {host:?}"),
     };
     let expected = format!(
-        "rustrace {}\nbuild commit: {PRE_MOVE_BUILD_COMMIT}\nevent format: 1\npackage format: 1\nassignment format: 2\ntarget: {target}\n",
+        "rustrace {}\nbuild commit: {PRE_MOVE_BUILD_COMMIT}\nevent format: 1\npackage format: 1\nassignment format: 3\ntarget: {target}\n",
         env!("CARGO_PKG_VERSION")
     );
     let output = test_home

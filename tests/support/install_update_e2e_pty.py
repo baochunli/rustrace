@@ -253,7 +253,7 @@ os.execv({str(real_curl)!r},[{str(real_curl)!r},*args])
         source = repository.as_uri() if installer else 'https://github.com/baochunli/rustrace'
         manifest = dict(schema_version=1, version=version, tag='v' + version,
                         commit=commits[version], event_format=1, package_format=1,
-                        assignment_format=2, source=dict(repository=source, tag='v' + version),
+                        assignment_format=3, source=dict(repository=source, tag='v' + version),
                         targets={})
         temporary = root / 'latest.new'
         temporary.write_text(json.dumps(manifest))

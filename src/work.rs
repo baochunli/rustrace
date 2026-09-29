@@ -3,18 +3,20 @@ use crate::display;
 use crate::session::{ProductionSession, ReadOnlyFinalizationStatus, ResumeChoice};
 use rustrace_model::WorkspacePath;
 use rustrace_workspace::{
-    RegularFileIdentity,
+    DirectoryIdentity, RegularFileIdentity, WorkspaceMutationError,
     assignment_package::{
         ExtractedTestCaseSuite, ExtractionLimits, PublishPreparedWorkspaceError,
         create_empty_directory_no_replace, extract_assignment_package, publish_prepared_workspace,
     },
-    create_external_regular_file_in, external_regular_file_exists_in,
+    create_external_directory_in, create_external_regular_file_in, external_directory_exists_in,
+    external_regular_file_exists_in,
+    fixture_tree::FIXTURE_ROOT,
     hash::{PinnedWorkspaceRoot, hash_workspace},
-    open_external_regular_file_read_in, remove_created_external_regular_file_in,
+    open_external_regular_file_read_in, remove_created_external_directory_in,
+    remove_created_external_regular_file_in,
 };
 use std::{
     error::Error,
-    ffi::OsStr,
     fmt,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
@@ -81,18 +83,21 @@ pub fn run_work(args: &[String], output: &mut impl Write) -> Result<()> {
     }
     let manifest_bytes = extracted.manifest_bytes.clone();
     let test_case_suite_hash = extracted.test_cases.as_ref().map(|suite| suite.hash);
+    let test_case_fixtures_hash = crate::session::packaged_fixtures_hash(&extracted);
     let mut incomplete = None;
     let mut selected_metadata = None;
     if exists {
         match ProductionSession::read_metadata(&root) {
             Ok(metadata) => {
-                if !ProductionSession::selected_assignment_matches(
-                    &root,
-                    &metadata,
-                    &manifest_bytes,
-                    starter_hash,
-                    test_case_suite_hash,
-                )? {
+                if metadata.test_case_fixtures_hash != test_case_fixtures_hash
+                    || !ProductionSession::selected_assignment_matches(
+                        &root,
+                        &metadata,
+                        &manifest_bytes,
+                        starter_hash,
+                        test_case_suite_hash,
+                    )?
+                {
                     return Err("assignment manifest/starter/test-case-suite identity mismatch; selected session left unchanged".into());
                 }
                 selected_metadata = Some(metadata);
@@ -197,6 +202,7 @@ pub fn run_work(args: &[String], output: &mut impl Write) -> Result<()> {
     let identity_matches = if started_from_package {
         session.metadata().starter_hash == starter_hash
             && session.metadata().test_case_suite_hash == test_case_suite_hash
+            && session.metadata().test_case_fixtures_hash == test_case_fixtures_hash
     } else {
         selected_metadata.as_ref() == Some(session.metadata())
     };
@@ -220,19 +226,33 @@ pub fn run_work(args: &[String], output: &mut impl Write) -> Result<()> {
     crate::work_editor::run_editor(session, &extracted.manifest.title, update_state)
 }
 
-fn preflight_test_case_suite(workspace_root: &Path, suite: &ExtractedTestCaseSuite) -> Result<()> {
-    let sibling = test_case_sibling(workspace_root)?;
+pub(crate) fn preflight_test_case_suite(
+    workspace_root: &Path,
+    suite: &ExtractedTestCaseSuite,
+) -> Result<()> {
+    let sibling = test_case_sibling(workspace_root, suite)?;
     let Some(root) = open_existing_test_case_root(&sibling)? else {
         return Ok(());
     };
-    for_each_test_case_file(suite, |path, contents| {
-        preflight_test_case_file(&root, path, contents)
+    if suite.format_version == 3 {
+        crate::console::CaseFolderMarker::require(
+            &root,
+            &crate::console::case_folder_owner(workspace_root)?,
+            Some(suite.hash),
+        )?;
+    }
+    for_each_managed_node(suite, |node| match node {
+        ManagedNode::Directory(path) => preflight_test_case_directory(&root, path),
+        ManagedNode::File(path, contents) => preflight_test_case_file(&root, path, contents),
     })?;
     root.verify_binding()?;
     Ok(())
 }
 
-fn deploy_test_case_suite(workspace_root: &Path, suite: &ExtractedTestCaseSuite) -> Result<()> {
+pub(crate) fn deploy_test_case_suite(
+    workspace_root: &Path,
+    suite: &ExtractedTestCaseSuite,
+) -> Result<()> {
     deploy_test_case_suite_with(workspace_root, suite, |_index, _path| Ok(()))
 }
 
@@ -242,34 +262,66 @@ fn deploy_test_case_suite_with(
     mut before_managed_file: impl FnMut(usize, &WorkspacePath) -> Result<()>,
 ) -> Result<()> {
     preflight_test_case_suite(workspace_root, suite)?;
-    let sibling = test_case_sibling(workspace_root)?;
+    let sibling = test_case_sibling(workspace_root, suite)?;
     let (root, created_root) = match open_existing_test_case_root(&sibling)? {
         Some(root) => (root, false),
         None => (create_empty_directory_no_replace(&sibling)?, true),
     };
-    let mut created = Vec::<(WorkspacePath, RegularFileIdentity)>::new();
-    let mut managed_file_index = 0;
-    let deployment = for_each_test_case_file(suite, |path, contents| {
-        managed_file_index += 1;
-        before_managed_file(managed_file_index, path)?;
-        if external_regular_file_exists_in(&root, path)? {
-            return preflight_test_case_file(&root, path, contents);
-        }
-        let mut file = create_external_regular_file_in(&root, path)?;
-        created.push((path.clone(), file.identity()));
-        file.file_mut().write_all(contents)?;
-        file.file_mut().sync_all()?;
-        root.verify_binding()?;
+    let mut created = Vec::<CreatedNode>::new();
+    let mut managed_node_index = 0;
+    // A format 3 folder is claimed for this workspace and suite before any
+    // case is written; preflight already checked an existing marker.
+    let claim = if suite.format_version == 3 {
+        claim_case_folder(&root, workspace_root, suite, &mut created)
+    } else {
         Ok(())
-    })
-    .and_then(|()| {
-        root.verify_binding()?;
-        Ok(())
-    });
+    };
+    let deployment = claim
+        .and_then(|()| {
+            for_each_managed_node(suite, |node| {
+                managed_node_index += 1;
+                match node {
+                    ManagedNode::Directory(path) => {
+                        before_managed_file(managed_node_index, path)?;
+                        if external_directory_exists_in(&root, path)? {
+                            return Ok(());
+                        }
+                        let identity = create_external_directory_in(&root, path)?;
+                        created.push(CreatedNode::Directory(path.clone(), identity));
+                    }
+                    ManagedNode::File(path, contents) => {
+                        before_managed_file(managed_node_index, path)?;
+                        if external_regular_file_exists_in(&root, path)? {
+                            return preflight_test_case_file(&root, path, contents);
+                        }
+                        let mut file = create_external_regular_file_in(&root, path)?;
+                        created.push(CreatedNode::File(path.clone(), file.identity()));
+                        file.file_mut().write_all(contents)?;
+                        file.file_mut().sync_all()?;
+                    }
+                }
+                root.verify_binding()?;
+                Ok(())
+            })
+        })
+        .and_then(|()| {
+            root.verify_binding()?;
+            Ok(())
+        });
     if let Err(error) = deployment {
         let mut cleanup_failures = Vec::new();
-        for (path, identity) in created.into_iter().rev() {
-            if let Err(cleanup) = remove_created_external_regular_file_in(&root, &path, identity) {
+        for node in created.into_iter().rev() {
+            let (path, cleanup) = match node {
+                CreatedNode::File(path, identity) => {
+                    let cleanup = remove_created_external_regular_file_in(&root, &path, identity);
+                    (path, cleanup)
+                }
+                CreatedNode::Directory(path, identity) => {
+                    let cleanup = remove_created_external_directory_in(&root, &path, identity);
+                    (path, cleanup)
+                }
+            };
+            if let Err(cleanup) = cleanup {
                 cleanup_failures.push(format!("{path}: {cleanup}"));
             }
         }
@@ -347,12 +399,34 @@ fn cleanup_failed_publication(
     cleanup_error(error, cleanup, &path)
 }
 
+/// A missing parent means the packaged path does not exist yet; deployment
+/// creates parents before their children.
+fn missing_parent_is_absent(
+    result: std::result::Result<bool, WorkspaceMutationError>,
+) -> Result<bool> {
+    match result {
+        Ok(exists) => Ok(exists),
+        Err(WorkspaceMutationError::MissingParent { .. }) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn preflight_test_case_directory(root: &PinnedWorkspaceRoot, path: &WorkspacePath) -> Result<()> {
+    missing_parent_is_absent(external_directory_exists_in(root, path)).map_err(|error| {
+        format!(
+            "packaged fixture directory `{}` cannot be deployed: {error}",
+            root.path().join(path.as_str()).display()
+        )
+    })?;
+    Ok(())
+}
+
 fn preflight_test_case_file(
     root: &PinnedWorkspaceRoot,
     path: &WorkspacePath,
     expected: &[u8],
 ) -> Result<()> {
-    if !external_regular_file_exists_in(root, path)? {
+    if !missing_parent_is_absent(external_regular_file_exists_in(root, path))? {
         return Ok(());
     }
     let mut opened = open_external_regular_file_read_in(root, path)?;
@@ -373,30 +447,81 @@ fn preflight_test_case_file(
     Ok(())
 }
 
-fn for_each_test_case_file(
+/// One packaged path in the sibling `test-cases/` directory.
+enum ManagedNode<'a> {
+    Directory(&'a WorkspacePath),
+    File(&'a WorkspacePath, &'a [u8]),
+}
+
+enum CreatedNode {
+    File(WorkspacePath, RegularFileIdentity),
+    Directory(WorkspacePath, DirectoryIdentity),
+}
+
+/// Visits every packaged path in deployment order: each case's `.in`,
+/// `.args`, and `.expected` in name order, then the format 3 fixture tree
+/// with `files/` and every directory before the files below it.
+fn for_each_managed_node(
     suite: &ExtractedTestCaseSuite,
-    mut visit: impl FnMut(&WorkspacePath, &[u8]) -> Result<()>,
+    mut visit: impl FnMut(ManagedNode<'_>) -> Result<()>,
 ) -> Result<()> {
     for case in &suite.cases {
-        let input = WorkspacePath::new(format!("{}.in", case.name))?;
-        visit(&input, &case.input)?;
-        let expected = WorkspacePath::new(format!("{}.expected", case.name))?;
-        visit(&expected, &case.expected)?;
+        for (suffix, contents) in [
+            ("in", case.input.as_deref()),
+            ("args", case.args_file.as_deref()),
+            ("expected", Some(case.expected.as_slice())),
+        ] {
+            if let Some(contents) = contents {
+                let path = WorkspacePath::new(format!("{}.{suffix}", case.name))?;
+                visit(ManagedNode::File(&path, contents))?;
+            }
+        }
+    }
+    if let Some(fixtures) = &suite.fixtures {
+        let root = WorkspacePath::new(FIXTURE_ROOT)?;
+        visit(ManagedNode::Directory(&root))?;
+        for directory in fixtures.directories() {
+            let path = WorkspacePath::new(format!("{FIXTURE_ROOT}/{directory}"))?;
+            visit(ManagedNode::Directory(&path))?;
+        }
+        for (file, contents) in fixtures.files() {
+            let path = WorkspacePath::new(format!("{FIXTURE_ROOT}/{file}"))?;
+            visit(ManagedNode::File(&path, contents))?;
+        }
     }
     Ok(())
 }
 
-fn test_case_sibling(workspace_root: &Path) -> Result<PathBuf> {
-    if workspace_root.file_name() == Some(OsStr::new("test-cases")) {
-        return Err(
-            "the selected workspace cannot be the fixed sibling test-cases directory".into(),
-        );
+/// Formats 1 and 2 deploy to the shared sibling `test-cases/`; format 3
+/// deploys to the workspace's own `NAME.test-cases/`.
+fn test_case_sibling(workspace_root: &Path, suite: &ExtractedTestCaseSuite) -> Result<PathBuf> {
+    crate::console::test_case_folder(
+        workspace_root,
+        crate::console::TestCaseLayout::for_format_version(suite.format_version),
+    )
+}
+
+/// Writes the format 3 ownership marker when the case folder has none.
+fn claim_case_folder(
+    root: &PinnedWorkspaceRoot,
+    workspace_root: &Path,
+    suite: &ExtractedTestCaseSuite,
+    created: &mut Vec<CreatedNode>,
+) -> Result<()> {
+    let path = WorkspacePath::new(crate::console::CASE_FOLDER_MARKER)?;
+    if external_regular_file_exists_in(root, &path)? {
+        return Ok(());
     }
-    let parent = workspace_root
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .ok_or("workspace has no parent for sibling test-cases")?;
-    Ok(parent.join("test-cases"))
+    let marker = crate::console::CaseFolderMarker::new(
+        &crate::console::case_folder_owner(workspace_root)?,
+        suite.hash,
+    );
+    let mut file = create_external_regular_file_in(root, &path)?;
+    created.push(CreatedNode::File(path, file.identity()));
+    file.file_mut().write_all(&marker.encode())?;
+    file.file_mut().sync_all()?;
+    root.verify_binding()?;
+    Ok(())
 }
 
 fn open_existing_test_case_root(path: &Path) -> Result<Option<PinnedWorkspaceRoot>> {
@@ -427,6 +552,8 @@ fn open_existing_test_case_root(path: &Path) -> Result<Option<PinnedWorkspaceRoo
         )
         .into());
     }
+    // Never deploy cases into another workspace, in any format.
+    crate::console::refuse_workspace_as_case_folder(root.path())?;
     root.verify_binding()?;
     Ok(Some(root))
 }
@@ -559,9 +686,338 @@ mod deployment_tests {
         AssignmentPackageError, ExtractedTestCase, ExtractedTestCaseSuite,
         PublishPreparedWorkspaceError,
     };
+    use rustrace_workspace::fixture_tree::{FixtureTree, hash_deployed_fixture_tree};
     use rustrace_workspace::hash::PinnedWorkspaceRoot;
 
-    use super::{cleanup_failed_publication, publish_fresh_workspace_with};
+    use super::{cleanup_failed_publication, deploy_test_case_suite, publish_fresh_workspace_with};
+    use crate::console::{CASE_FOLDER_MARKER, CaseFolderMarker};
+
+    fn suite_fixture_hash(suite: &ExtractedTestCaseSuite) -> Hash {
+        suite.fixtures.as_ref().unwrap().hash()
+    }
+
+    fn path(value: &str) -> rustrace_model::WorkspacePath {
+        rustrace_model::WorkspacePath::new(value).unwrap()
+    }
+
+    fn format3_suite() -> ExtractedTestCaseSuite {
+        let fixtures = FixtureTree::from_parts(
+            [path("empty")],
+            [
+                (path("src/lib.rs"), b"fn a() {}\n".to_vec()),
+                (path("notes.txt"), b"fn\n".to_vec()),
+            ],
+        )
+        .unwrap();
+        ExtractedTestCaseSuite {
+            format_version: 3,
+            cases: vec![
+                ExtractedTestCase {
+                    name: "count".to_owned(),
+                    input: None,
+                    args_file: Some(b"-c\nfn\n".to_vec()),
+                    args: vec!["-c".to_owned(), "fn".to_owned()],
+                    expected: b"1\n".to_vec(),
+                },
+                ExtractedTestCase::paired("stdin", b"fn\n".to_vec(), b"fn\n".to_vec()),
+            ],
+            fixtures: Some(fixtures),
+            hash: Hash::zero(),
+            total_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn format3_deployment_writes_args_optional_input_and_the_fixture_tree() {
+        let temp = TempRoot::new();
+        let suite = format3_suite();
+        let prepared = temp.path().join("lab2.prepare");
+        let workspace = temp.path().join("lab2.work");
+        prepare_workspace(&prepared);
+        drop(
+            publish_fresh_workspace_with(&prepared, &workspace, Some(&suite), |_, _| Ok(()))
+                .unwrap(),
+        );
+
+        let sibling = temp.path().join("lab2.test-cases");
+        assert!(
+            !temp.path().join("test-cases").exists(),
+            "format 3 never writes the shared format 2 folder"
+        );
+        assert_eq!(fs::read(sibling.join("count.args")).unwrap(), b"-c\nfn\n");
+        assert_eq!(fs::read(sibling.join("count.expected")).unwrap(), b"1\n");
+        assert!(
+            !sibling.join("count.in").exists(),
+            "absent input stays absent"
+        );
+        assert_eq!(fs::read(sibling.join("stdin.in")).unwrap(), b"fn\n");
+        assert!(!sibling.join("stdin.args").exists());
+        assert!(sibling.join("files/empty").is_dir());
+        assert_eq!(
+            fs::read(sibling.join("files/src/lib.rs")).unwrap(),
+            b"fn a() {}\n"
+        );
+        assert!(!workspace.join("files").exists());
+        let root = PinnedWorkspaceRoot::open(&sibling).unwrap();
+        let expected = suite.fixtures.as_ref().unwrap().hash();
+        assert_eq!(hash_deployed_fixture_tree(&root).unwrap(), Some(expected));
+
+        // Resume recreates missing packaged paths and accepts identical ones.
+        fs::remove_file(sibling.join("files/src/lib.rs")).unwrap();
+        fs::remove_dir(sibling.join("files/src")).unwrap();
+        fs::remove_dir(sibling.join("files/empty")).unwrap();
+        fs::write(sibling.join("files/local.txt"), b"unrelated\n").unwrap();
+        deploy_test_case_suite(&workspace, &suite).unwrap();
+        assert_eq!(
+            fs::read(sibling.join("files/src/lib.rs")).unwrap(),
+            b"fn a() {}\n"
+        );
+        assert!(sibling.join("files/empty").is_dir());
+        assert_eq!(
+            fs::read(sibling.join("files/local.txt")).unwrap(),
+            b"unrelated\n"
+        );
+        fs::remove_file(sibling.join("files/local.txt")).unwrap();
+        assert_eq!(hash_deployed_fixture_tree(&root).unwrap(), Some(expected));
+
+        // A changed packaged fixture is refused, never overwritten.
+        fs::write(sibling.join("files/notes.txt"), b"edited\n").unwrap();
+        let error = deploy_test_case_suite(&workspace, &suite).expect_err("changed fixture");
+        assert!(error.to_string().contains("different bytes"), "{error}");
+        assert_eq!(
+            fs::read(sibling.join("files/notes.txt")).unwrap(),
+            b"edited\n"
+        );
+        fs::write(sibling.join("files/notes.txt"), b"fn\n").unwrap();
+
+        // A symlinked or non-directory fixture directory is refused.
+        fs::remove_dir(sibling.join("files/empty")).unwrap();
+        std::os::unix::fs::symlink("../..", sibling.join("files/empty")).unwrap();
+        assert!(deploy_test_case_suite(&workspace, &suite).is_err());
+        fs::remove_file(sibling.join("files/empty")).unwrap();
+        fs::write(sibling.join("files/empty"), b"").unwrap();
+        assert!(deploy_test_case_suite(&workspace, &suite).is_err());
+    }
+
+    #[test]
+    fn each_format3_workspace_gets_its_own_case_folder_beside_format2() {
+        let temp = TempRoot::new();
+        for name in ["lab2", "lab3"] {
+            let prepared = temp.path().join(format!("{name}.prepare"));
+            let workspace = temp.path().join(format!("{name}.work"));
+            prepare_workspace(&prepared);
+            drop(
+                publish_fresh_workspace_with(
+                    &prepared,
+                    &workspace,
+                    Some(&format3_suite()),
+                    |_, _| Ok(()),
+                )
+                .unwrap(),
+            );
+            assert!(
+                temp.path()
+                    .join(format!("{name}.test-cases/files"))
+                    .is_dir()
+            );
+        }
+        let prepared = temp.path().join("lab1.prepare");
+        prepare_workspace(&prepared);
+        drop(
+            publish_fresh_workspace_with(
+                &prepared,
+                &temp.path().join("lab1.work"),
+                Some(&suite()),
+                |_, _| Ok(()),
+            )
+            .unwrap(),
+        );
+        assert!(temp.path().join("test-cases/alpha.in").is_file());
+        assert!(!temp.path().join("lab1.test-cases").exists());
+        assert!(!temp.path().join("lab2.test-cases/alpha.in").exists());
+
+        // A workspace that another workspace would use as its case folder, or
+        // whose name Cargo would read as a template, is refused before it is
+        // published, and its prepared starter is removed.
+        for name in ["lab2.test-cases", "test-cases", "lab{2}.work", ".work"] {
+            let prepared = temp.path().join("refused.prepare");
+            prepare_workspace(&prepared);
+            let workspace = temp.path().join(name);
+            let existed = workspace.exists();
+            let error = publish_fresh_workspace_with(
+                &prepared,
+                &workspace,
+                Some(&format3_suite()),
+                |_, _| Ok(()),
+            )
+            .expect_err(name);
+            assert!(
+                error.to_string().contains("format 3 workspace"),
+                "{name}: {error}"
+            );
+            assert!(!prepared.exists(), "{name}");
+            assert_eq!(workspace.exists(), existed, "{name} was published");
+        }
+    }
+
+    #[test]
+    fn failed_fixture_deployment_rolls_back_created_files_and_directories() {
+        // Managed order: count.args, count.expected, stdin.in,
+        // stdin.expected, files, files/empty, files/src, files/notes.txt,
+        // files/src/lib.rs.
+        for target in [6, 7, 9] {
+            let temp = TempRoot::new();
+            let sibling = temp.path().join("lab2.test-cases");
+            fs::create_dir(&sibling).unwrap();
+            fs::write(
+                sibling.join(CASE_FOLDER_MARKER),
+                CaseFolderMarker::new("lab2.work", Hash::zero()).encode(),
+            )
+            .unwrap();
+            fs::write(sibling.join("stdin.in"), b"fn\n").unwrap();
+            fs::write(sibling.join("unrelated.txt"), b"keep\n").unwrap();
+            let prepared = temp.path().join("lab2.prepare");
+            let workspace = temp.path().join("lab2.work");
+            prepare_workspace(&prepared);
+            let error = publish_fresh_workspace_with(
+                &prepared,
+                &workspace,
+                Some(&format3_suite()),
+                fail_managed_file(target),
+            )
+            .expect_err("injected failure");
+            assert!(
+                error.to_string().contains("injected deployment failure"),
+                "{target}: {error}"
+            );
+            assert!(!workspace.exists());
+            let mut remaining = fs::read_dir(&sibling)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<Vec<_>>();
+            remaining.sort();
+            assert_eq!(
+                remaining,
+                [CASE_FOLDER_MARKER, "stdin.in", "unrelated.txt"],
+                "{target}"
+            );
+        }
+
+        // A folder this attempt created, marker included, is removed whole.
+        let temp = TempRoot::new();
+        let prepared = temp.path().join("lab2.prepare");
+        prepare_workspace(&prepared);
+        publish_fresh_workspace_with(
+            &prepared,
+            &temp.path().join("lab2.work"),
+            Some(&format3_suite()),
+            fail_managed_file(1),
+        )
+        .expect_err("injected failure");
+        assert!(!temp.path().join("lab2.test-cases").exists());
+    }
+
+    #[test]
+    fn format3_case_folders_are_claimed_for_one_workspace_and_suite() {
+        let temp = TempRoot::new();
+        let prepared = temp.path().join("lab2.prepare");
+        prepare_workspace(&prepared);
+        drop(
+            publish_fresh_workspace_with(
+                &prepared,
+                &temp.path().join("lab2.work"),
+                Some(&format3_suite()),
+                |_, _| Ok(()),
+            )
+            .unwrap(),
+        );
+        let folder = temp.path().join("lab2.test-cases");
+        assert_eq!(
+            fs::read(folder.join(CASE_FOLDER_MARKER)).unwrap(),
+            CaseFolderMarker::new("lab2.work", Hash::zero()).encode()
+        );
+        let tree = suite_fixture_hash(&format3_suite());
+        let root = PinnedWorkspaceRoot::open(&folder).unwrap();
+        assert_eq!(
+            hash_deployed_fixture_tree(&root).unwrap(),
+            Some(tree),
+            "the marker is outside the fixture tree"
+        );
+
+        // `lab2` maps to the same folder, which belongs to `lab2.work`.
+        let prepared = temp.path().join("other.prepare");
+        prepare_workspace(&prepared);
+        let error = publish_fresh_workspace_with(
+            &prepared,
+            &temp.path().join("lab2"),
+            Some(&format3_suite()),
+            |_, _| Ok(()),
+        )
+        .expect_err("another workspace's folder");
+        assert!(
+            error
+                .to_string()
+                .contains("belongs to the workspace `lab2.work`"),
+            "{error}"
+        );
+        assert!(!prepared.exists() && !temp.path().join("lab2").exists());
+
+        // Another package version is refused as well.
+        let mut other_version = format3_suite();
+        other_version.hash = Hash::from_bytes([9; Hash::LENGTH]);
+        let error = deploy_test_case_suite(&temp.path().join("lab2.work"), &other_version)
+            .expect_err("another suite");
+        assert!(
+            error.to_string().contains("different assignment package"),
+            "{error}"
+        );
+
+        // A folder without a marker is not claimed silently.
+        fs::create_dir(temp.path().join("lab3.test-cases")).unwrap();
+        let prepared = temp.path().join("lab3.prepare");
+        prepare_workspace(&prepared);
+        let error = publish_fresh_workspace_with(
+            &prepared,
+            &temp.path().join("lab3.work"),
+            Some(&format3_suite()),
+            |_, _| Ok(()),
+        )
+        .expect_err("unmarked folder");
+        assert!(
+            error.to_string().contains("not created by Rustrace"),
+            "{error}"
+        );
+
+        // A case folder that is itself a workspace is refused in both formats.
+        fs::create_dir_all(temp.path().join("lab4.test-cases/.rustrace")).unwrap();
+        let prepared = temp.path().join("lab4.prepare");
+        prepare_workspace(&prepared);
+        let error = publish_fresh_workspace_with(
+            &prepared,
+            &temp.path().join("lab4.work"),
+            Some(&format3_suite()),
+            |_, _| Ok(()),
+        )
+        .expect_err("workspace as case folder");
+        assert!(
+            error.to_string().contains("is a Rustrace workspace"),
+            "{error}"
+        );
+        fs::create_dir_all(temp.path().join("test-cases/.rustrace")).unwrap();
+        let prepared = temp.path().join("lab1.prepare");
+        prepare_workspace(&prepared);
+        let error = publish_fresh_workspace_with(
+            &prepared,
+            &temp.path().join("lab1.work"),
+            Some(&suite()),
+            |_, _| Ok(()),
+        )
+        .expect_err("format 2 workspace as case folder");
+        assert!(
+            error.to_string().contains("is a Rustrace workspace"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn failed_case_deployment_rolls_back_only_attempt_created_paths() {
@@ -674,18 +1130,20 @@ mod deployment_tests {
 
     fn suite() -> ExtractedTestCaseSuite {
         ExtractedTestCaseSuite {
+            format_version: 2,
             cases: vec![
-                ExtractedTestCase {
-                    name: "alpha".to_owned(),
-                    input: b"alpha input\n".to_vec(),
-                    expected: b"alpha expected\n".to_vec(),
-                },
-                ExtractedTestCase {
-                    name: "beta".to_owned(),
-                    input: b"beta input\n".to_vec(),
-                    expected: b"beta expected\n".to_vec(),
-                },
+                ExtractedTestCase::paired(
+                    "alpha",
+                    b"alpha input\n".to_vec(),
+                    b"alpha expected\n".to_vec(),
+                ),
+                ExtractedTestCase::paired(
+                    "beta",
+                    b"beta input\n".to_vec(),
+                    b"beta expected\n".to_vec(),
+                ),
             ],
+            fixtures: None,
             hash: Hash::zero(),
             total_bytes: 52,
         }

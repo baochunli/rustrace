@@ -23,8 +23,8 @@ use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 use rustix::fd::OwnedFd;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use rustix::fs::{
-    AtFlags, Dir, FileType, Mode, OFlags, RenameFlags, Stat, fstat, fsync, openat, renameat_with,
-    statat, unlinkat,
+    AtFlags, Dir, FileType, Mode, OFlags, RenameFlags, Stat, fstat, fsync, mkdirat, openat,
+    renameat_with, statat, unlinkat,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use rustix::io::Errno;
@@ -59,6 +59,14 @@ const FILE_MODE: Mode = Mode::RUSR
     .union(Mode::WUSR)
     .union(Mode::RGRP)
     .union(Mode::ROTH);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const DIRECTORY_MODE: Mode = Mode::RUSR
+    .union(Mode::WUSR)
+    .union(Mode::XUSR)
+    .union(Mode::RGRP)
+    .union(Mode::XGRP)
+    .union(Mode::ROTH)
+    .union(Mode::XOTH);
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -246,6 +254,151 @@ pub fn remove_created_external_regular_file_in(
         Ok(true)
     }
 
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (root, path, expected);
+        Err(WorkspaceMutationError::UnsupportedPlatform)
+    }
+}
+
+/// Descriptor identity of a directory created by [`create_external_directory_in`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+/// Reports whether an existing real directory is at `path`. A missing leaf
+/// below safe parents is `Ok(false)`; a symlink or other object is an error.
+pub fn external_directory_exists_in(
+    root: &PinnedWorkspaceRoot,
+    path: &WorkspacePath,
+) -> Result<bool, WorkspaceMutationError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        verify_mutation_root(root)?;
+        let opened = OpenedRoot::from_pinned(root);
+        let parents = open_parent_chain(&opened, path)?;
+        let parent = directory_chain_leaf(opened.directory, &parents);
+        let exists = match statat(parent, file_name(path), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => match file_type(&stat) {
+                FileType::Directory => true,
+                FileType::Symlink => {
+                    return Err(WorkspaceMutationError::Symlink { path: path.clone() });
+                }
+                kind => {
+                    return Err(WorkspaceMutationError::NotDirectory {
+                        path: path.clone(),
+                        kind: file_type_name(kind),
+                    });
+                }
+            },
+            Err(Errno::NOENT) => false,
+            Err(error) => {
+                return Err(filesystem_error(
+                    "inspect external directory",
+                    opened.absolute(path),
+                    error,
+                ));
+            }
+        };
+        verify_mutation_root(root)?;
+        Ok(exists)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (root, path);
+        Err(WorkspaceMutationError::UnsupportedPlatform)
+    }
+}
+
+/// Creates one new directory without replacing an existing entry. Parents are
+/// opened without following links and are never created implicitly.
+pub fn create_external_directory_in(
+    root: &PinnedWorkspaceRoot,
+    path: &WorkspacePath,
+) -> Result<DirectoryIdentity, WorkspaceMutationError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        verify_mutation_root(root)?;
+        let opened = OpenedRoot::from_pinned(root);
+        let parents = open_parent_chain(&opened, path)?;
+        let parent = directory_chain_leaf(opened.directory, &parents);
+        let absolute = opened.absolute(path);
+        mkdirat(parent, file_name(path), DIRECTORY_MODE).map_err(|error| match error {
+            Errno::EXIST => WorkspaceMutationError::PathCollision { path: path.clone() },
+            _ => filesystem_error("create external directory", &absolute, error),
+        })?;
+        let stat = statat(parent, file_name(path), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| filesystem_error("inspect external directory", &absolute, error))?;
+        if file_type(&stat) != FileType::Directory {
+            return Err(WorkspaceMutationError::PathChanged { path: path.clone() });
+        }
+        fsync(parent).map_err(|error| {
+            filesystem_error("sync external directory parent", &absolute, error)
+        })?;
+        verify_mutation_root(root)?;
+        Ok(DirectoryIdentity {
+            device: stat.st_dev as u64,
+            inode: stat.st_ino,
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (root, path);
+        Err(WorkspaceMutationError::UnsupportedPlatform)
+    }
+}
+
+/// Removes a directory only while it is still the empty directory created by
+/// the caller, for rollback after [`create_external_directory_in`]. A
+/// missing, replaced, or nonempty directory is left untouched: `Ok(false)`.
+pub fn remove_created_external_directory_in(
+    root: &PinnedWorkspaceRoot,
+    path: &WorkspacePath,
+    expected: DirectoryIdentity,
+) -> Result<bool, WorkspaceMutationError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        verify_mutation_root(root)?;
+        let opened = OpenedRoot::from_pinned(root);
+        let parents = open_parent_chain(&opened, path)?;
+        let parent = directory_chain_leaf(opened.directory, &parents);
+        let absolute = opened.absolute(path);
+        let stat = match statat(parent, file_name(path), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(Errno::NOENT) => return Ok(false),
+            Err(error) => {
+                return Err(filesystem_error(
+                    "inspect created external directory",
+                    &absolute,
+                    error,
+                ));
+            }
+        };
+        if file_type(&stat) != FileType::Directory
+            || stat.st_dev as u64 != expected.device
+            || stat.st_ino != expected.inode
+        {
+            return Ok(false);
+        }
+        match unlinkat(parent, file_name(path), AtFlags::REMOVEDIR) {
+            Ok(()) => {}
+            Err(Errno::NOTEMPTY | Errno::EXIST | Errno::NOENT) => return Ok(false),
+            Err(error) => {
+                return Err(filesystem_error(
+                    "remove created external directory",
+                    &absolute,
+                    error,
+                ));
+            }
+        }
+        fsync(parent).map_err(|error| {
+            filesystem_error("sync external directory parent", &absolute, error)
+        })?;
+        verify_mutation_root(root)?;
+        Ok(true)
+    }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (root, path, expected);

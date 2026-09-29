@@ -1247,3 +1247,241 @@ fn output_limit_termination_requires_the_exact_started_capture_cap() {
     );
     assert_eq!(replay.last_event_hash(), before);
 }
+
+const FIXTURES_HASH: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+
+fn format3_start(replay: &ReplayEngine, route: Value, tail: &[&str]) -> Value {
+    let mut value = start(replay);
+    value["payload"]["action"] = json!("run");
+    let mut argv = vec![
+        json!("/trusted/rustup"),
+        json!("run"),
+        json!("fixture"),
+        json!("/trusted/cargo"),
+        json!("run"),
+    ];
+    argv.extend(tail.iter().map(|argument| json!(argument)));
+    value["payload"]["argv"] = json!(argv);
+    value["payload"]["console"] = route;
+    value
+}
+
+/// The closed-stdin packaged case `sample`, run with arguments from the
+/// deployed fixture directory, finished with exit 0 and complete stdout.
+fn format3_route() -> (Value, Vec<&'static str>) {
+    (
+        json!({"stdin":{"kind":"closed"},"stdout":{"kind":"console"},
+            "args":["-n","fn main"],
+            "working_directory":{"kind":"fixtures","fixtures_blake3":FIXTURES_HASH},
+            "test_case":"sample"}),
+        vec![
+            "--locked",
+            "--manifest-path",
+            "../../lab.work/Cargo.toml",
+            "--",
+            "-n",
+            "fn main",
+        ],
+    )
+}
+
+fn through_format3_finish(route: Value, tail: &[&str], exit_code: i32) -> ReplayEngine {
+    let mut replay = initial();
+    let event = format3_start(&replay, route, tail);
+    apply(&mut replay, 2, event);
+    apply(
+        &mut replay,
+        3,
+        json!({"type": "controlled_command_output", "payload": {
+            "command_id": "command-2", "stream": "stdout", "offset": 0,
+            "bytes_hex": "ff001b"
+        }}),
+    );
+    post_checkpoint(&mut replay);
+    let mut value = finish(&replay);
+    value["payload"]["outcome"] = json!({"kind":"exited","code":exit_code});
+    apply(&mut replay, 5, value);
+    replay
+}
+
+fn format3_invocation() -> Value {
+    json!({"args_blake3":test_case_args_blake3(&["-n", "fn main"]),
+        "stdin":{"kind":"closed"},"fixtures_blake3":FIXTURES_HASH})
+}
+
+fn format3_comparison(outcome: Value, invocation: Option<Value>) -> Value {
+    let mut event = comparison(outcome, Some(captured_stdout_hash()));
+    if let Some(invocation) = invocation {
+        event["payload"]["invocation"] = invocation;
+    }
+    event
+}
+
+fn assert_rejected_atomically(replay: &mut ReplayEngine, event: Value, label: &str) {
+    let envelope = decode(replay, 6, event);
+    let before = (replay.next_sequence(), replay.last_event_hash());
+    let error = replay.apply(&envelope).expect_err(label);
+    assert_eq!(
+        (replay.next_sequence(), replay.last_event_hash()),
+        before,
+        "{label}: {error}"
+    );
+}
+
+#[test]
+fn format3_comparisons_replay_for_closed_stdin_arguments_and_fixtures() {
+    let (route, tail) = format3_route();
+    for (exit, outcome) in [
+        (0, json!({"kind":"pass"})),
+        (
+            0,
+            json!({"kind":"mismatch","line":1,"expected_len":3,"actual_len":3}),
+        ),
+        (7, json!({"kind":"error","reason":"nonzero_exit"})),
+    ] {
+        let mut replay = through_format3_finish(route.clone(), &tail, exit);
+        apply(
+            &mut replay,
+            6,
+            format3_comparison(outcome.clone(), Some(format3_invocation())),
+        );
+        assert_eq!(replay.next_sequence(), 7, "{outcome}");
+    }
+
+    // A case with its own NAME.in, no arguments, and no fixture tree.
+    let file_route = json!({"stdin":{"kind":"file","path":"sample.in"},
+        "stdout":{"kind":"console"},"test_case":"sample"});
+    let mut replay = through_format3_finish(file_route, &["--locked"], 0);
+    apply(
+        &mut replay,
+        6,
+        format3_comparison(
+            json!({"kind":"pass"}),
+            Some(json!({"args_blake3":test_case_args_blake3::<&str>(&[]),
+                "stdin":{"kind":"file","blake3":"55".repeat(32)}})),
+        ),
+    );
+}
+
+#[test]
+fn format3_comparison_rejects_arguments_stdin_or_fixture_tampering() {
+    let (route, tail) = format3_route();
+    let mut tampered = Vec::new();
+    for (label, key, value) in [
+        (
+            "changed arguments",
+            "args_blake3",
+            json!(test_case_args_blake3(&["-n", "fn  main"])),
+        ),
+        (
+            "no arguments",
+            "args_blake3",
+            json!(test_case_args_blake3::<&str>(&[])),
+        ),
+        (
+            "file stdin",
+            "stdin",
+            json!({"kind":"file","blake3":"55".repeat(32)}),
+        ),
+        (
+            "changed fixtures",
+            "fixtures_blake3",
+            json!("45".repeat(32)),
+        ),
+    ] {
+        let mut invocation = format3_invocation();
+        invocation[key] = value;
+        tampered.push((label, Some(invocation)));
+    }
+    let mut no_fixtures = format3_invocation();
+    no_fixtures
+        .as_object_mut()
+        .unwrap()
+        .remove("fixtures_blake3");
+    tampered.push(("missing fixtures", Some(no_fixtures)));
+    tampered.push(("missing invocation", None));
+    for (label, invocation) in tampered {
+        let mut replay = through_format3_finish(route.clone(), &tail, 0);
+        assert_rejected_atomically(
+            &mut replay,
+            format3_comparison(json!({"kind":"pass"}), invocation),
+            label,
+        );
+    }
+
+    let mut replay = through_format3_finish(route.clone(), &tail, 0);
+    let mut other_case = format3_comparison(json!({"kind":"pass"}), Some(format3_invocation()));
+    other_case["payload"]["case"] = json!("other");
+    assert_rejected_atomically(&mut replay, other_case, "comparison names another case");
+
+    // The fixture tree must be absent from a workspace-directory Run.
+    let workspace_route = json!({"stdin":{"kind":"closed"},"stdout":{"kind":"console"},
+        "test_case":"sample"});
+    let mut replay = through_format3_finish(workspace_route, &["--locked"], 0);
+    let mut invocation = format3_invocation();
+    invocation["args_blake3"] = json!(test_case_args_blake3::<&str>(&[]));
+    assert_rejected_atomically(
+        &mut replay,
+        format3_comparison(json!({"kind":"pass"}), Some(invocation)),
+        "fixtures claimed for a workspace Run",
+    );
+
+    // A file-stdin route cannot be restated as closed.
+    let file_route = json!({"stdin":{"kind":"file","path":"sample.in"},
+        "stdout":{"kind":"console"},"test_case":"sample"});
+    let mut replay = through_format3_finish(file_route, &["--locked"], 0);
+    assert_rejected_atomically(
+        &mut replay,
+        format3_comparison(
+            json!({"kind":"pass"}),
+            Some(json!({"args_blake3":test_case_args_blake3::<&str>(&[]),
+                "stdin":{"kind":"closed"}})),
+        ),
+        "closed stdin claimed for a NAME.in Run",
+    );
+}
+
+#[test]
+fn format2_comparisons_stay_strict_about_format3_route_additions() {
+    // A format 2 comparison (no invocation) after an unmarked Run route that
+    // nevertheless carries arguments or a fixture directory.
+    for (route, tail) in [
+        (
+            json!({"stdin":{"kind":"file","path":"sample.in"},"stdout":{"kind":"console"},
+                "args":["x"]}),
+            vec!["--locked", "--", "x"],
+        ),
+        (
+            json!({"stdin":{"kind":"file","path":"sample.in"},"stdout":{"kind":"console"},
+                "working_directory":{"kind":"fixtures","fixtures_blake3":FIXTURES_HASH}}),
+            vec!["--locked", "--manifest-path", "../../lab.work/Cargo.toml"],
+        ),
+    ] {
+        let mut replay = through_format3_finish(route.clone(), &tail, 0);
+        assert_rejected_atomically(
+            &mut replay,
+            format3_comparison(json!({"kind":"pass"}), None),
+            &route.to_string(),
+        );
+    }
+
+    // An invocation block cannot be attached to a Lab 1 packaged-case Run.
+    let mut replay = through_test_case_finish(0, "complete");
+    assert_rejected_atomically(
+        &mut replay,
+        format3_comparison(
+            json!({"kind":"pass"}),
+            Some(json!({"args_blake3":test_case_args_blake3::<&str>(&[]),
+                "stdin":{"kind":"file","blake3":"55".repeat(32)}})),
+        ),
+        "invocation after an unmarked route",
+    );
+
+    // Lab 1 comparisons still replay unchanged.
+    let mut replay = through_test_case_finish(0, "complete");
+    apply(
+        &mut replay,
+        6,
+        comparison(json!({"kind":"pass"}), Some(captured_stdout_hash())),
+    );
+}

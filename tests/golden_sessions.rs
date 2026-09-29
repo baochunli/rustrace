@@ -18,11 +18,12 @@ use rustrace::{
     },
 };
 use rustrace_model::{
-    DecodeOutcome, DecodePolicy, Event, Hash, MAX_RPROV_ARCHIVE_ENTRIES, MAX_RPROV_EVENTS,
-    RPROV_FORMAT_VERSION_V1, RPROV_RECORD_HEADER_BYTES, RprovContainerHeader,
-    RprovInterAttemptTime, RprovManifest, RprovRecordHeader, RprovRecordType,
-    TestCaseComparisonError, TestCaseComparisonOutcome, decode_envelope, encode_envelope,
-    encode_rprov_container_header, encode_rprov_record_header, rprov_raw_blake3,
+    ConsoleCommandRoute, DecodeOutcome, DecodePolicy, Event, EventEnvelope, Hash,
+    MAX_RPROV_ARCHIVE_ENTRIES, MAX_RPROV_EVENTS, RPROV_FORMAT_VERSION_V1,
+    RPROV_RECORD_HEADER_BYTES, RprovContainerHeader, RprovInterAttemptTime, RprovManifest,
+    RprovRecordHeader, RprovRecordType, TestCaseComparisonError, TestCaseComparisonOutcome,
+    TestCaseInvocation, decode_envelope, encode_envelope, encode_rprov_container_header,
+    encode_rprov_record_header, rprov_raw_blake3, test_case_args_blake3,
 };
 use rustrace_workspace::{
     assignment_package::{ExtractionLimits, extract_assignment_package},
@@ -434,7 +435,12 @@ fn run_controlled_child(case: &Path, mode: &str) {
             b"[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n[workspace]\n",
         )
         .unwrap();
-        let test_cases = case.join("test-cases");
+        // Format 3 sessions read the workspace's own case folder.
+        let test_cases = case.join(if mode == "comparison-format3" {
+            "workspace.test-cases"
+        } else {
+            "test-cases"
+        });
         fs::create_dir(&test_cases).unwrap();
         fs::write(test_cases.join("sample.in"), b"input\n").unwrap();
         fs::write(
@@ -447,27 +453,65 @@ fn run_controlled_child(case: &Path, mode: &str) {
         )
         .unwrap();
         fs::write(workspace.join("main.rs"), "").unwrap();
+        // The format 3 package names a closed-stdin case with arguments and a
+        // fixture tree. The live sibling above keeps the format 2 pair so the
+        // current runner can execute it; tests then reseal the evidence a
+        // format 3 run records.
+        let format3 = mode == "comparison-format3";
         let manifest = String::from_utf8(SESSION_MANIFEST.to_vec())
             .unwrap()
-            .replacen("format_version = 1", "format_version = 2", 1);
-        fs::write(
-            case.join("assignment.rta"),
-            assignment_tar(&[
-                StoredZipEntry::file("assignment.toml", manifest.as_bytes()),
-                StoredZipEntry::file(
-                    "starter/Cargo.toml",
-                    b"[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n[workspace]\n",
-                ),
-                StoredZipEntry::file("starter/Cargo.lock", b"fixture"),
-                StoredZipEntry::file("starter/main.rs", b""),
+            .replacen(
+                "format_version = 1",
+                if format3 {
+                    "format_version = 3"
+                } else {
+                    "format_version = 2"
+                },
+                1,
+            );
+        let expected = fs::read(test_cases.join("sample.expected")).unwrap();
+        let mut entries = vec![
+            StoredZipEntry::file("assignment.toml", manifest.as_bytes()),
+            StoredZipEntry::file(
+                "starter/Cargo.toml",
+                b"[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n[workspace]\n",
+            ),
+            StoredZipEntry::file("starter/Cargo.lock", b"fixture"),
+            StoredZipEntry::file("starter/main.rs", b""),
+        ];
+        if format3 {
+            entries.extend([
+                StoredZipEntry::file("test-cases/sample.args", b"-n\nfn main\n"),
+                StoredZipEntry::file("test-cases/sample.expected", expected),
+                StoredZipEntry::file("test-cases/files/src/lib.rs", b"fn main() {}\n"),
+                StoredZipEntry::file("test-cases/files/notes.txt", b"notes\n"),
+            ]);
+        } else {
+            entries.extend([
                 StoredZipEntry::file("test-cases/sample.in", b"input\n"),
-                StoredZipEntry::file(
-                    "test-cases/sample.expected",
-                    fs::read(test_cases.join("sample.expected")).unwrap(),
+                StoredZipEntry::file("test-cases/sample.expected", expected),
+            ]);
+        }
+        fs::write(case.join("assignment.rta"), assignment_tar(&entries)).unwrap();
+        if format3 {
+            // Deployment claims a format 3 case folder with this marker.
+            let suite = extract_assignment_package(
+                fs::File::open(case.join("assignment.rta")).unwrap(),
+                &case.join("marker-extraction"),
+                ExtractionLimits::default(),
+            )
+            .unwrap()
+            .test_cases
+            .unwrap();
+            fs::write(
+                test_cases.join(".rustrace-cases.json"),
+                format!(
+                    "{{\"version\":1,\"workspace\":\"workspace\",\"test_case_suite_hash\":\"{}\"}}\n",
+                    suite.hash
                 ),
-            ]),
-        )
-        .unwrap();
+            )
+            .unwrap();
+        }
     } else if mode == "formatting" {
         for index in 0..5 {
             fs::write(
@@ -643,7 +687,7 @@ fn golden_session_child() {
                 run_command(&mut session, CargoAction::Format);
             }
         }
-        "comparison-pass" | "comparison-mismatch" | "comparison-error" => {
+        "comparison-pass" | "comparison-mismatch" | "comparison-error" | "comparison-format3" => {
             let case = session
                 .list_test_cases()
                 .unwrap()
@@ -654,7 +698,7 @@ fn golden_session_child() {
             wait_for_command(&mut session);
             let comparison = session.take_test_case_result().unwrap();
             match mode {
-                "comparison-pass" => {
+                "comparison-pass" | "comparison-format3" => {
                     assert!(matches!(comparison.outcome, TestCaseOutcome::Pass));
                 }
                 "comparison-mismatch" => assert!(matches!(
@@ -1092,6 +1136,468 @@ fn test_case_comparison_goldens_reach_verify_scan_replay_and_cli_rows() {
             _ => unreachable!(),
         }
     }
+}
+
+/// Rewrites the events of a one-segment `.rprov`, reseals the chain, and
+/// rebinds every command tree link and manifest hash that named an old event.
+fn reseal_rprov_events(original: &[u8], mut edit: impl FnMut(&mut EventEnvelope)) -> Vec<u8> {
+    let (mut manifest, mut payloads) = collect_rprov(original);
+    let event_path = manifest.segments[0].events.entry.clone();
+    let mut remapped = BTreeMap::<Hash, Hash>::new();
+    let mut previous = Hash::zero();
+    let mut events = Vec::new();
+    for bytes in payloads[&event_path]
+        .split(|byte| *byte == b'\n')
+        .filter(|bytes| !bytes.is_empty())
+    {
+        let DecodeOutcome::Decoded(mut envelope) =
+            decode_envelope(bytes, DecodePolicy::RejectUnsupported).unwrap()
+        else {
+            panic!("golden envelope must decode")
+        };
+        let old_hash = envelope.event_hash;
+        edit(&mut envelope);
+        let link = match &mut envelope.event {
+            Event::ControlledCommandStarted(start) => Some(&mut start.before),
+            Event::ControlledCommandFinished(finish) => Some(&mut finish.after),
+            _ => None,
+        };
+        if let Some(link) = link
+            && let Some(new_hash) = remapped.get(&link.checkpoint_event_hash)
+        {
+            link.checkpoint_event_hash = *new_hash;
+        }
+        let envelope = envelope.seal(previous).unwrap();
+        remapped.insert(old_hash, envelope.event_hash);
+        previous = envelope.event_hash;
+        for checkpoint in &mut manifest.segments[0].checkpoints {
+            if checkpoint.owner.sequence == envelope.sequence {
+                checkpoint.owner.event_hash = envelope.event_hash;
+            }
+        }
+        events.extend_from_slice(&encode_envelope(&envelope).unwrap());
+        events.push(b'\n');
+    }
+    let digest = rprov_raw_blake3(&events);
+    let segment = &mut manifest.segments[0];
+    segment.last_event_hash = previous;
+    segment.terminal_event_hash = rustrace_model::RprovKnown::Known { value: previous };
+    segment.events.blake3 = digest;
+    segment.events.byte_length = events.len() as u64;
+    let inventory = manifest
+        .inventory
+        .iter_mut()
+        .find(|entry| entry.path == event_path)
+        .unwrap();
+    inventory.blake3 = digest;
+    inventory.byte_length = events.len() as u64;
+    payloads.insert(event_path, events);
+    encode_rprov_unchecked(&manifest, &payloads)
+}
+
+/// What a format 3 runner would record for the packaged case `sample`.
+struct Format3Run<'a> {
+    args: &'a [&'a str],
+    fixtures: Option<Hash>,
+    input: Option<Hash>,
+    /// Arguments claimed by the comparison, when they differ from the route.
+    invocation_args: Option<&'a [&'a str]>,
+    invocation: bool,
+}
+
+fn format3_rprov(original: &[u8], manifest_path: &str, run: &Format3Run<'_>) -> Vec<u8> {
+    let args = run
+        .args
+        .iter()
+        .map(|arg| (*arg).to_owned())
+        .collect::<Vec<_>>();
+    let route = ConsoleCommandRoute::packaged_case(
+        "sample",
+        run.input.is_some(),
+        args.clone(),
+        run.fixtures,
+    )
+    .unwrap();
+    let mut invocation = TestCaseInvocation::for_route(&route, run.input).unwrap();
+    if let Some(claimed) = run.invocation_args {
+        invocation.args_blake3 = test_case_args_blake3(claimed);
+    }
+    reseal_rprov_events(original, |envelope| match &mut envelope.event {
+        Event::ControlledCommandStarted(start) if start.console.is_some() => {
+            assert_eq!(start.argv[5..], ["--locked"]);
+            if run.fixtures.is_some() {
+                start
+                    .argv
+                    .extend(["--manifest-path".to_owned(), manifest_path.to_owned()]);
+            }
+            if !args.is_empty() {
+                start.argv.push("--".to_owned());
+                start.argv.extend(args.iter().cloned());
+            }
+            start.console = Some(route.clone());
+        }
+        Event::TestCaseCompared(comparison) => {
+            comparison.invocation = run.invocation.then(|| invocation.clone());
+        }
+        _ => {}
+    })
+}
+
+#[test]
+fn format3_reference_verifies_arguments_closed_stdin_and_fixtures() {
+    let test_home = test_home::TestHome::new(false);
+    let fixture = FixtureRoot::new("format3-reference");
+    let case = fixture.case("format3");
+    run_controlled_child(&case, "comparison-format3");
+    let reference = case.join("assignment.rta");
+    let bundle = case.join("session.zip");
+
+    // This build's runner still records a format 2-shaped comparison. It
+    // replays, but a format 3 reference refuses it as incomplete evidence.
+    let unmarked = verify_path(&bundle, Some(&reference));
+    assert_eq!(unmarked.replay, VerificationStatus::Ok, "{unmarked:#?}");
+    assert_eq!(
+        unmarked.assignment_reference,
+        rustrace::verify::AssignmentReferenceStatus::Mismatch
+    );
+    assert!(unmarked.issues.iter().any(|issue| {
+        issue.kind == VerificationIssueKind::AssignmentReference
+            && issue
+                .detail
+                .contains("lacks the arguments, input, and fixture evidence")
+    }));
+    assert_eq!(
+        unmarked.test_case_evidence,
+        Some(TestCaseEvidenceStatus::Recorded)
+    );
+
+    let packaged_fixtures = extract_assignment_package(
+        fs::File::open(&reference).unwrap(),
+        &case.join("reference-extraction"),
+        ExtractionLimits::default(),
+    )
+    .unwrap()
+    .test_cases
+    .unwrap()
+    .fixtures
+    .unwrap()
+    .hash();
+    let metadata: Value =
+        serde_json::from_slice(&fs::read(case.join("workspace/.rustrace/session.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        metadata["test_case_fixtures_hash"],
+        Value::from(packaged_fixtures.to_string()),
+        "the session records the packaged fixture tree at startup"
+    );
+    let original = stored_zip_entry(&fs::read(&bundle).unwrap(), "session.rprov");
+    // Relative to the fixture folder `workspace.test-cases/files`.
+    let manifest_path = "../../workspace/Cargo.toml";
+    let baseline = Format3Run {
+        args: &["-n", "fn main"],
+        fixtures: Some(packaged_fixtures),
+        input: None,
+        invocation_args: None,
+        invocation: true,
+    };
+
+    let submissions = case.join("submissions");
+    fs::create_dir(&submissions).unwrap();
+    let verified_path = submissions.join("format3.rprov");
+    fs::write(
+        &verified_path,
+        format3_rprov(&original, manifest_path, &baseline),
+    )
+    .unwrap();
+    let recorded = verify_path(&verified_path, None);
+    assert!(recorded.is_clean(), "{recorded:#?}");
+    assert_eq!(recorded.test_case_passes, Some(1));
+    let verified = verify_path(&verified_path, Some(&reference));
+    assert!(verified.is_clean(), "{verified:#?}");
+    assert_eq!(
+        verified.test_case_evidence,
+        Some(TestCaseEvidenceStatus::ReferenceVerified)
+    );
+    let mut scan = Vec::new();
+    run_scan(
+        &[
+            submissions.to_string_lossy().into_owned(),
+            "--reference".to_owned(),
+            reference.to_string_lossy().into_owned(),
+        ],
+        &mut scan,
+    )
+    .unwrap();
+    let scan = String::from_utf8(scan).unwrap();
+    assert!(scan.contains("evidence=reference-verified"), "{scan}");
+    let verified_cli = test_home
+        .command(env!("CARGO_BIN_EXE_rustrace"))
+        .arg("verify")
+        .arg(&verified_path)
+        .arg("--reference")
+        .arg(&reference)
+        .output()
+        .unwrap();
+    command_ok(&verified_cli, "format 3 verify");
+    let mut replay = ReplayController::open(&verified_path).unwrap();
+    let position = replay
+        .timeline_rows(replay.event_count())
+        .into_iter()
+        .find(|row| row.event_name == "test case compared")
+        .unwrap()
+        .position;
+    replay.select(position).unwrap();
+    let selected = replay.selected_event().unwrap();
+    assert!(
+        selected
+            .test_case_comparison
+            .as_ref()
+            .unwrap()
+            .invocation
+            .is_some()
+    );
+
+    // Consistent tampering replays but no longer matches the package.
+    let other_fixtures = Hash::from_bytes([0x45; Hash::LENGTH]);
+    let input = rprov_raw_blake3(b"input\n");
+    for (label, run, detail) in [
+        (
+            "arguments",
+            Format3Run {
+                args: &["-n", "fn  main"],
+                ..baseline
+            },
+            "program arguments mismatch for test case sample",
+        ),
+        (
+            "fixture tree",
+            Format3Run {
+                fixtures: Some(other_fixtures),
+                ..baseline
+            },
+            "fixture tree mismatch for test case sample",
+        ),
+        (
+            "no fixture tree",
+            Format3Run {
+                fixtures: None,
+                ..baseline
+            },
+            "fixture tree mismatch for test case sample",
+        ),
+        (
+            "stdin source",
+            Format3Run {
+                input: Some(input),
+                ..baseline
+            },
+            "standard input mismatch for test case sample",
+        ),
+    ] {
+        let path = case.join(format!("tampered-{}.rprov", label.replace(' ', "-")));
+        fs::write(&path, format3_rprov(&original, manifest_path, &run)).unwrap();
+        let recorded = verify_path(&path, None);
+        assert!(recorded.is_clean(), "{label}: {recorded:#?}");
+        let report = verify_path(&path, Some(&reference));
+        assert_eq!(report.replay, VerificationStatus::Ok, "{label}");
+        assert_eq!(
+            report.assignment_reference,
+            rustrace::verify::AssignmentReferenceStatus::Mismatch,
+            "{label}: {report:#?}"
+        );
+        assert_eq!(
+            report.test_case_evidence,
+            Some(TestCaseEvidenceStatus::Recorded),
+            "{label}"
+        );
+        assert!(
+            report.issues.iter().any(|issue| {
+                issue.kind == VerificationIssueKind::AssignmentReference
+                    && issue.detail.contains(detail)
+            }),
+            "{label}: {report:#?}"
+        );
+    }
+
+    // Inconsistent evidence fails replay before any reference comparison.
+    for (label, run) in [
+        (
+            "comparison arguments differ from the route",
+            Format3Run {
+                invocation_args: Some(&["-n"]),
+                ..baseline
+            },
+        ),
+        (
+            "route names the case without an invocation",
+            Format3Run {
+                invocation: false,
+                ..baseline
+            },
+        ),
+    ] {
+        let path = case.join("inconsistent.rprov");
+        fs::write(&path, format3_rprov(&original, manifest_path, &run)).unwrap();
+        let report = verify_path(&path, None);
+        assert_eq!(report.replay, VerificationStatus::Failed, "{label}");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.kind == VerificationIssueKind::Replay),
+            "{label}: {report:#?}"
+        );
+    }
+}
+
+#[test]
+fn format3_revision_gets_its_own_claimed_case_folder() {
+    let fixture = FixtureRoot::new("format3-revise");
+    let root = fixture.case("course");
+    let manifest = String::from_utf8(SESSION_MANIFEST.to_vec())
+        .unwrap()
+        .replacen("format_version = 1", "format_version = 3", 1);
+    let package = root.join("lab2.rta");
+    fs::write(
+        &package,
+        assignment_tar(&[
+            StoredZipEntry::file("assignment.toml", manifest.as_bytes()),
+            StoredZipEntry::file(
+                "starter/Cargo.toml",
+                b"[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n[workspace]\n",
+            ),
+            StoredZipEntry::file("starter/main.rs", b"fn main() {}\n"),
+            StoredZipEntry::file("test-cases/sample.args", b"-n\n"),
+            StoredZipEntry::file("test-cases/sample.expected", b"1\n"),
+            StoredZipEntry::file("test-cases/files/notes.txt", b"notes\n"),
+        ]),
+    )
+    .unwrap();
+    let parent = root.join("lab2.work");
+    let extracted = extract_assignment_package(
+        fs::File::open(&package).unwrap(),
+        &parent,
+        ExtractionLimits::default(),
+    )
+    .unwrap();
+    let fixtures = extracted
+        .test_cases
+        .as_ref()
+        .unwrap()
+        .fixtures
+        .as_ref()
+        .unwrap()
+        .hash();
+    ProductionSession::start_from_assignment(&parent, &extracted)
+        .unwrap()
+        .finalize("student-1")
+        .unwrap();
+    let arg = |path: &Path| path.to_string_lossy().into_owned();
+
+    // An unusable revision name is refused before anything is created.
+    let refused = root.join("lab2-rev.test-cases");
+    let error = rustrace::session::run_revise(
+        &[arg(&parent), arg(&refused), arg(&package)],
+        &mut Vec::new(),
+    )
+    .expect_err("case-folder name");
+    assert!(error.to_string().contains("format 3 workspace"), "{error}");
+    assert!(!refused.exists());
+
+    let revision = root.join("lab2-rev.work");
+    let mut output = Vec::new();
+    rustrace::session::run_revise(&[arg(&parent), arg(&revision), arg(&package)], &mut output)
+        .unwrap();
+    let folder = root.join("lab2-rev.test-cases");
+    let marker: Value =
+        serde_json::from_slice(&fs::read(folder.join(".rustrace-cases.json")).unwrap()).unwrap();
+    assert_eq!(marker["workspace"], "lab2-rev.work");
+    assert_eq!(fs::read(folder.join("sample.args")).unwrap(), b"-n\n");
+    assert_eq!(
+        fs::read(folder.join("files/notes.txt")).unwrap(),
+        b"notes\n"
+    );
+    let metadata: Value =
+        serde_json::from_slice(&fs::read(revision.join(".rustrace/session.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        metadata["test_case_fixtures_hash"],
+        Value::from(fixtures.to_string())
+    );
+    assert!(
+        !root.join("test-cases").exists(),
+        "format 3 never uses the shared folder"
+    );
+}
+
+#[test]
+fn format2_packaged_case_evidence_keeps_its_historical_shape() {
+    let fixture = FixtureRoot::new("format2-shape");
+    let case = fixture.case("lab1");
+    run_controlled_child(&case, "comparison-pass");
+    let original = stored_zip_entry(
+        &fs::read(case.join("session.zip")).unwrap(),
+        "session.rprov",
+    );
+    let (manifest, payloads) = collect_rprov(&original);
+    let events = &payloads[&manifest.segments[0].events.entry];
+    let mut routes = 0;
+    let mut comparisons = 0;
+    for line in events
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let value: Value = serde_json::from_slice(line).unwrap();
+        let payload = &value["event"]["payload"];
+        match value["event"]["type"].as_str().unwrap() {
+            "controlled_command_started" if payload.get("console").is_some() => {
+                routes += 1;
+                assert_eq!(
+                    payload["console"],
+                    serde_json::json!({"stdin":{"kind":"file","path":"sample.in"},
+                        "stdout":{"kind":"console"}})
+                );
+                assert_eq!(
+                    payload["argv"].as_array().unwrap()[5..],
+                    [Value::from("--locked")]
+                );
+                let text = std::str::from_utf8(line).unwrap();
+                assert!(text.contains(
+                    r#""console":{"stdin":{"kind":"file","path":"sample.in"},"stdout":{"kind":"console"}}}"#
+                ));
+            }
+            "test_case_compared" => {
+                comparisons += 1;
+                let keys = payload
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(
+                    keys,
+                    BTreeSet::from([
+                        "actual_blake3",
+                        "case",
+                        "command_id",
+                        "expected_blake3",
+                        "outcome"
+                    ])
+                );
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((routes, comparisons), (1, 1));
+    let reference = verify_path(
+        &case.join("session.zip"),
+        Some(&case.join("assignment.rta")),
+    );
+    assert!(reference.is_clean(), "{reference:#?}");
+    assert_eq!(
+        reference.test_case_evidence,
+        Some(TestCaseEvidenceStatus::ReferenceVerified)
+    );
 }
 
 #[test]

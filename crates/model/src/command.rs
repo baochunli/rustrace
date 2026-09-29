@@ -12,6 +12,15 @@ pub const MAX_COMMAND_CLEANUP_MILLIS: u64 = 2_000;
 pub const MAX_TEST_CASE_NAME_BYTES: usize = 64;
 pub const MAX_TEST_CASE_EXPECTED_LINE_BYTES: u64 = 1024 * 1024;
 pub const MAX_TEST_CASE_COMPARISON_LINE: u64 = MAX_TEST_CASE_EXPECTED_LINE_BYTES + 1;
+/// Maximum program arguments in one packaged `NAME.args` file or console Run route.
+pub const MAX_TEST_CASE_ARGS: usize = 64;
+/// Maximum UTF-8 bytes in one program argument.
+pub const MAX_TEST_CASE_ARG_BYTES: usize = 1024;
+/// Maximum bytes in one packaged `NAME.args` file. It also bounds the combined
+/// argument bytes of one recorded console Run route.
+pub const MAX_TEST_CASE_ARGS_FILE_BYTES: usize = 8 * 1024;
+
+const TEST_CASE_ARGS_DOMAIN: &[u8] = b"rustrace.test-case-args.v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,11 +112,102 @@ pub struct ControlledCommandStarted {
     pub console: Option<ConsoleCommandRoute>,
 }
 
+/// How one console command was connected. The three trailing fields were added
+/// for assignment format 3 and are omitted at their defaults, so format 2
+/// routes keep their exact historical bytes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConsoleCommandRoute {
     pub stdin: ConsoleStdinRoute,
     pub stdout: ConsoleStdoutRoute,
+    /// Literal program arguments; a Run argv ends with `--` and exactly these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Where the program ran. `Fixtures` pins the deployed fixture tree.
+    #[serde(default, skip_serializing_if = "ConsoleWorkingDirectory::is_workspace")]
+    pub working_directory: ConsoleWorkingDirectory,
+    /// The packaged format 3 case this Run executes. Only format 3 picker runs
+    /// carry it; it is the one route on which a Run may have closed stdin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_case: Option<String>,
+}
+
+impl ConsoleCommandRoute {
+    /// A route with no program arguments, in the workspace, for no packaged case.
+    pub fn new(stdin: ConsoleStdinRoute, stdout: ConsoleStdoutRoute) -> Self {
+        Self {
+            stdin,
+            stdout,
+            args: Vec::new(),
+            working_directory: ConsoleWorkingDirectory::Workspace,
+            test_case: None,
+        }
+    }
+
+    /// True when the route uses none of the format 3 additions.
+    pub fn is_plain(&self) -> bool {
+        self.args.is_empty() && self.working_directory.is_workspace() && self.test_case.is_none()
+    }
+
+    /// The route of a format 3 packaged-case Run: stdin is the case's own
+    /// `NAME.in` when it has one and closed otherwise, stdout is captured for
+    /// comparison, and a fixture hash selects the `test-cases/files/` working
+    /// directory. The Run argv must then end with
+    /// `--locked [--manifest-path ../../WORKSPACE_NAME/Cargo.toml] [-- ARG...]`
+    /// to validate.
+    pub fn packaged_case(
+        case: &str,
+        has_input: bool,
+        args: Vec<String>,
+        fixtures_blake3: Option<Hash>,
+    ) -> Result<Self, ValidationError> {
+        require(is_valid_test_case_name(case), "test-case name grammar")?;
+        require(
+            are_valid_test_case_args(&args),
+            "bounded literal console Run arguments",
+        )?;
+        let stdin = if has_input {
+            ConsoleStdinRoute::File {
+                path: WorkspacePath::new(format!("{case}.in"))
+                    .expect("a valid case name makes a valid input path"),
+            }
+        } else {
+            ConsoleStdinRoute::Closed
+        };
+        Ok(Self {
+            stdin,
+            stdout: ConsoleStdoutRoute::Console,
+            args,
+            working_directory: fixtures_blake3
+                .map_or(ConsoleWorkingDirectory::Workspace, |fixtures_blake3| {
+                    ConsoleWorkingDirectory::Fixtures { fixtures_blake3 }
+                }),
+            test_case: Some(case.to_owned()),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ConsoleWorkingDirectory {
+    #[default]
+    Workspace,
+    /// The sibling `test-cases/files/` tree, with its fixture-tree hash
+    /// computed immediately before launch.
+    Fixtures { fixtures_blake3: Hash },
+}
+
+impl ConsoleWorkingDirectory {
+    pub fn is_workspace(&self) -> bool {
+        *self == Self::Workspace
+    }
+
+    pub fn fixtures_blake3(&self) -> Option<Hash> {
+        match self {
+            Self::Workspace => None,
+            Self::Fixtures { fixtures_blake3 } => Some(*fixtures_blake3),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -213,6 +313,52 @@ pub struct TestCaseCompared {
     pub expected_blake3: Hash,
     pub actual_blake3: Option<Hash>,
     pub outcome: TestCaseComparisonOutcome,
+    /// The packaged format 3 case identity the Run used. Absent for format 2
+    /// comparisons, whose bytes stay unchanged; present exactly when the
+    /// compared Run's console route names the case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation: Option<TestCaseInvocation>,
+}
+
+/// What a format 3 comparison claims about its packaged case, for replay to
+/// link to the Run route and for verify to compare with a reference package.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestCaseInvocation {
+    /// [`test_case_args_blake3`] of the route's program arguments.
+    pub args_blake3: Hash,
+    /// Closed, or the BLAKE3 of the `NAME.in` bytes read before launch.
+    pub stdin: TestCaseStdin,
+    /// The fixture-tree hash when the Run used `test-cases/files/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixtures_blake3: Option<Hash>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TestCaseStdin {
+    Closed,
+    File { blake3: Hash },
+}
+
+impl TestCaseInvocation {
+    /// The invocation block for a comparison of a Run on `route`, given the
+    /// BLAKE3 of the `NAME.in` bytes that were read before launch. Returns
+    /// `None` unless the route names a packaged case and the input hash is
+    /// present exactly when the route reads `NAME.in`.
+    pub fn for_route(route: &ConsoleCommandRoute, input_blake3: Option<Hash>) -> Option<Self> {
+        route.test_case.as_ref()?;
+        let stdin = match (&route.stdin, input_blake3) {
+            (ConsoleStdinRoute::Closed, None) => TestCaseStdin::Closed,
+            (ConsoleStdinRoute::File { .. }, Some(blake3)) => TestCaseStdin::File { blake3 },
+            _ => return None,
+        };
+        Some(Self {
+            args_blake3: test_case_args_blake3(&route.args),
+            stdin,
+            fixtures_blake3: route.working_directory.fixtures_blake3(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -247,6 +393,183 @@ fn require(valid: bool, detail: &'static str) -> Result<(), ValidationError> {
         Ok(())
     } else {
         Err(ValidationError::CommandEvidence { detail })
+    }
+}
+
+/// Packaged test-case names: 1 to 64 ASCII letters, digits, `-`, or `_`.
+pub fn is_valid_test_case_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_TEST_CASE_NAME_BYTES
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// One literal program argument: nonempty, bounded, with no control character
+/// (which also excludes NUL, CR, LF, and tab).
+pub fn is_valid_test_case_arg(argument: &str) -> bool {
+    !argument.is_empty()
+        && argument.len() <= MAX_TEST_CASE_ARG_BYTES
+        && !argument.chars().any(char::is_control)
+}
+
+/// A recorded argument list: every argument valid, at most
+/// [`MAX_TEST_CASE_ARGS`] of them, and at most
+/// [`MAX_TEST_CASE_ARGS_FILE_BYTES`] argument bytes in total. Every list parsed
+/// from a valid `NAME.args` file satisfies this bound.
+pub fn are_valid_test_case_args<T: AsRef<str>>(arguments: &[T]) -> bool {
+    arguments.len() <= MAX_TEST_CASE_ARGS
+        && arguments
+            .iter()
+            .all(|argument| is_valid_test_case_arg(argument.as_ref()))
+        && arguments
+            .iter()
+            .map(|argument| argument.as_ref().len())
+            .sum::<usize>()
+            <= MAX_TEST_CASE_ARGS_FILE_BYTES
+}
+
+/// Why a packaged `NAME.args` file is invalid. Lines are one-based.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TestCaseArgsError {
+    TooLarge { actual: usize },
+    InvalidUtf8,
+    MissingFinalNewline,
+    EmptyArgument { line: usize },
+    ControlCharacter { line: usize },
+    ArgumentTooLong { line: usize },
+    TooManyArguments,
+}
+
+impl std::fmt::Display for TestCaseArgsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge { actual } => write!(
+                formatter,
+                "is {actual} bytes; the limit is {MAX_TEST_CASE_ARGS_FILE_BYTES} bytes"
+            ),
+            Self::InvalidUtf8 => formatter.write_str("is not valid UTF-8"),
+            Self::MissingFinalNewline => {
+                formatter.write_str("must end every argument line with LF")
+            }
+            Self::EmptyArgument { line } => write!(formatter, "line {line} is empty"),
+            Self::ControlCharacter { line } => write!(
+                formatter,
+                "line {line} contains a control character such as CR, tab, or NUL"
+            ),
+            Self::ArgumentTooLong { line } => write!(
+                formatter,
+                "line {line} exceeds the {MAX_TEST_CASE_ARG_BYTES}-byte argument limit"
+            ),
+            Self::TooManyArguments => {
+                write!(formatter, "has more than {MAX_TEST_CASE_ARGS} arguments")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TestCaseArgsError {}
+
+/// Parses a packaged `NAME.args` file: UTF-8 text holding one literal argument
+/// per LF-terminated line, with no shell parsing. An empty file has no
+/// arguments. Blank lines, a missing final LF, and control characters
+/// (including CR) are rejected rather than normalized.
+pub fn parse_test_case_args(bytes: &[u8]) -> Result<Vec<String>, TestCaseArgsError> {
+    if bytes.len() > MAX_TEST_CASE_ARGS_FILE_BYTES {
+        return Err(TestCaseArgsError::TooLarge {
+            actual: bytes.len(),
+        });
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| TestCaseArgsError::InvalidUtf8)?;
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let body = text
+        .strip_suffix('\n')
+        .ok_or(TestCaseArgsError::MissingFinalNewline)?;
+    let mut arguments = Vec::new();
+    for (index, argument) in body.split('\n').enumerate() {
+        let line = index + 1;
+        if argument.is_empty() {
+            return Err(TestCaseArgsError::EmptyArgument { line });
+        }
+        if argument.chars().any(char::is_control) {
+            return Err(TestCaseArgsError::ControlCharacter { line });
+        }
+        if argument.len() > MAX_TEST_CASE_ARG_BYTES {
+            return Err(TestCaseArgsError::ArgumentTooLong { line });
+        }
+        if arguments.len() == MAX_TEST_CASE_ARGS {
+            return Err(TestCaseArgsError::TooManyArguments);
+        }
+        arguments.push(argument.to_owned());
+    }
+    Ok(arguments)
+}
+
+/// Domain-separated BLAKE3 of an argument list: the domain
+/// `rustrace.test-case-args.v1`, the count as a big-endian `u32`, then each
+/// argument as a big-endian `u32` byte length followed by its UTF-8 bytes.
+pub fn test_case_args_blake3<T: AsRef<str>>(arguments: &[T]) -> Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(TEST_CASE_ARGS_DOMAIN);
+    hasher.update(&(arguments.len() as u32).to_be_bytes());
+    for argument in arguments {
+        let argument = argument.as_ref().as_bytes();
+        hasher.update(&(argument.len() as u32).to_be_bytes());
+        hasher.update(argument);
+    }
+    Hash::from_bytes(*hasher.finalize().as_bytes())
+}
+
+/// Maximum bytes in the workspace directory name of a recorded fixture Run.
+const MAX_RUN_WORKSPACE_NAME_BYTES: usize = 255;
+
+/// The recorded `--manifest-path` value of a fixture-directory Run, relative
+/// to the fixture folder `WORKSPACE_PARENT/NAME.test-cases/files`: exactly
+/// `../../WORKSPACE_NAME/Cargo.toml`. Only the workspace directory's own name
+/// is recorded, never its absolute location.
+fn is_valid_run_manifest_path(path: &str) -> bool {
+    matches!(
+        path.split('/').collect::<Vec<_>>().as_slice(),
+        ["..", "..", name, "Cargo.toml"]
+            if !name.is_empty()
+                && !matches!(*name, "." | "..")
+                && name.len() <= MAX_RUN_WORKSPACE_NAME_BYTES
+                && !name.chars().any(char::is_control)
+    )
+}
+
+/// The natural console Run tail, in fixed order:
+/// `[--release] --locked [--manifest-path PATH] [-- ARG...]`. The manifest
+/// path appears exactly for a fixture working directory, and `-- ARG...`
+/// exactly when the route has arguments, which it must equal.
+fn is_valid_natural_run_tail(tail: &[String], route: &ConsoleCommandRoute) -> bool {
+    let mut rest = tail;
+    if rest.first().is_some_and(|flag| flag == "--release") {
+        rest = &rest[1..];
+    }
+    let Some((locked, after_locked)) = rest.split_first() else {
+        return false;
+    };
+    if locked != "--locked" {
+        return false;
+    }
+    rest = after_locked;
+    if !route.working_directory.is_workspace() {
+        let [flag, path, after_path @ ..] = rest else {
+            return false;
+        };
+        if flag != "--manifest-path" || !is_valid_run_manifest_path(path) {
+            return false;
+        }
+        rest = after_path;
+    }
+    if route.args.is_empty() {
+        rest.is_empty()
+    } else {
+        rest.split_first()
+            .is_some_and(|(separator, arguments)| separator == "--" && arguments == route.args)
     }
 }
 
@@ -352,6 +675,25 @@ fn is_valid_new_action_tail(action: ControlledAction, tail: &[String]) -> bool {
 }
 
 impl ControlledCommandStarted {
+    /// The launcher and Cargo arguments, without a trailing `-- ARG...` of
+    /// program arguments recorded on the console route. A program argument
+    /// that spells a Cargo flag therefore never looks like a Cargo option.
+    pub fn cargo_argv(&self) -> &[String] {
+        match &self.console {
+            Some(route) if !route.args.is_empty() => {
+                let program = route.args.len() + 1;
+                self.argv
+                    .len()
+                    .checked_sub(program)
+                    .filter(|split| {
+                        self.argv[*split] == "--" && self.argv[*split + 1..] == route.args
+                    })
+                    .map_or(&self.argv[..], |split| &self.argv[..split])
+            }
+            _ => &self.argv,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ValidationError> {
         require(
             (1..=MAX_COMMAND_DEADLINE_MILLIS).contains(&self.deadline_millis)
@@ -359,9 +701,14 @@ impl ControlledCommandStarted {
                 && self.output_limit > 0,
             "command resource bounds",
         )?;
+        // Program arguments after `--` are bounded separately by the route.
+        let program_arguments = self
+            .console
+            .as_ref()
+            .map_or(0, |route| route.args.len().min(MAX_TEST_CASE_ARGS));
         require(
             self.argv.len() >= 2
-                && self.argv.len() <= 40
+                && self.argv.len() <= 40 + program_arguments
                 && self
                     .argv
                     .iter()
@@ -463,6 +810,12 @@ impl ControlledCommandStarted {
                 && self.argv[4] == subcommand,
             "argv/tool/action evidence linkage",
         )?;
+        if let Some(route) = &self.console {
+            require(
+                self.action == ControlledAction::Run || route.is_plain(),
+                "program arguments, fixtures, and test cases require a console Run",
+            )?;
+        }
         match (&self.console, self.action) {
             (None, ControlledAction::Build) => {
                 return Err(ValidationError::CommandEvidence {
@@ -471,12 +824,33 @@ impl ControlledCommandStarted {
             }
             (Some(route), ControlledAction::Run) => {
                 require(
-                    matches!(
-                        route.stdin,
-                        ConsoleStdinRoute::Submitted | ConsoleStdinRoute::File { .. }
-                    ),
-                    "Run console stdin route",
+                    are_valid_test_case_args(&route.args),
+                    "bounded literal console Run arguments",
                 )?;
+                if let Some(case) = &route.test_case {
+                    // A format 3 packaged case: stdin is its `NAME.in` or,
+                    // for a case without one, closed. Stdout is compared.
+                    require(is_valid_test_case_name(case), "test-case name grammar")?;
+                    require(
+                        route.stdout == ConsoleStdoutRoute::Console
+                            && match &route.stdin {
+                                ConsoleStdinRoute::Closed => true,
+                                ConsoleStdinRoute::File { path } => {
+                                    path.as_str().strip_suffix(".in") == Some(case.as_str())
+                                }
+                                ConsoleStdinRoute::Submitted => false,
+                            },
+                        "packaged test-case Run route",
+                    )?;
+                } else {
+                    require(
+                        matches!(
+                            route.stdin,
+                            ConsoleStdinRoute::Submitted | ConsoleStdinRoute::File { .. }
+                        ),
+                        "Run console stdin route",
+                    )?;
+                }
                 if let (
                     ConsoleStdinRoute::File { path: input },
                     ConsoleStdoutRoute::File { path: output },
@@ -485,11 +859,16 @@ impl ControlledCommandStarted {
                     require(input != output, "distinct console redirection paths")?;
                 }
                 let tail = self.argv.get(5..).unwrap_or_default();
+                // Historical `--frozen` and structured forms never carry the
+                // format 3 route additions.
                 let old = tail == ["--frozen"] || tail == ["--release", "--frozen"];
                 let structured = tail == ["--message-format=json", "--locked"]
                     || tail == ["--release", "--message-format=json", "--locked"];
-                let natural = tail == ["--locked"] || tail == ["--release", "--locked"];
-                require(old || structured || natural, "literal console Run argv")?;
+                require(
+                    (old || structured) && route.is_plain()
+                        || is_valid_natural_run_tail(tail, route),
+                    "literal console Run argv",
+                )?;
             }
             (Some(_), ControlledAction::Format) => {
                 return Err(ValidationError::CommandEvidence {
@@ -700,12 +1079,7 @@ impl ControlledCommandFinished {
 impl TestCaseCompared {
     pub fn validate(&self) -> Result<(), ValidationError> {
         require(
-            !self.case.is_empty()
-                && self.case.len() <= MAX_TEST_CASE_NAME_BYTES
-                && self
-                    .case
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            is_valid_test_case_name(&self.case),
             "test-case name grammar",
         )?;
         match self.outcome {
