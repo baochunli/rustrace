@@ -522,8 +522,9 @@ pub fn test_case_args_blake3<T: AsRef<str>>(arguments: &[T]) -> Hash {
     Hash::from_bytes(*hasher.finalize().as_bytes())
 }
 
-/// Maximum bytes in the workspace directory name of a recorded fixture Run.
-const MAX_RUN_WORKSPACE_NAME_BYTES: usize = 255;
+/// Maximum bytes in the name of a format 3 workspace's case folder.
+const MAX_RUN_CASE_FOLDER_NAME_BYTES: usize = 255;
+const RUN_CASE_FOLDER_SUFFIX: &str = ".test-cases";
 
 /// The recorded `--manifest-path` value of a fixture-directory Run, relative
 /// to the fixture folder `WORKSPACE_PARENT/NAME.test-cases/files`: exactly
@@ -532,12 +533,27 @@ const MAX_RUN_WORKSPACE_NAME_BYTES: usize = 255;
 fn is_valid_run_manifest_path(path: &str) -> bool {
     matches!(
         path.split('/').collect::<Vec<_>>().as_slice(),
-        ["..", "..", name, "Cargo.toml"]
-            if !name.is_empty()
-                && !matches!(*name, "." | "..")
-                && name.len() <= MAX_RUN_WORKSPACE_NAME_BYTES
-                && !name.chars().any(char::is_control)
+        ["..", "..", name, "Cargo.toml"] if is_valid_run_workspace_name(name)
     )
+}
+
+/// A workspace directory name that format 3 can give a case folder, so a
+/// fixture Run can come from it. These are Rustrace's case-folder naming
+/// rules: not `test-cases` or a name ending in `.test-cases` in any letter
+/// case, no `{` or `}` (Cargo build-directory template syntax), not `.work`
+/// alone, and short enough that `STEM.test-cases` fits in 255 bytes, where
+/// `STEM` is the name without a trailing `.work`.
+fn is_valid_run_workspace_name(name: &str) -> bool {
+    let lowercase = name.to_ascii_lowercase();
+    let stem = name.strip_suffix(".work").unwrap_or(name);
+    !name.is_empty()
+        && !matches!(name, "." | "..")
+        && !name.chars().any(char::is_control)
+        && !name.contains(['{', '}'])
+        && lowercase != "test-cases"
+        && !lowercase.ends_with(RUN_CASE_FOLDER_SUFFIX)
+        && !stem.is_empty()
+        && stem.len() + RUN_CASE_FOLDER_SUFFIX.len() <= MAX_RUN_CASE_FOLDER_NAME_BYTES
 }
 
 /// The natural console Run tail, in fixed order:

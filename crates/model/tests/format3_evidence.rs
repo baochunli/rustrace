@@ -334,8 +334,11 @@ fn fixture_runs_record_one_relative_manifest_path_in_a_fixed_slot() {
         json!({"stdin":{"kind":"submitted"},"stdout":{"kind":"console"},
             "args":args,"working_directory":fixtures()})
     };
-    let longest = format!("../../{}/Cargo.toml", "n".repeat(255));
-    let too_long = format!("../../{}/Cargo.toml", "n".repeat(256));
+    // `STEM.test-cases` must fit in 255 bytes, where STEM drops a `.work`.
+    let longest = format!("../../{}/Cargo.toml", "n".repeat(244));
+    let longest_work = format!("../../{}.work/Cargo.toml", "n".repeat(244));
+    let too_long = format!("../../{}/Cargo.toml", "n".repeat(245));
+    let too_long_work = format!("../../{}.work/Cargo.toml", "n".repeat(245));
     for (tail, args) in [
         (
             &["--locked", "--manifest-path", MANIFEST_PATH][..],
@@ -355,6 +358,22 @@ fn fixture_runs_record_one_relative_manifest_path_in_a_fixed_slot() {
         ),
         (
             &["--locked", "--manifest-path", longest.as_str()][..],
+            json!([]),
+        ),
+        (
+            &["--locked", "--manifest-path", longest_work.as_str()][..],
+            json!([]),
+        ),
+        (
+            &[
+                "--locked",
+                "--manifest-path",
+                "../../test-cases.work/Cargo.toml",
+            ][..],
+            json!([]),
+        ),
+        (
+            &["--locked", "--manifest-path", "../../.WORK/Cargo.toml"][..],
             json!([]),
         ),
         (
@@ -437,6 +456,47 @@ fn fixture_runs_record_one_relative_manifest_path_in_a_fixed_slot() {
         ),
         (
             &["--locked", "--manifest-path", too_long.as_str()][..],
+            json!([]),
+        ),
+        (
+            &["--locked", "--manifest-path", too_long_work.as_str()][..],
+            json!([]),
+        ),
+        // Names Rustrace never gives a format 3 case folder.
+        (
+            &["--locked", "--manifest-path", "../../lab{2}.work/Cargo.toml"][..],
+            json!([]),
+        ),
+        (
+            &["--locked", "--manifest-path", "../../lab}2/Cargo.toml"][..],
+            json!([]),
+        ),
+        (
+            &["--locked", "--manifest-path", "../../test-cases/Cargo.toml"][..],
+            json!([]),
+        ),
+        (
+            &["--locked", "--manifest-path", "../../Test-Cases/Cargo.toml"][..],
+            json!([]),
+        ),
+        (
+            &[
+                "--locked",
+                "--manifest-path",
+                "../../lab2.test-cases/Cargo.toml",
+            ][..],
+            json!([]),
+        ),
+        (
+            &[
+                "--locked",
+                "--manifest-path",
+                "../../lab2.TEST-CASES/Cargo.toml",
+            ][..],
+            json!([]),
+        ),
+        (
+            &["--locked", "--manifest-path", "../../.work/Cargo.toml"][..],
             json!([]),
         ),
         (
