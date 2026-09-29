@@ -1176,9 +1176,9 @@ Once a count passes three quarters of what the attempt can hold, `rustrace
 work` prints a warning when it starts. Submit the attempt soon. If only the
 attempt's own checkpoint limit is near, use `rustrace revise` to keep working
 after that; the warning says when a linked attempt would not add room, and
-past a limit it tells you to contact your course staff. Near the limit,
-`submit` first prints `Packaging N checkpoints; this can take a minute or
-two...`.
+past a limit it tells you to contact your course staff. When an attempt has
+more than 1,024 checkpoints, `submit` first prints `Packaging N checkpoints;
+this can take a minute or two...`.
 
 `rustrace work assignment.rta --workspace assignment.work --inspect` prints,
 without changing anything, the last saved contents of each file, the last
