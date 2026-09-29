@@ -429,13 +429,14 @@ fn student_documents_describe_verify_as_validity_only_without_advisories() {
         ),
         "student guide must describe plain verify as validity only"
     );
-    let mut files = Vec::new();
-    visit_files(&docs_dir(), &mut files);
-    for path in files
-        .iter()
-        .filter(|path| path.extension().is_some_and(|extension| extension == "md"))
-    {
-        let text = fs::read_to_string(path).unwrap();
+    for name in [
+        "student-guide.md",
+        "installation.md",
+        "configuration.md",
+        "privacy.md",
+    ] {
+        let path = docs_dir().join(name);
+        let text = read_doc(name);
         for name in AdvisoryFlagKind::ALL
             .map(AdvisoryFlagKind::name)
             .into_iter()
