@@ -116,6 +116,10 @@ pub struct VerificationReport {
     pub test_case_mismatches: Option<u64>,
     pub test_case_errors: Option<u64>,
     pub test_case_evidence: Option<TestCaseEvidenceStatus>,
+    /// With a v2 or v3 reference, the recorded runs of cases the package does
+    /// not have. They are neither checked nor flagged, and any keeps the
+    /// evidence recorded (unverified). `None` without that reference check.
+    pub test_case_runs_not_in_package: Option<u64>,
     pub first_failing_case: Option<TestCaseFailure>,
     pub external_changes: Option<u64>,
     pub unknown_edit_origins: Option<u64>,
@@ -150,6 +154,7 @@ impl VerificationReport {
             test_case_mismatches: None,
             test_case_errors: None,
             test_case_evidence: None,
+            test_case_runs_not_in_package: None,
             first_failing_case: None,
             external_changes: None,
             unknown_edit_origins: None,
@@ -1215,6 +1220,7 @@ fn authenticate_test_case_reference(
             }
         }
     }
+    report.test_case_runs_not_in_package = Some(unpackaged_runs);
     if modified.is_empty() && unpackaged_runs == 0 {
         report.test_case_evidence = Some(TestCaseEvidenceStatus::ReferenceVerified);
     }
@@ -1583,6 +1589,19 @@ fn write_remainder(
             None => "unavailable",
         },
     )?;
+    // A neutral count, so the unverified evidence above is explained when
+    // the only cause is cases the student added.
+    if reference.is_some()
+        && let Some(runs) = report
+            .test_case_runs_not_in_package
+            .filter(|runs| *runs > 0)
+    {
+        write_row(
+            output,
+            "Runs not in the package",
+            &format!("{runs} (not checked)"),
+        )?;
+    }
     let first_failure = match &report.first_failing_case {
         Some(failure) => failure.line.map_or_else(
             || failure.case.clone(),

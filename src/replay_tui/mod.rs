@@ -1802,6 +1802,7 @@ mod tests {
             test_case_mismatches: Some(0),
             test_case_errors: Some(0),
             test_case_evidence: Some(crate::verify::TestCaseEvidenceStatus::Recorded),
+            test_case_runs_not_in_package: None,
             first_failing_case: None,
             external_changes: Some(0),
             unknown_edit_origins: Some(0),

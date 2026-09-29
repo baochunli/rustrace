@@ -1687,11 +1687,74 @@ fn format3_reference_verifies_arguments_closed_stdin_and_fixtures() {
         report.test_case_evidence,
         Some(TestCaseEvidenceStatus::Recorded)
     );
+    assert_eq!(report.test_case_runs_not_in_package, Some(1));
     assert!(
         !advisory_kinds(&report).contains(&AdvisoryFlagKind::TestFilesModified),
         "{:#?}",
         report.advisories
     );
+    assert_eq!(
+        verify_path(&added, None).test_case_runs_not_in_package,
+        None
+    );
+    assert_eq!(
+        verify_path(&rewritten, Some(&reference)).test_case_runs_not_in_package,
+        Some(0)
+    );
+
+    // `verify --reference` explains the unverified evidence with a neutral
+    // count row; plain `verify` and a package without such runs have none.
+    let cli = |args: &[&std::ffi::OsStr]| {
+        let output = test_home
+            .command(env!("CARGO_BIN_EXE_rustrace"))
+            .args(args)
+            .output()
+            .unwrap();
+        command_ok(&output, "student-added case");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let instructor = cli(&[
+        "verify".as_ref(),
+        added.as_os_str(),
+        "--reference".as_ref(),
+        reference.as_os_str(),
+    ]);
+    let lines = instructor.lines().collect::<Vec<_>>();
+    let evidence = lines
+        .iter()
+        .position(|line| *line == "Test-case evidence       recorded (unverified)")
+        .unwrap_or_else(|| panic!("{instructor}"));
+    assert_eq!(
+        lines[evidence + 1],
+        "Runs not in the package  1 (not checked)"
+    );
+    assert!(!instructor.contains("TEST_FILES_MODIFIED"), "{instructor}");
+    assert!(!cli(&["verify".as_ref(), added.as_os_str()]).contains("Runs not in the package"));
+    assert!(
+        !cli(&[
+            "verify".as_ref(),
+            rewritten.as_os_str(),
+            "--reference".as_ref(),
+            reference.as_os_str(),
+        ])
+        .contains("Runs not in the package")
+    );
+    let batch = case.join("scan-student-added");
+    fs::create_dir_all(&batch).unwrap();
+    fs::copy(&added, batch.join("added.rprov")).unwrap();
+    let with_reference = cli(&[
+        "scan".as_ref(),
+        batch.as_os_str(),
+        "--reference".as_ref(),
+        reference.as_os_str(),
+    ]);
+    assert!(
+        with_reference.contains(
+            "  Test cases: runs=2 passes=2 mismatches=0 errors=0 evidence=recorded (unverified) not-in-package=1 first=none\n"
+        ),
+        "{with_reference}"
+    );
+    assert!(!cli(&["scan".as_ref(), batch.as_os_str()]).contains("not-in-package"));
 
     // Evidence that does not fit the package's working directory is a wrong
     // reference or inconsistent evidence, not a student's edit: it still
