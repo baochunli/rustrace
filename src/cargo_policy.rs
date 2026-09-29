@@ -1,8 +1,8 @@
 //! T4.3 preparation only. Execution/barriers/evidence belong to T4.2.
 //! It validates allowed commands and prepares bounded arguments and environments.
 use rustrace_model::{
-    WorkspacePath, is_valid_console_test_tail, is_valid_crates_io_dependency_spec,
-    is_valid_crates_io_name,
+    WorkspacePath, are_valid_test_case_args, is_valid_console_test_tail,
+    is_valid_crates_io_dependency_spec, is_valid_crates_io_name, is_valid_test_case_arg,
 };
 use std::{
     fmt,
@@ -53,18 +53,32 @@ impl CargoAction {
 }
 
 /// A parsed manual console command. Redirection paths stay outside argv and
-/// are opened by the session's fixed sibling test-case authority.
+/// are opened by the session's sibling test-case authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConsoleCommand {
     pub action: CargoAction,
+    /// The literal Cargo command: `cargo run` or `cargo run --release` for a
+    /// Run, never its program arguments.
     pub argv: Vec<String>,
+    /// A Run's literal program arguments, passed after `--`. Empty for every
+    /// other action.
+    pub args: Vec<String>,
     pub stdin: Option<WorkspacePath>,
     pub stdout: Option<WorkspacePath>,
 }
 
-/// Parse the bounded literal T5.7 console grammar before any effect.
-pub fn parse_console_command(_input: &str) -> Result<ConsoleCommand, PreparationError> {
-    let input = _input;
+/// Parse the bounded literal console grammar before any effect.
+///
+/// A Run is `cargo run [--release] [-- ARG...] [< IN] [> OUT]`. Tokens are
+/// separated by ASCII whitespace and taken literally: there are no quotes,
+/// escapes, wildcards, pipes, or variables, so an argument cannot contain a
+/// space. `--` must be followed by at least one argument. Arguments end at
+/// the first `<` or `>` token, so redirections always follow the arguments
+/// and are never passed to the program; an argument may not contain `<` or
+/// `>` at all, and one redirection before `--` is refused. The two
+/// redirections may appear in either order, each at most once. Arguments
+/// obey the packaged `NAME.args` bounds: at most 64, each 1 to 1024 bytes.
+pub fn parse_console_command(input: &str) -> Result<ConsoleCommand, PreparationError> {
     if input.is_empty()
         || input.len() > 4096
         || input.chars().any(|character| {
@@ -113,6 +127,7 @@ pub fn parse_console_command(_input: &str) -> Result<ConsoleCommand, Preparation
         return Ok(ConsoleCommand {
             action,
             argv: tokens.into_iter().map(str::to_owned).collect(),
+            args: Vec::new(),
             stdin: None,
             stdout: None,
         });
@@ -122,6 +137,22 @@ pub fn parse_console_command(_input: &str) -> Result<ConsoleCommand, Preparation
     let release = tokens.get(index) == Some(&"--release");
     if release {
         index += 1;
+    }
+    let mut args = Vec::new();
+    if tokens.get(index) == Some(&"--") {
+        index += 1;
+        while let Some(argument) = tokens.get(index)
+            && !matches!(*argument, "<" | ">")
+        {
+            if argument.contains(['<', '>']) || !is_valid_test_case_arg(argument) {
+                return Err(PreparationError::UnsupportedCommand);
+            }
+            args.push((*argument).to_owned());
+            index += 1;
+        }
+        if args.is_empty() || !are_valid_test_case_args(&args) {
+            return Err(PreparationError::UnsupportedCommand);
+        }
     }
     let mut stdin = None;
     let mut stdout = None;
@@ -157,6 +188,7 @@ pub fn parse_console_command(_input: &str) -> Result<ConsoleCommand, Preparation
     Ok(ConsoleCommand {
         action,
         argv,
+        args,
         stdin,
         stdout,
     })
@@ -215,7 +247,7 @@ impl fmt::Display for PreparationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::UnsupportedCommand => {
-                "unsupported Cargo command; allowed: cargo build, cargo check, cargo test [FILTER] [-- OUTPUT_OPTION] (OUTPUT_OPTION: --nocapture, --no-capture, or --show-output), cargo run, cargo clippy, cargo doc, cargo add NAME, cargo add NAME@VERSION, cargo remove NAME, cargo update"
+                "unsupported Cargo command; allowed: cargo build, cargo check, cargo test [FILTER] [-- OUTPUT_OPTION] (OUTPUT_OPTION: --nocapture, --no-capture, or --show-output), cargo run [--release] [-- ARGS] [< IN] [> OUT], cargo clippy, cargo doc, cargo add NAME, cargo add NAME@VERSION, cargo remove NAME, cargo update"
             }
             Self::InvalidToolSelection => {
                 "expected an explicitly resolved installed toolchain name"
@@ -252,11 +284,25 @@ pub fn prepare(
     )
 }
 
-/// Prepare a parsed console action. Redirect paths never enter this argv.
+/// Prepare a parsed console action run in the workspace. Redirect paths
+/// never enter this argv.
 pub fn prepare_console(
     request: &ConsoleCommand,
     tools: &ResolvedTools,
     workspace: &Path,
+) -> Result<PreparedCargoCommand, PreparationError> {
+    prepare_console_in(request, tools, workspace, None)
+}
+
+/// Prepare a parsed console action. A Run with `fixtures` runs from that
+/// format 3 fixture folder (see [`PreparedCargoCommand::run_from_directory`]);
+/// otherwise it runs in the workspace. A Run's program arguments end the
+/// argument vector as `-- ARG...`, after every Cargo option.
+pub fn prepare_console_in(
+    request: &ConsoleCommand,
+    tools: &ResolvedTools,
+    workspace: &Path,
+    fixtures: Option<&Path>,
 ) -> Result<PreparedCargoCommand, PreparationError> {
     let release = request.argv.as_slice() == ["cargo", "run", "--release"];
     let valid = match request.action {
@@ -274,13 +320,22 @@ pub fn prepare_console(
             if cargo == "cargo" && remove == "remove" && is_valid_crates_io_name(name)),
         CargoAction::Update => request.argv.as_slice() == ["cargo", "update"],
     };
+    let run = request.action == CargoAction::Run;
     if !valid
-        || request.action != CargoAction::Run
-            && (request.stdin.is_some() || request.stdout.is_some())
+        || !run
+            && (request.stdin.is_some()
+                || request.stdout.is_some()
+                || !request.args.is_empty()
+                || fixtures.is_some())
+        || !are_valid_test_case_args(&request.args)
+        || request
+            .args
+            .iter()
+            .any(|argument| argument.contains(['<', '>']))
     {
         return Err(PreparationError::UnsupportedCommand);
     }
-    prepare_inner(
+    let mut prepared = prepare_inner(
         request.action,
         tools,
         workspace,
@@ -288,7 +343,14 @@ pub fn prepare_console(
         false,
         false,
         request.argv.get(2..).unwrap_or_default(),
-    )
+    )?;
+    if let Some(fixtures) = fixtures {
+        prepared.run_from_directory(workspace, fixtures)?;
+    }
+    if !request.args.is_empty() {
+        prepared.command.arg("--").args(&request.args);
+    }
+    Ok(prepared)
 }
 
 fn prepare_inner(

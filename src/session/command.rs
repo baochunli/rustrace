@@ -636,6 +636,7 @@ impl ProductionSession {
         let request = ConsoleCommand {
             action: CargoAction::Run,
             argv: vec!["cargo".into(), "run".into()],
+            args: Vec::new(),
             stdin: Some(case.input_path()),
             stdout: None,
         };
