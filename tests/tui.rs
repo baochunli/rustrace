@@ -2883,7 +2883,7 @@ fn format3_picker_run_all_and_many_cases_keep_selection_and_detail_visible() {
 }
 
 #[test]
-fn format2_picker_renders_exactly_as_before_without_a_detail() {
+fn format2_picker_renders_without_a_detail() {
     let state = view_state(RecordingState::Active, JournalHealth::Healthy).with_test_case_picker(
         TestCasePickerState::new(
             vec![
