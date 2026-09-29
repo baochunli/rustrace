@@ -3727,7 +3727,10 @@ fn read_payload_source(payload: &FinalizationPayload) -> Result<Vec<u8>> {
     if !before.is_file() || before.len() != payload.byte_length {
         return Err(format!("receipt payload {} has changed size/type", payload.entry).into());
     }
-    let mut bytes = Vec::with_capacity(maximum.min(1024 * 1024));
+    // The length was just checked against the open file, so one exact
+    // allocation holds it; growing by doubling would leave each larger
+    // stream's intermediate buffers resident.
+    let mut bytes = Vec::with_capacity(maximum.saturating_add(1));
     file.take(payload.byte_length.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() != maximum || rprov_raw_blake3(&bytes) != payload.blake3 {
@@ -3769,29 +3772,29 @@ fn read_all_events(journal: &mut Journal, session_id: &SessionId) -> Result<Vec<
     Ok(result)
 }
 
+/// Encodes the stream into one exactly sized buffer: its size is measured
+/// first, both to check the segment limit before allocating and because
+/// growing a large buffer by doubling leaves the smaller copies resident.
 fn encode_event_stream(events: &[EventEnvelope]) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    for (index, event) in events.iter().enumerate() {
-        let encoded = encode_envelope(event)?;
-        let new_length = bytes
-            .len()
-            .checked_add(encoded.len())
-            .and_then(|length| length.checked_add(1))
+    let mut length = 0_u64;
+    for event in events {
+        length = length
+            .checked_add(encode_envelope(event)?.len() as u64 + 1)
             .ok_or("event stream byte count overflow")?;
-        if new_length as u64 > MAX_RPROV_SEGMENT_EVENTS_BYTES {
-            // Report the whole stream's size, not where encoding stopped.
-            let mut count = new_length as u64;
-            for later in &events[index + 1..] {
-                count = count.saturating_add(encode_envelope(later)?.len() as u64 + 1);
-            }
-            return Err(Box::new(FinalizationLimitExceeded {
-                what: "bytes of recorded events",
-                count,
-                limit: MAX_RPROV_SEGMENT_EVENTS_BYTES,
-            }));
-        }
-        bytes.extend_from_slice(&encoded);
+    }
+    FinalizationLimitExceeded::check(
+        "bytes of recorded events",
+        length,
+        MAX_RPROV_SEGMENT_EVENTS_BYTES,
+    )?;
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(length).map_err(|_| "event stream exceeds usize")?);
+    for event in events {
+        bytes.extend_from_slice(&encode_envelope(event)?);
         bytes.push(b'\n');
+    }
+    if bytes.len() as u64 != length {
+        return Err("event stream encoding is not deterministic".into());
     }
     Ok(bytes)
 }
