@@ -2,8 +2,10 @@
 #[path = "support/test_home.rs"]
 mod test_home;
 use rustrace::review_flags::{
-    LARGE_SINGLE_INSERTION_BYTES, SUSTAINED_HIGH_RATE_CHARACTERS_PER_SECOND,
-    SUSTAINED_HIGH_RATE_WINDOW_MILLIS,
+    AdvisoryFlagKind, LARGE_SINGLE_INSERTION_BYTES, REJECTED_PASTE_ATTEMPTS_MINIMUM,
+    RELEASED_BUILD_COMMIT_HEX_DIGITS, SUSTAINED_HIGH_RATE_CHARACTERS_PER_SECOND,
+    SUSTAINED_HIGH_RATE_WINDOW_MILLIS, TYPED_AFTER_REJECTED_PASTE_CHARACTERS,
+    TYPED_AFTER_REJECTED_PASTE_WINDOW_MILLIS,
 };
 use std::{fs, path::PathBuf};
 
@@ -406,10 +408,51 @@ fn files_panel_context_menu_is_the_documented_file_management_route() {
 }
 
 #[test]
-fn typing_shape_advisory_thresholds_are_stable() {
+fn advisory_thresholds_are_stable() {
     assert_eq!(LARGE_SINGLE_INSERTION_BYTES, 200);
     assert_eq!(SUSTAINED_HIGH_RATE_CHARACTERS_PER_SECOND, 15);
     assert_eq!(SUSTAINED_HIGH_RATE_WINDOW_MILLIS, 60_000);
+    assert_eq!(REJECTED_PASTE_ATTEMPTS_MINIMUM, 1);
+    assert_eq!(TYPED_AFTER_REJECTED_PASTE_CHARACTERS, 200);
+    assert_eq!(TYPED_AFTER_REJECTED_PASTE_WINDOW_MILLIS, 300_000);
+    assert_eq!(RELEASED_BUILD_COMMIT_HEX_DIGITS, 40);
+}
+
+/// Advisories are for instructors: students run plain `verify`, which
+/// reports validity only, so the student documents never describe them.
+#[test]
+fn student_documents_describe_verify_as_validity_only_without_advisories() {
+    let guide = unwrapped(&read_doc("student-guide.md"));
+    assert!(
+        guide.contains(
+            "`rustrace verify` checks that a ZIP validates: its structure, recorded history, checkpoints, replay, and submitted source. It prints those checks and a few recorded counts, such as test-case runs, and nothing else."
+        ),
+        "student guide must describe plain verify as validity only"
+    );
+    let mut files = Vec::new();
+    visit_files(&docs_dir(), &mut files);
+    for path in files
+        .iter()
+        .filter(|path| path.extension().is_some_and(|extension| extension == "md"))
+    {
+        let text = fs::read_to_string(path).unwrap();
+        for name in AdvisoryFlagKind::ALL
+            .map(AdvisoryFlagKind::name)
+            .into_iter()
+            .chain(["UNIFORM_KEY_TIMING"])
+        {
+            assert!(
+                !text.contains(name),
+                "{} mentions the advisory {name}",
+                path.display()
+            );
+        }
+        assert!(
+            !text.contains("expect false positives"),
+            "{} quotes advisory wording",
+            path.display()
+        );
+    }
 }
 
 const MANIFEST: &[u8] = br#"format_version = 1

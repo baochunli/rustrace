@@ -1205,6 +1205,10 @@ rustrace submit lab1-corrected.work --student-id actual_utorid --output actual_u
 rustrace verify actual_utorid-lab1-corrected.zip
 ```
 
+`rustrace verify` checks that a ZIP validates: its structure, recorded history,
+checkpoints, replay, and submitted source. It prints those checks and a few
+recorded counts, such as test-case runs, and nothing else.
+
 The new ZIP records the corrected ID and includes the complete recorded history.
 The original workspace, receipt, and ZIP retain their original ID. You cannot
 change the ID by resubmitting an already finalized workspace or by renaming its
