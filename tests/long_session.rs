@@ -281,3 +281,65 @@ fn grouped(value: u64) -> String {
     }
     result
 }
+
+/// Builds the release measurement workspace: a Lab-1-sized tree of about
+/// 100 KB of Rust source (`RUSTRACE_MEASURE_FILES` files of about 16 KB,
+/// default 6) and `RUSTRACE_MEASURE_CHECKPOINTS` checkpoints
+/// (default 8,191, so the submission's own boundary makes 8,192), at
+/// `RUSTRACE_MEASURE_ROOT/lab1.work`. Measure the release binary on it with
+/// `/usr/bin/time -l rustrace status|privacy|submit ...`.
+#[test]
+#[ignore = "run in release mode to build the peak-memory measurement workspace"]
+fn build_release_measurement_workspace() {
+    let root = PathBuf::from(
+        std::env::var_os("RUSTRACE_MEASURE_ROOT").expect("set RUSTRACE_MEASURE_ROOT"),
+    );
+    let boundaries = std::env::var("RUSTRACE_MEASURE_CHECKPOINTS")
+        .map_or(8_191, |value| value.parse::<usize>().unwrap())
+        .checked_sub(1)
+        .expect("at least the genesis checkpoint");
+    let workspace = root.join("lab1.work");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname = \"reversi\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    // Six files of about 16 KB make the 100 KB tree; more files, a larger one.
+    let files =
+        std::env::var("RUSTRACE_MEASURE_FILES").map_or(6, |value| value.parse::<usize>().unwrap());
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut total = 0;
+    for file in 0..files {
+        let mut text = String::new();
+        for function in 0..84 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            text.push_str(&format!(
+                "/// Scores square ({}, {}) for player {}.\npub fn score_{file}_{function}(board: &[[u8; 8]; 8], x: usize, y: usize) -> u32 {{\n    let weight = {} + u32::from(board[x % 8][y % 8]);\n    weight.wrapping_mul({})\n}}\n\n",
+                state % 8,
+                (state >> 8) % 8,
+                (state >> 16) % 2,
+                state >> 44,
+                (state >> 20) & 0xffff
+            ));
+        }
+        total += text.len();
+        let name = if file == 0 {
+            "src/main.rs".to_owned()
+        } else {
+            format!("src/board{file}.rs")
+        };
+        fs::write(workspace.join(name), text).unwrap();
+    }
+    eprintln!("measurement tree: {total} bytes of source");
+    let mut session = ProductionSession::start(&workspace, MANIFEST).unwrap();
+    for index in 0..boundaries {
+        if index % 16 == 0 {
+            session.execute(EditorCommand::Insert('x')).unwrap();
+        }
+        session.capture_boundary().unwrap();
+    }
+    session.quit().unwrap();
+}

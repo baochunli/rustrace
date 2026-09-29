@@ -966,6 +966,8 @@ impl ProductionSession {
                 artifact_tag: "finalization-recovery",
             },
         )?;
+        // Every later step reads the durable capture, not the decoded prefix.
+        drop(prefix_events);
         let manifest_bytes = authority
             .owner
             .read_artifact("manifest.toml", METADATA_LIMIT)?;
@@ -1049,8 +1051,8 @@ impl ProductionSession {
             return Err("revision history exceeds the package segment limit".into());
         }
         let ordinal = u32::try_from(ordinal).map_err(|_| "segment ordinal overflow")?;
-        let captured = complete_current_capture(
-            &current,
+        let mut captured = complete_current_capture(
+            current,
             &state_directory,
             &terminal,
             ordinal,
@@ -1185,6 +1187,9 @@ impl ProductionSession {
         authority
             .owner
             .publish_artifact(PREFIX_EVENTS, &captured.prefix_bytes, false)?;
+        // Validation reads the published copies; free the in-memory streams.
+        captured.publications = Vec::new();
+        captured.prefix_bytes = Vec::new();
         let candidate = validate_receipt_parts(
             &authority.owner,
             manifest,
@@ -1307,11 +1312,15 @@ fn capture_current_segment(
     let checkpoint_count =
         usize::try_from(totals.count).map_err(|_| "checkpoint count does not fit usize")?;
     let prefix_bytes = encode_event_stream(prefix_events)?;
-    let mut event_bytes = prefix_bytes.clone();
-    if let Some(terminal) = terminal {
-        event_bytes.extend_from_slice(&encode_envelope(terminal)?);
-        event_bytes.push(b'\n');
-    }
+    let event_bytes = match terminal {
+        None => std::borrow::Cow::Borrowed(prefix_bytes.as_slice()),
+        Some(terminal) => {
+            let mut bytes = prefix_bytes.clone();
+            bytes.extend_from_slice(&encode_envelope(terminal)?);
+            bytes.push(b'\n');
+            std::borrow::Cow::Owned(bytes)
+        }
+    };
     FinalizationLimitExceeded::check(
         "bytes of recorded events",
         event_bytes.len() as u64,
@@ -1442,6 +1451,8 @@ fn capture_current_segment(
     )?;
     let replacing_partial = artifact_exists(owner, RECOVERY_EVENTS)?;
     owner.publish_artifact(event_artifact, &event_bytes, replacing_partial)?;
+    let event_byte_length = event_bytes.len() as u64;
+    drop(event_bytes);
     let mut checkpoint_refs = Vec::with_capacity(checkpoint_count);
     checkpoints.for_each(|index, checkpoint| {
         if !owned_by_prefix(&checkpoint) {
@@ -1514,7 +1525,7 @@ fn capture_current_segment(
         events: RprovEventStreamRef {
             format_version: 1,
             entry: event_entry,
-            byte_length: event_bytes.len() as u64,
+            byte_length: event_byte_length,
             blake3: event_digest,
             completeness: if terminal.is_some() {
                 RprovEventStreamCompleteness::Complete
@@ -1581,7 +1592,7 @@ fn publish_enriched_current_capture(
 }
 
 fn complete_current_capture(
-    current: &CapturedCurrent,
+    current: CapturedCurrent,
     state_directory: &Path,
     terminal: &EventEnvelope,
     ordinal: u32,
@@ -1598,10 +1609,13 @@ fn complete_current_capture(
     {
         return Err("terminal does not immediately extend the immutable current prefix".into());
     }
-    let mut result = current.clone();
+    let mut result = current;
     result.publications.clear();
-    let mut complete_events = current.prefix_bytes.clone();
-    complete_events.extend_from_slice(&encode_envelope(terminal)?);
+    let terminal_bytes = encode_envelope(terminal)?;
+    let mut complete_events =
+        Vec::with_capacity(result.prefix_bytes.len() + terminal_bytes.len() + 1);
+    complete_events.extend_from_slice(&result.prefix_bytes);
+    complete_events.extend_from_slice(&terminal_bytes);
     complete_events.push(b'\n');
     if complete_events.len() as u64 > MAX_RPROV_SEGMENT_EVENTS_BYTES {
         return Err("captured event stream exceeds the segment byte limit".into());
@@ -2432,39 +2446,38 @@ fn validate_receipt_parts_inner(
         .segments
         .last()
         .ok_or("receipt has no terminal segment")?;
-    let complete_bytes = read_declared_payload(&payloads, &tip.events.entry)?;
-    let complete_events = decode_event_stream(&complete_bytes)?;
-    let (terminal, prefix_events) = complete_events
-        .split_last()
-        .ok_or("receipt event stream is empty")?;
-    let prefix_bytes = encode_event_stream(prefix_events)?;
-    let Event::SubmissionFinalized(finalized) = &terminal.event else {
-        return Err("receipt event stream has no SubmissionFinalized terminal".into());
-    };
-    if prefix_events.len() as u64 != binding.prefix_event_count
-        || prefix_events.last().map(|event| event.event_hash) != Some(binding.prefix_event_hash)
-        || prefix_bytes.len() as u64 != binding.prefix_byte_length
-        || rprov_raw_blake3(&prefix_bytes) != binding.prefix_blake3
-        || terminal.sequence != binding.terminal_event_count
-        || terminal.event_hash != binding.terminal_event_hash
-        || terminal.previous_event_hash != binding.prefix_event_hash
-        || finalized.event_count != binding.terminal_event_count
-        || finalized.final_workspace_hash != binding.final_tree_hash
-        || tip.inclusive_event_count != binding.terminal_event_count
-        || tip.last_event_hash != binding.terminal_event_hash
-        || tip.terminal_event_hash.known() != Some(&binding.terminal_event_hash)
-        || tip.final_tree_hash.known() != Some(&binding.final_tree_hash)
     {
-        return Err("receipt binding disagrees with the actual complete event stream".into());
-    }
-    let durable_prefix = owner.read_artifact(
-        PREFIX_EVENTS,
-        usize::try_from(binding.prefix_byte_length)
-            .unwrap_or(usize::MAX)
-            .min(MAX_RPROV_SEGMENT_EVENTS_BYTES as usize),
-    )?;
-    if durable_prefix != prefix_bytes {
-        return Err("durable prefix bytes differ from the complete event stream".into());
+        let complete_bytes = read_declared_payload(&payloads, &tip.events.entry)?;
+        let tail = complete_stream_tail(&complete_bytes)?;
+        let terminal = &tail.terminal;
+        let Event::SubmissionFinalized(finalized) = &terminal.event else {
+            return Err("receipt event stream has no SubmissionFinalized terminal".into());
+        };
+        if tail.prefix_event_count != binding.prefix_event_count
+            || tail.last_prefix_hash != Some(binding.prefix_event_hash)
+            || tail.prefix.len() as u64 != binding.prefix_byte_length
+            || rprov_raw_blake3(tail.prefix) != binding.prefix_blake3
+            || terminal.sequence != binding.terminal_event_count
+            || terminal.event_hash != binding.terminal_event_hash
+            || terminal.previous_event_hash != binding.prefix_event_hash
+            || finalized.event_count != binding.terminal_event_count
+            || finalized.final_workspace_hash != binding.final_tree_hash
+            || tip.inclusive_event_count != binding.terminal_event_count
+            || tip.last_event_hash != binding.terminal_event_hash
+            || tip.terminal_event_hash.known() != Some(&binding.terminal_event_hash)
+            || tip.final_tree_hash.known() != Some(&binding.final_tree_hash)
+        {
+            return Err("receipt binding disagrees with the actual complete event stream".into());
+        }
+        let durable_prefix = owner.read_artifact(
+            PREFIX_EVENTS,
+            usize::try_from(binding.prefix_byte_length)
+                .unwrap_or(usize::MAX)
+                .min(MAX_RPROV_SEGMENT_EVENTS_BYTES as usize),
+        )?;
+        if durable_prefix != tail.prefix {
+            return Err("durable prefix bytes differ from the complete event stream".into());
+        }
     }
     let initial_files = read_initial_workspace(&manifest, &payloads)?;
     let mut latest_final = None;
@@ -2542,15 +2555,15 @@ fn replay_segment(
     payloads: &[FinalizationPayload],
 ) -> Result<CheckpointSnapshot> {
     let event_bytes = read_declared_payload(payloads, &segment.events.entry)?;
-    let events = decode_event_stream(&event_bytes)?;
+    let mut events = event_records(&event_bytes)?;
     let initial_ref = segment
         .checkpoints
         .first()
         .ok_or("segment has no initial checkpoint")?;
     let initial = decode_checkpoint(&read_declared_payload(payloads, &initial_ref.entry)?)?;
-    let first = events.first().ok_or("segment event stream is empty")?;
+    let first = events.next().ok_or("segment event stream is empty")??;
     let mut replay = ReplayEngine::from_initial_checkpoint(StoredCheckpoint {
-        owning_event: first.clone(),
+        owning_event: first,
         snapshot: initial,
     })?;
     let checkpoints = segment
@@ -2559,8 +2572,9 @@ fn replay_segment(
         .map(|checkpoint| (checkpoint.owner.sequence, checkpoint))
         .collect::<BTreeMap<_, _>>();
     let mut final_snapshot = None;
-    for envelope in events.iter().skip(1) {
-        replay.apply(envelope)?;
+    for envelope in events {
+        let envelope = envelope?;
+        replay.apply(&envelope)?;
         if matches!(envelope.event, Event::WorkspaceCheckpoint(_)) {
             let declaration = checkpoints
                 .get(&envelope.sequence)
@@ -2568,7 +2582,7 @@ fn replay_segment(
             let snapshot =
                 decode_checkpoint(&read_declared_payload(payloads, &declaration.entry)?)?;
             let stored = StoredCheckpoint {
-                owning_event: envelope.clone(),
+                owning_event: envelope,
                 snapshot: snapshot.clone(),
             };
             replay.validate_checkpoint(&stored)?;
@@ -2769,18 +2783,15 @@ fn load_published_summary(
         return Err("terminal event-stream artifact differs from its source receipt".into());
     }
     validate_rprov_event_stream(&manifest, tip, &complete_bytes)?;
-    let complete_events = decode_event_stream(&complete_bytes)?;
-    let (terminal, prefix_events) = complete_events
-        .split_last()
-        .ok_or("receipt event stream is empty")?;
-    let prefix_bytes = encode_event_stream(prefix_events)?;
+    let tail = complete_stream_tail(&complete_bytes)?;
+    let terminal = &tail.terminal;
     let Event::SubmissionFinalized(finalized) = &terminal.event else {
         return Err("receipt event stream has no SubmissionFinalized terminal".into());
     };
-    if prefix_events.len() as u64 != binding.prefix_event_count
-        || prefix_events.last().map(|event| event.event_hash) != Some(binding.prefix_event_hash)
-        || prefix_bytes.len() as u64 != binding.prefix_byte_length
-        || rprov_raw_blake3(&prefix_bytes) != binding.prefix_blake3
+    if tail.prefix_event_count != binding.prefix_event_count
+        || tail.last_prefix_hash != Some(binding.prefix_event_hash)
+        || tail.prefix.len() as u64 != binding.prefix_byte_length
+        || rprov_raw_blake3(tail.prefix) != binding.prefix_blake3
         || terminal.sequence != binding.terminal_event_count
         || terminal.event_hash != binding.terminal_event_hash
         || terminal.previous_event_hash != binding.prefix_event_hash
@@ -2795,7 +2806,7 @@ fn load_published_summary(
             .unwrap_or(usize::MAX)
             .min(MAX_RPROV_SEGMENT_EVENTS_BYTES as usize),
     )?;
-    if durable_prefix != prefix_bytes {
+    if durable_prefix != tail.prefix {
         return Err("durable prefix bytes differ from the complete event stream".into());
     }
     let assignment_bytes = state.read_artifact("manifest.toml", METADATA_LIMIT)?;
@@ -3353,15 +3364,16 @@ fn replay_prefix_segment(
     segment: &RprovSegment,
     payloads: &[FinalizationPayload],
 ) -> Result<CheckpointSnapshot> {
-    let events = decode_event_stream(&read_declared_payload(payloads, &segment.events.entry)?)?;
-    let first = events.first().ok_or("segment event stream is empty")?;
+    let event_bytes = read_declared_payload(payloads, &segment.events.entry)?;
+    let mut events = event_records(&event_bytes)?;
+    let first = events.next().ok_or("segment event stream is empty")??;
     let initial_ref = segment
         .checkpoints
         .first()
         .ok_or("segment has no initial checkpoint")?;
     let initial = decode_checkpoint(&read_declared_payload(payloads, &initial_ref.entry)?)?;
     let mut replay = ReplayEngine::from_initial_checkpoint(StoredCheckpoint {
-        owning_event: first.clone(),
+        owning_event: first,
         snapshot: initial,
     })?;
     let checkpoints = segment
@@ -3370,8 +3382,9 @@ fn replay_prefix_segment(
         .map(|checkpoint| (checkpoint.owner.sequence, checkpoint))
         .collect::<BTreeMap<_, _>>();
     let mut boundary = None;
-    for envelope in events.iter().skip(1) {
-        replay.apply(envelope)?;
+    for envelope in events {
+        let envelope = envelope?;
+        replay.apply(&envelope)?;
         if matches!(envelope.event, Event::WorkspaceCheckpoint(_)) {
             let declaration = checkpoints
                 .get(&envelope.sequence)
@@ -3379,7 +3392,7 @@ fn replay_prefix_segment(
             let snapshot =
                 decode_checkpoint(&read_declared_payload(payloads, &declaration.entry)?)?;
             replay.validate_checkpoint(&StoredCheckpoint {
-                owning_event: envelope.clone(),
+                owning_event: envelope,
                 snapshot: snapshot.clone(),
             })?;
             boundary = Some(snapshot);
@@ -3784,21 +3797,67 @@ fn encode_event_stream(events: &[EventEnvelope]) -> Result<Vec<u8>> {
 }
 
 fn decode_event_stream(bytes: &[u8]) -> Result<Vec<EventEnvelope>> {
+    event_records(bytes)?.collect()
+}
+
+/// Decodes one record at a time, so a replay holds one decoded event rather
+/// than the whole stream.
+fn event_records(bytes: &[u8]) -> Result<impl Iterator<Item = Result<EventEnvelope>> + '_> {
     let framed = bytes
         .strip_suffix(b"\n")
         .ok_or("event stream is missing its final LF")?;
     if framed.is_empty() {
         return Err("event stream is empty".into());
     }
-    framed
-        .split(|byte| *byte == b'\n')
-        .map(
-            |line| match decode_envelope(line, DecodePolicy::RejectUnsupported)? {
-                DecodeOutcome::Decoded(event) => Ok(event),
-                DecodeOutcome::Skipped(_) => Err("unsupported event was not rejected".into()),
-            },
-        )
-        .collect()
+    Ok(framed.split(|byte| *byte == b'\n').map(decode_event_record))
+}
+
+fn decode_event_record(line: &[u8]) -> Result<EventEnvelope> {
+    match decode_envelope(line, DecodePolicy::RejectUnsupported)? {
+        DecodeOutcome::Decoded(event) => Ok(event),
+        DecodeOutcome::Skipped(_) => Err("unsupported event was not rejected".into()),
+    }
+}
+
+/// The binding facts of a complete event stream. The caller has already
+/// validated every record as its own canonical encoding, so the prefix is
+/// exactly the bytes before the terminal record and only the last two
+/// records need decoding.
+struct CompleteStreamTail<'a> {
+    prefix: &'a [u8],
+    prefix_event_count: u64,
+    last_prefix_hash: Option<Hash>,
+    terminal: EventEnvelope,
+}
+
+fn complete_stream_tail(bytes: &[u8]) -> Result<CompleteStreamTail<'_>> {
+    let last_record = |framed: &[u8]| {
+        framed
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1)
+    };
+    let framed = bytes
+        .strip_suffix(b"\n")
+        .ok_or("event stream is missing its final LF")?;
+    if framed.is_empty() {
+        return Err("receipt event stream is empty".into());
+    }
+    let terminal_start = last_record(framed);
+    let terminal = decode_event_record(&framed[terminal_start..])?;
+    let prefix = &bytes[..terminal_start];
+    let last_prefix_hash = match prefix.strip_suffix(b"\n") {
+        Some(framed_prefix) => {
+            Some(decode_event_record(&framed_prefix[last_record(framed_prefix)..])?.event_hash)
+        }
+        None => None,
+    };
+    Ok(CompleteStreamTail {
+        prefix,
+        prefix_event_count: prefix.iter().filter(|byte| **byte == b'\n').count() as u64,
+        last_prefix_hash,
+        terminal,
+    })
 }
 
 fn event_reference(event: &EventEnvelope) -> RecordedEventRef {
