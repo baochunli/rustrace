@@ -47,10 +47,24 @@ def language_server(root):
             return
 
 program = pathlib.Path(__file__).name
-root = pathlib.Path.cwd()
+cwd = pathlib.Path.cwd()
+root = cwd
+args = sys.argv[1:]
+# A console Run ends with `-- ARG...` for the program. A format 3 fixture Run
+# starts in NAME.test-cases/files and names the workspace with a relative
+# --manifest-path; the workspace still holds this fixture's configuration.
+cargo_args, program_args = args, []
+if program == "cargo" and args[:1] == ["run"] and "--" in args:
+    split = args.index("--")
+    cargo_args, program_args = args[:split], args[split + 1:]
+manifest_path = None
+if program == "cargo" and "--manifest-path" in cargo_args:
+    at = cargo_args.index("--manifest-path")
+    manifest_path = cargo_args[at + 1]
+    cargo_args = cargo_args[:at] + cargo_args[at + 2:]
+    root = (cwd / manifest_path).parent.resolve()
 config_path = root / "target" / "runner-fixture.json"
 config = json.loads(config_path.read_bytes()) if config_path.exists() else {}
-args = sys.argv[1:]
 if program == "rustup":
     assert os.environ["RUSTUP_AUTO_INSTALL"] == "0"
     if args == ["--version"]:
@@ -98,16 +112,21 @@ else:
     assert args[0] in ["check", "test", "run", "clippy", "fmt", "doc"]
     console = str(config.get("mode", "")).startswith("console")
     if console:
-        assert args in [[name, "--locked"]
-                        for name in ["check", "test", "clippy", "doc"]] + [
-                            ["run", "--locked"], ["run", "--release", "--locked"]]
+        assert cargo_args in [[name, "--locked"]
+                              for name in ["check", "test", "clippy", "doc"]] + [
+                                  ["run", "--locked"], ["run", "--release", "--locked"]]
+        if manifest_path is not None:
+            assert cargo_args[0] == "run" and manifest_path == f"../../{root.name}/Cargo.toml"
+            assert os.environ["CARGO_BUILD_BUILD_DIR"] == f"../../{root.name}/target"
+            assert cwd.name == "files" and cwd.parent.parent == root.parent, cwd
     else:
         assert os.read(0, 1) == b""
         assert args == ["fmt"] or args[1:3] == ["--message-format=json", "--locked"]
     target = root / "target"
     target.mkdir(exist_ok=True)
     (target / "invocation.json").write_text(json.dumps({"program": str(pathlib.Path(__file__).resolve()),
-        "argv": args, "keys": sorted(os.environ), "cwd": str(root)}))
+        "argv": args, "keys": sorted(os.environ), "cwd": str(root),
+        "working_directory": str(cwd), "program_args": program_args}))
     mode = config.get("mode")
     if mode is None and program == "cargo-fmt" and (root / "Cargo.lock").exists():
         mode = (root / "Cargo.lock").read_text().strip()
@@ -132,7 +151,23 @@ else:
         if config.get("delay_after_input_millis"):
             (target / "runner-input-read").write_text("ready")
             time.sleep(config["delay_after_input_millis"] / 1000)
-        os.write(1, b"stdout:" + value if config.get("echo", True) else b"console-complete")
+        if config.get("report"):
+            # Everything a packaged case controls, in a fixed text form: the
+            # working directory, arguments, stdin kind and bytes, and a file
+            # read relative to the working directory.
+            import stat
+            mode = os.fstat(0).st_mode
+            kind = "pipe" if stat.S_ISFIFO(mode) else "file" if stat.S_ISREG(mode) else "closed"
+            data = cwd / "data.txt"
+            os.write(1, (
+                f"cwd={cwd.parent.name}/{cwd.name}\n"
+                f"args={'|'.join(program_args)}\n"
+                f"stdin={kind}:"
+            ).encode() + value + (
+                b"\ndata=" + data.read_bytes() if data.is_file() else b"\ndata=none\n"
+            ))
+        else:
+            os.write(1, b"stdout:" + value if config.get("echo", True) else b"console-complete")
         os.write(2, b"console-stderr")
         sys.exit(config.get("exit", 0))
     elif program == "cargo-fmt":

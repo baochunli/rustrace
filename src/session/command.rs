@@ -8,8 +8,8 @@ use crate::{
         ProcessIo, ProcessLimits, ProcessResult, ProcessStdin, ProcessStdout, StdinMessage,
     },
     console::{
-        OutputDisposition, TestCase, TestCaseComparison, TestCaseDirectory, TestCaseOutcome,
-        classify_test_case_result,
+        OutputDisposition, PinnedFixtures, TestCase, TestCaseComparison, TestCaseDirectory,
+        TestCaseLayout, TestCaseOutcome, classify_test_case_result,
     },
     diagnostics::{CommandDiagnostics, derive_command_diagnostics},
     toolchain::{self, ToolchainReport},
@@ -121,6 +121,18 @@ struct ConsoleLaunch {
     cases: Option<TestCaseDirectory>,
     input: Option<rustrace_workspace::OpenedRegularFile>,
     output: Option<OutputDisposition>,
+    /// The format 3 packaged case this Run executes; its route names the case.
+    packaged_case: Option<PackagedCaseLaunch>,
+    /// The pinned fixture folder a format 3 Run starts in.
+    fixtures: Option<PinnedFixtures>,
+}
+
+/// A format 3 packaged case, with the `NAME.in` bytes read before launch.
+struct PackagedCaseLaunch {
+    name: String,
+    /// Exactly the bytes that were hashed; the program reads them from a pipe.
+    input: Option<Vec<u8>>,
+    input_blake3: Option<Hash>,
 }
 
 pub(super) struct PendingConsole {
@@ -133,6 +145,10 @@ struct ConsoleIo {
     process: ProcessIo,
     sender: Option<SyncSender<StdinMessage>>,
     live: LiveOutput,
+    /// Kept open until the spawn, which starts the child in this directory.
+    fixtures: Option<rustrace_workspace::fixture_tree::PinnedFixtureRoot>,
+    /// What the comparison of a packaged format 3 case records.
+    invocation: Option<TestCaseInvocation>,
 }
 
 struct FormatPrepare {
@@ -234,6 +250,10 @@ pub(super) struct CommandState {
     test_case: Option<TestCase>,
     test_case_expected: Option<std::result::Result<Vec<u8>, String>>,
     completed_test_case: Option<TestCaseComparison>,
+    /// The invocation block of the running format 3 case's comparison.
+    test_case_invocation: Option<TestCaseInvocation>,
+    /// A warning about the latest Run's start, for the editor to show once.
+    run_warning: Option<String>,
 }
 
 /// Per-case limit for packaged test-case runs, including the `cargo run` build.
@@ -259,6 +279,8 @@ impl Default for CommandState {
             test_case: None,
             test_case_expected: None,
             completed_test_case: None,
+            test_case_invocation: None,
+            run_warning: None,
         }
     }
 }
@@ -462,6 +484,7 @@ impl ProductionSession {
     pub fn start_command(&mut self, action: CargoAction) -> Result<()> {
         self.clear_completion();
         self.require_command_idle()?;
+        self.command.run_warning = None;
         let manifest = self.command_manifest()?;
         let argv = match action {
             CargoAction::Build => return Err("Build is not an allowed Cargo command".into()),
@@ -487,6 +510,7 @@ impl ProductionSession {
     ) -> Result<()> {
         self.clear_completion();
         self.require_command_idle()?;
+        self.command.run_warning = None;
         let manifest = self.command_manifest()?;
         let mut argv = vec!["cargo".into(), action.subcommand().into()];
         match (action, dependency) {
@@ -502,10 +526,16 @@ impl ProductionSession {
         self.clear_completion();
         let request = cargo_policy::parse_console_command(input)?;
         self.require_command_idle()?;
+        self.command.run_warning = None;
         let manifest = self.command_manifest()?;
         let action = request.action;
         let argv = request.argv.clone();
         let launch = self.prepare_console_launch(request)?;
+        // Held until the Run starts, including across an overwrite prompt.
+        self.command.run_warning = launch
+            .fixtures
+            .as_ref()
+            .and_then(|fixtures| fixtures.warning(false));
         if launch.output == Some(OutputDisposition::Overwrite) {
             let path = launch
                 .request
@@ -543,8 +573,20 @@ impl ProductionSession {
         let cancelled = self.command.pending_console.take().is_some();
         if cancelled {
             self.command.modal = false;
+            self.command.run_warning = None;
         }
         cancelled
+    }
+
+    /// Takes the warning about the Run that just started, if any: a format 3
+    /// fixture folder that differs from the assignment package. Show it once
+    /// after a Run or test case starts. A console Run held at an overwrite
+    /// prompt keeps its warning until the overwrite is confirmed.
+    pub fn take_run_warning(&mut self) -> Option<String> {
+        if self.command.pending_console.is_some() {
+            return None;
+        }
+        self.command.run_warning.take()
     }
 
     pub fn console_command_active(&self) -> bool {
@@ -611,47 +653,111 @@ impl ProductionSession {
             .map_or_else(Vec::new, LiveOutput::snapshot)
     }
 
+    /// The session's packaged cases as its assignment format defines them:
+    /// complete `.in`/`.expected` pairs for formats 1 and 2, and every case
+    /// with a `.expected` for format 3.
     pub fn list_test_cases(&self) -> Result<Vec<TestCase>> {
+        let layout = self.test_case_layout();
         TestCaseDirectory::open(
             self.workspace.root(),
-            self.test_case_layout(),
+            layout,
             self.metadata.test_case_suite_hash,
         )?
-        .list_cases()
+        .list_cases_for(layout)
     }
 
+    /// Runs one packaged case and compares its standard output.
+    ///
+    /// Formats 1 and 2 run `cargo run < NAME.in` in the workspace. Format 3
+    /// rereads the case by name, ignoring what an earlier listing said about
+    /// it: `NAME.args` becomes the program arguments, `NAME.in` (read into
+    /// memory and hashed) its standard input, or stdin is closed without one.
+    /// When the package has a fixture tree, the program runs in the pinned
+    /// `NAME.test-cases/files`; a tree that differs from the package still
+    /// runs, with a warning from [`Self::take_run_warning`], and records the
+    /// deployed hash.
     pub fn start_test_case(&mut self, case: TestCase) -> Result<()> {
         self.clear_completion();
         self.require_command_idle()?;
+        self.command.run_warning = None;
         let manifest = self.command_manifest()?;
+        let layout = self.test_case_layout();
         let cases = TestCaseDirectory::open(
             self.workspace.root(),
-            self.test_case_layout(),
+            layout,
             self.metadata.test_case_suite_hash,
         )?;
-        let input = cases.open_input(&case.input_path())?;
-        // Reject bad expected files before launch by design. ExpectedUnreadable and
-        // ExpectedOversized remain in the closed vocabulary for stream acceptance only.
-        let expected = cases.read_expected(&case)?;
-        let request = ConsoleCommand {
-            action: CargoAction::Run,
-            argv: vec!["cargo".into(), "run".into()],
-            args: Vec::new(),
-            stdin: Some(case.input_path()),
-            stdout: None,
+        let (launch, expected, warning) = match layout {
+            TestCaseLayout::Paired => {
+                let input = cases.open_input(&case.input_path())?;
+                // Reject bad expected files before launch by design. ExpectedUnreadable and
+                // ExpectedOversized remain in the closed vocabulary for stream acceptance only.
+                let expected = cases.read_expected(&case)?;
+                let request = ConsoleCommand {
+                    action: CargoAction::Run,
+                    argv: vec!["cargo".into(), "run".into()],
+                    args: Vec::new(),
+                    stdin: Some(case.input_path()),
+                    stdout: None,
+                };
+                let launch = ConsoleLaunch {
+                    request,
+                    cases: Some(cases),
+                    input: Some(input),
+                    output: None,
+                    packaged_case: None,
+                    fixtures: None,
+                };
+                (launch, expected, None)
+            }
+            TestCaseLayout::Extended => {
+                let files = cases.read_extended_case(&case)?;
+                let expected = cases.read_expected(&case)?;
+                let fixtures = self.pin_run_fixtures(&cases)?;
+                let warning = fixtures
+                    .as_ref()
+                    .and_then(|fixtures| fixtures.warning(true));
+                let (input, input_blake3) = files.input.unzip();
+                let request = ConsoleCommand {
+                    action: CargoAction::Run,
+                    argv: vec!["cargo".into(), "run".into()],
+                    args: files.args,
+                    stdin: input.is_some().then(|| case.input_path()),
+                    stdout: None,
+                };
+                let launch = ConsoleLaunch {
+                    request,
+                    cases: Some(cases),
+                    input: None,
+                    output: None,
+                    packaged_case: Some(PackagedCaseLaunch {
+                        name: case.name().to_owned(),
+                        input,
+                        input_blake3,
+                    }),
+                    fixtures,
+                };
+                (launch, expected, warning)
+            }
         };
-        let action = request.action;
-        let argv = request.argv.clone();
-        let launch = ConsoleLaunch {
-            request,
-            cases: Some(cases),
-            input: Some(input),
-            output: None,
-        };
+        let action = launch.request.action;
+        let argv = launch.request.argv.clone();
         self.begin_command(manifest.toolchain, action, argv, Some(launch))?;
         self.command.test_case = Some(case);
         self.command.test_case_expected = Some(Ok(expected));
+        self.command.run_warning = warning;
         Ok(())
+    }
+
+    /// Pins the fixture folder a Run of this session starts in, or `None`
+    /// when its package has no fixture tree and the Run stays in the
+    /// workspace. The choice follows the package, never the disk.
+    fn pin_run_fixtures(&self, cases: &TestCaseDirectory) -> Result<Option<PinnedFixtures>> {
+        let Some(packaged) = self.packaged_fixtures_hash() else {
+            return Ok(None);
+        };
+        reject_workspace_cargo_configuration(self.workspace.root())?;
+        Ok(Some(cases.pin_fixtures(packaged)?))
     }
 
     pub fn take_test_case_result(&mut self) -> Option<TestCaseComparison> {
@@ -681,13 +787,25 @@ impl ProductionSession {
         Ok(manifest)
     }
 
+    /// Opens what a console command needs before it starts. A Run in a
+    /// session whose format 3 package has a fixture tree starts in the pinned
+    /// fixture folder, with or without arguments, so a student can reproduce
+    /// a case exactly; every other command runs in the workspace.
     fn prepare_console_launch(&self, request: ConsoleCommand) -> Result<ConsoleLaunch> {
-        let needs_cases = request.stdin.is_some() || request.stdout.is_some();
+        let layout = self.test_case_layout();
+        let fixture_run =
+            request.action == CargoAction::Run && self.packaged_fixtures_hash().is_some();
+        if layout == TestCaseLayout::Extended
+            && let Some(path) = &request.stdout
+        {
+            refuse_managed_case_output(path)?;
+        }
+        let needs_cases = request.stdin.is_some() || request.stdout.is_some() || fixture_run;
         let cases = needs_cases
             .then(|| {
                 TestCaseDirectory::open(
                     self.workspace.root(),
-                    self.test_case_layout(),
+                    layout,
                     self.metadata.test_case_suite_hash,
                 )
             })
@@ -700,11 +818,17 @@ impl ProductionSession {
             (Some(cases), Some(path)) => Some(cases.output_disposition(path)?),
             _ => None,
         };
+        let fixtures = match &cases {
+            Some(cases) if fixture_run => self.pin_run_fixtures(cases)?,
+            _ => None,
+        };
         Ok(ConsoleLaunch {
             request,
             cases,
             input,
             output,
+            packaged_case: None,
+            fixtures,
         })
     }
 
@@ -779,6 +903,7 @@ impl ProductionSession {
             })?;
         self.command.cancel = cancel;
         self.command.outcome = None;
+        self.command.test_case_invocation = None;
         self.command.is_console = is_console;
         self.command.last_action = Some(action);
         self.command.console_stdin = None;
@@ -1655,6 +1780,7 @@ impl ProductionSession {
             Ok(console) => console,
             Err(error) => {
                 self.clear_command_ownership()?;
+                self.complete_test_case_error("could not start");
                 return Err(error);
             }
         };
@@ -1728,10 +1854,17 @@ impl ProductionSession {
             output_bytes: ready.output_limit as usize,
         };
         let cancel = self.command.cancel.clone();
-        let (process_io, sender, live) = match console {
-            Some(console) => (Some(console.process), console.sender, Some(console.live)),
-            None => (None, None, None),
+        let (process_io, sender, live, fixtures, invocation) = match console {
+            Some(console) => (
+                Some(console.process),
+                console.sender,
+                Some(console.live),
+                console.fixtures,
+                console.invocation,
+            ),
+            None => (None, None, None, None, None),
         };
+        self.command.test_case_invocation = invocation;
         // The child holds the workspace writer lock with us; if Rustrace dies,
         // the lock stays held until the last command process exits, and resume
         // treats a free lock as proof that none survived.
@@ -1739,6 +1872,14 @@ impl ProductionSession {
             &mut ready.prepared.command,
             std::os::fd::AsRawFd::as_raw_fd(&writer_lock),
         );
+        // A fixture Run starts in the directory that was just hashed, even if
+        // its path now names another one; the worker keeps it open.
+        if let Some(fixtures) = &fixtures {
+            command_process::change_directory_to_descriptor(
+                &mut ready.prepared.command,
+                std::os::fd::AsRawFd::as_raw_fd(&fixtures.directory_fd()),
+            );
+        }
         let panic_cleanup = ProcessCleanupHandoff::new();
         let worker_cleanup = panic_cleanup.clone();
         let worker = std::thread::Builder::new()
@@ -1746,6 +1887,7 @@ impl ProductionSession {
             .spawn(move || {
                 // The worker owns the duplicate, so it stays open through the spawn.
                 let _writer_lock = writer_lock;
+                let _fixtures = fixtures;
                 match process_io {
                     Some(process_io) => command_process::execute_with_io_and_handoff(
                         ready.prepared.command,
@@ -2368,7 +2510,11 @@ impl ProductionSession {
             .ok_or("missing post-tree")?
             .clone();
         if let Some(comparison) = test_case_result {
-            let comparison = test_case_event(&finish, comparison)?;
+            let comparison = test_case_event(
+                &finish,
+                comparison,
+                self.command.test_case_invocation.take(),
+            )?;
             a.append_compared_finish(finish.clone(), comparison)?;
         } else {
             a.append(Event::ControlledCommandFinished(finish.clone()))?;
@@ -2464,6 +2610,7 @@ impl ProductionSession {
 fn test_case_event(
     finish: &ControlledCommandFinished,
     comparison: &TestCaseComparison,
+    invocation: Option<TestCaseInvocation>,
 ) -> Result<TestCaseCompared> {
     let expected_blake3 = comparison
         .expected_blake3
@@ -2496,7 +2643,7 @@ fn test_case_event(
         expected_blake3,
         actual_blake3: comparison.actual_blake3,
         outcome,
-        invocation: None,
+        invocation,
     };
     event.validate()?;
     Ok(event)
@@ -2506,7 +2653,59 @@ fn diagnostic_count(count: usize, label: &str) -> String {
     format!("{count} {label}{}", if count == 1 { "" } else { "s" })
 }
 
+/// Refuses a format 3 console output redirection onto Rustrace's case-folder
+/// marker or into the fixture tree a Run starts in.
+fn refuse_managed_case_output(path: &WorkspacePath) -> Result<()> {
+    let first = path.components().next().unwrap_or_default();
+    if path
+        .as_str()
+        .eq_ignore_ascii_case(crate::console::CASE_FOLDER_MARKER)
+        || first.eq_ignore_ascii_case(rustrace_workspace::fixture_tree::FIXTURE_ROOT)
+    {
+        return Err(format!(
+            "console output cannot replace {} or write into files/ in the test-case folder; choose another file name",
+            crate::console::CASE_FOLDER_MARKER
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Refuses a fixture-folder Run while the workspace has `.cargo`. Cargo reads
+/// configuration from the directory a command runs in and its parents, so
+/// commands run in the workspace would use it while a Run from the fixture
+/// folder would not, and the two would build differently.
+fn reject_workspace_cargo_configuration(workspace: &Path) -> Result<()> {
+    match fs::symlink_metadata(workspace.join(".cargo")) {
+        Ok(_) => Err(
+            "remove `.cargo` from the workspace: Cargo would read it for commands run in the workspace but not for a Run from the test-case fixture folder"
+                .into(),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn prepare_console_io(mut launch: ConsoleLaunch) -> Result<ConsoleIo> {
+    // Hash the pinned fixture folder again just before the start is recorded,
+    // so the route names the tree the program is launched in. A change since
+    // the student was told whether it matches the package cancels the launch.
+    let fixtures = match launch.fixtures.take() {
+        Some(pinned) => {
+            pinned.root.verify_binding()?;
+            let current = pinned.root.hash()?;
+            if current != pinned.deployed() {
+                return Err(format!(
+                    "the files in {} changed while the run was starting; run it again",
+                    pinned.display
+                )
+                .into());
+            }
+            Some((pinned.root, current))
+        }
+        None => None,
+    };
+    let fixtures_blake3 = fixtures.as_ref().map(|(_, hash)| *hash);
     let input_identity = launch.input.as_ref().map(|input| input.identity());
     let stdout = match (&launch.request.stdout, launch.output) {
         (Some(path), Some(disposition)) => {
@@ -2524,7 +2723,13 @@ fn prepare_console_io(mut launch: ConsoleLaunch) -> Result<ConsoleIo> {
         (None, None) => ProcessStdout::Captured,
         _ => return Err("incomplete console output setup".into()),
     };
-    let (stdin, sender) = if let Some(input) = launch.input.take() {
+    let (stdin, sender) = if let Some(case) = &mut launch.packaged_case {
+        // A format 3 case reads the bytes that were hashed, or nothing.
+        match case.input.take() {
+            Some(bytes) => (ProcessStdin::Bytes(bytes), None),
+            None => (ProcessStdin::Closed, None),
+        }
+    } else if let Some(input) = launch.input.take() {
         (ProcessStdin::File(input.into_file()), None)
     } else if launch.request.action == CargoAction::Run {
         let (sender, receiver) = mpsc::sync_channel(64);
@@ -2532,17 +2737,34 @@ fn prepare_console_io(mut launch: ConsoleLaunch) -> Result<ConsoleIo> {
     } else {
         (ProcessStdin::Closed, None)
     };
-    let route = ConsoleCommandRoute::new(
-        match &launch.request.stdin {
-            Some(path) => ConsoleStdinRoute::File { path: path.clone() },
-            None if launch.request.action == CargoAction::Run => ConsoleStdinRoute::Submitted,
-            None => ConsoleStdinRoute::Closed,
-        },
-        match &launch.request.stdout {
-            Some(path) => ConsoleStdoutRoute::File { path: path.clone() },
-            None => ConsoleStdoutRoute::Console,
-        },
-    );
+    let (route, invocation) = if let Some(case) = &launch.packaged_case {
+        let route = ConsoleCommandRoute::packaged_case(
+            &case.name,
+            case.input_blake3.is_some(),
+            launch.request.args.clone(),
+            fixtures_blake3,
+        )?;
+        let invocation = TestCaseInvocation::for_route(&route, case.input_blake3)
+            .ok_or("packaged test-case route and input disagree")?;
+        (route, Some(invocation))
+    } else {
+        let mut route = ConsoleCommandRoute::new(
+            match &launch.request.stdin {
+                Some(path) => ConsoleStdinRoute::File { path: path.clone() },
+                None if launch.request.action == CargoAction::Run => ConsoleStdinRoute::Submitted,
+                None => ConsoleStdinRoute::Closed,
+            },
+            match &launch.request.stdout {
+                Some(path) => ConsoleStdoutRoute::File { path: path.clone() },
+                None => ConsoleStdoutRoute::Console,
+            },
+        );
+        route.args = launch.request.args.clone();
+        if let Some(fixtures_blake3) = fixtures_blake3 {
+            route.working_directory = ConsoleWorkingDirectory::Fixtures { fixtures_blake3 };
+        }
+        (route, None)
+    };
     let live = LiveOutput::new(command_process::MAX_LIVE_OUTPUT_BYTES);
     Ok(ConsoleIo {
         route,
@@ -2553,6 +2775,8 @@ fn prepare_console_io(mut launch: ConsoleLaunch) -> Result<ConsoleIo> {
         },
         sender,
         live,
+        fixtures: fixtures.map(|(root, _)| root),
+        invocation,
     })
 }
 
@@ -2695,7 +2919,12 @@ fn resolve(
             },
         };
         let prepared = if let Some(console) = &console {
-            cargo_policy::prepare_console(&console.request, &resolved, &root)
+            cargo_policy::prepare_console_in(
+                &console.request,
+                &resolved,
+                &root,
+                console.fixtures.as_ref().map(|fixtures| fixtures.root.path()),
+            )
         } else {
             cargo_policy::prepare(action, &argv, &resolved, &root)
         }
