@@ -1212,8 +1212,9 @@ rustrace verify actual_utorid-lab1-corrected.zip
 ```
 
 `rustrace verify` checks that a ZIP validates: its structure, recorded history,
-checkpoints, replay, and submitted source. It prints those checks and a few
-recorded counts, such as test-case runs, and nothing else.
+checkpoints, replay, and submitted source. It prints those checks, a few
+recorded counts such as test-case runs, and a closing note on what the checks
+cannot show.
 
 The new ZIP records the corrected ID and includes the complete recorded history.
 The original workspace, receipt, and ZIP retain their original ID. You cannot

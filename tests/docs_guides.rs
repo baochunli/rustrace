@@ -426,18 +426,20 @@ fn student_documents_describe_verify_as_validity_only_without_advisories() {
     let guide = unwrapped(&read_doc("student-guide.md"));
     assert!(
         guide.contains(
-            "`rustrace verify` checks that a ZIP validates: its structure, recorded history, checkpoints, replay, and submitted source. It prints those checks and a few recorded counts, such as test-case runs, and nothing else."
+            "`rustrace verify` checks that a ZIP validates: its structure, recorded history, checkpoints, replay, and submitted source. It prints those checks, a few recorded counts such as test-case runs, and a closing note on what the checks cannot show."
         ),
         "student guide must describe plain verify as validity only"
     );
-    for name in [
-        "student-guide.md",
-        "installation.md",
-        "configuration.md",
-        "privacy.md",
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for path in [
+        docs_dir().join("student-guide.md"),
+        docs_dir().join("installation.md"),
+        docs_dir().join("configuration.md"),
+        docs_dir().join("privacy.md"),
+        root.join("README.md"),
     ] {
-        let path = docs_dir().join(name);
-        let text = read_doc(name);
+        let text =
+            fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         for name in AdvisoryFlagKind::ALL
             .map(AdvisoryFlagKind::name)
             .into_iter()
