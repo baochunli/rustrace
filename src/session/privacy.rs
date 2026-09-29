@@ -237,7 +237,7 @@ pub fn run_privacy(args: &[String], output: &mut impl Write) -> Result<()> {
         ReadOnlyFinalizationStatus::Finalized(_) => {
             summarize_receipt(&load_published_receipt(&root, &metadata)?)?
         }
-        ReadOnlyFinalizationStatus::Unfinished => summarize_unfinished(&root, &metadata)?,
+        ReadOnlyFinalizationStatus::Unfinished { .. } => summarize_unfinished(&root, &metadata)?,
         ReadOnlyFinalizationStatus::Prepared { .. } => {
             return Err(
                 "finalization is prepared but incomplete; preserve it and run `rustrace submit` or inspect recovery before privacy display"

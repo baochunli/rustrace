@@ -223,6 +223,38 @@ fn status_distinguishes_unfinished_incomplete_and_finalized_receipts() {
         "{text}"
     );
 
+    // A submit that stopped before its immutable capture left only a reason:
+    // the attempt is still unfinished, and the next submit retries it.
+    let failed = Fixture::new("retention-status-failed-submit");
+    let session = ProductionSession::start(&failed.workspace, MANIFEST).unwrap();
+    let failed_id = session.session_id().clone();
+    session.quit().unwrap();
+    fs::write(
+        failed
+            .workspace
+            .join(".rustrace/finalization-incomplete.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "label": "INCOMPLETE RECOVERY",
+            "reason": "interrupted before immutable capture",
+            "session_id": failed_id,
+            "capture_available": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = run(&[Path::new("status"), &failed.workspace]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains(&format!("UNFINISHED session {failed_id}"))
+            && text
+                .contains("Unfinished (last submit failed: interrupted before immutable capture)")
+            && text.contains("run `rustrace submit` again"),
+        "{text}"
+    );
+    assert!(!text.contains("INCOMPLETE RECOVERY"), "{text}");
+
     let incomplete = Fixture::new("retention-status-incomplete");
     let session = ProductionSession::start(&incomplete.workspace, MANIFEST).unwrap();
     let incomplete_id = session.session_id().clone();
@@ -234,9 +266,9 @@ fn status_distinguishes_unfinished_incomplete_and_finalized_receipts() {
         serde_json::to_vec(&serde_json::json!({
             "version": 1,
             "label": "INCOMPLETE RECOVERY",
-            "reason": "interrupted before immutable capture",
+            "reason": "interrupted after immutable capture",
             "session_id": incomplete_id,
-            "capture_available": false
+            "capture_available": true
         }))
         .unwrap(),
     )
@@ -246,7 +278,7 @@ fn status_distinguishes_unfinished_incomplete_and_finalized_receipts() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("INCOMPLETE RECOVERY"), "{text}");
     assert!(
-        text.contains("interrupted before immutable capture"),
+        text.contains("interrupted after immutable capture"),
         "{text}"
     );
 

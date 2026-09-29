@@ -1018,3 +1018,60 @@ fn review3_missing_parent_evidence_retains_parent_segments_and_exact_gaps() {
     );
     assert_eq!(terminal_count(&child.0, &child_id).1, 0);
 }
+
+#[test]
+fn over_limit_finalization_names_the_count_and_stays_retryable() {
+    let (fixture, session) = Fixture::started("finalization-over-limit-text");
+    let id = session.session_id().clone();
+    let error = session
+        .finalize_with_checkpoint_limit("student-1", 1)
+        .unwrap_err()
+        .to_string();
+    // The genesis checkpoint plus the boundary finalization records first.
+    assert_eq!(
+        error,
+        "this attempt has 2 checkpoints, more than the 1 one submission can hold"
+    );
+    for name in [
+        "finalization-recovery-capture.json",
+        "finalization-recovery-events.jsonl",
+        "finalization-prefix.jsonl",
+        "finalization-prepared.json",
+    ] {
+        assert!(!state_artifact(&fixture.0, name).exists(), "{name}");
+    }
+    match ProductionSession::inspect_finalization_read_only(&fixture.0).unwrap() {
+        ReadOnlyFinalizationStatus::Unfinished {
+            last_submit_failure: Some(reason),
+        } => assert_eq!(reason, error),
+        other => panic!("a pre-capture failure must stay unfinished: {other:?}"),
+    }
+    assert!(
+        ProductionSession::recover_finalization_if_started(&fixture.0)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(terminal_count(&fixture.0, &id).1, 0);
+
+    let resumed = ProductionSession::resume(&fixture.0, MANIFEST, ResumeChoice::Resume).unwrap();
+    let receipt = resumed.finalize("student-1").unwrap();
+    assert_eq!(receipt.manifest().latest_session_id, id);
+    assert!(matches!(
+        ProductionSession::inspect_finalization_read_only(&fixture.0).unwrap(),
+        ReadOnlyFinalizationStatus::Finalized(_)
+    ));
+}
+
+#[test]
+fn limit_counts_are_grouped_by_thousands() {
+    for (value, text) in [
+        (0, "0"),
+        (999, "999"),
+        (1_000, "1,000"),
+        (8_192, "8,192"),
+        (1_000_000, "1,000,000"),
+        (u64::MAX, "18,446,744,073,709,551,615"),
+    ] {
+        assert_eq!(crate::display::grouped(value), text);
+    }
+}

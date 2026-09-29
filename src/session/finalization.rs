@@ -55,6 +55,72 @@ const RECOVERY_CAPTURE: &str = "finalization-recovery-capture.json";
 const RECOVERY_EVENTS: &str = "finalization-recovery-events.jsonl";
 const FINALIZATION_METADATA_LIMIT: usize = MAX_RPROV_MANIFEST_BYTES;
 const INCOMPLETE_REASON_BYTES: usize = 4096;
+/// Any of these makes the finalization immutable: a new attempt can no longer
+/// resume the journal, so a failure marker next to one is a real incomplete
+/// recovery rather than a failed submit attempt.
+const CAPTURE_ARTIFACTS: [&str; 5] = [
+    RECEIPT_MARKER,
+    PREPARED_MARKER,
+    RECOVERY_CAPTURE,
+    PREFIX_EVENTS,
+    COMPLETE_EVENTS,
+];
+
+/// A count the `.rprov` format caps, found over its limit before anything was
+/// captured. The attempt stays unfinished and resumable, so a build with a
+/// larger limit can finalize the same journal.
+#[derive(Debug)]
+pub(super) struct FinalizationLimitExceeded {
+    what: &'static str,
+    count: u64,
+    limit: u64,
+}
+
+impl FinalizationLimitExceeded {
+    fn check(what: &'static str, count: u64, limit: u64) -> Result<()> {
+        if count > limit {
+            return Err(Box::new(Self { what, count, limit }));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for FinalizationLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "this attempt has {} {}, more than the {} one submission can hold",
+            crate::display::grouped(self.count),
+            self.what,
+            crate::display::grouped(self.limit)
+        )
+    }
+}
+
+impl std::error::Error for FinalizationLimitExceeded {}
+
+/// Per-segment limits applied before the immutable capture. Tests lower them
+/// to reach an over-limit journal without recording thousands of checkpoints.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FinalizationLimits {
+    aggregate_events: u64,
+    checkpoints: usize,
+}
+
+impl FinalizationLimits {
+    pub(super) const PACKAGE: Self = Self {
+        aggregate_events: MAX_RPROV_EVENTS,
+        checkpoints: MAX_RPROV_CHECKPOINTS_PER_SEGMENT,
+    };
+
+    #[cfg(test)]
+    pub(super) fn with_checkpoints(maximum: usize) -> Self {
+        Self {
+            checkpoints: maximum,
+            ..Self::PACKAGE
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -174,6 +240,17 @@ struct PersistedIncompleteFinalization {
     capture_available: bool,
 }
 
+impl PersistedIncompleteFinalization {
+    /// A submit that stopped before its immutable capture records only its
+    /// reason. The caller also requires that no capture artifact exists.
+    fn is_failed_attempt(&self, session_id: &SessionId) -> bool {
+        self.version == 1
+            && self.label == "INCOMPLETE RECOVERY"
+            && !self.capture_available
+            && &self.session_id == session_id
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum FinalizationStatus {
     Finalized(Box<FinalizationReceipt>),
@@ -192,7 +269,11 @@ pub(crate) struct ReadOnlyFinalizationReceipt {
 
 #[derive(Clone, Debug)]
 pub(crate) enum ReadOnlyFinalizationStatus {
-    Unfinished,
+    /// Mutable and resumable. `last_submit_failure` is the reason a previous
+    /// submit stopped before capturing anything; a new submit retries it.
+    Unfinished {
+        last_submit_failure: Option<String>,
+    },
     Prepared {
         session_id: SessionId,
     },
@@ -365,6 +446,7 @@ struct CaptureCurrentInput<'a> {
     prefix_events: &'a [EventEnvelope],
     terminal: Option<&'a EventEnvelope>,
     checkpoints: &'a [StoredCheckpoint],
+    maximum_checkpoints: usize,
     parent_link: Option<RprovParentLink>,
     original_starter_tree_hash: Hash,
     include_initial_workspace: bool,
@@ -403,16 +485,16 @@ impl ProductionSession {
     /// Consumes the active controller and returns a receipt only after its exact
     /// prepared terminal event and ended-session bit are durable.
     pub fn finalize(self, student_id: &str) -> Result<FinalizationReceipt> {
-        self.finalize_with_limit(student_id, MAX_RPROV_EVENTS)
+        self.finalize_with_limits(student_id, FinalizationLimits::PACKAGE)
     }
 
-    fn finalize_with_limit(
+    pub(super) fn finalize_with_limits(
         mut self,
         student_id: &str,
-        maximum_aggregate_event_count: u64,
+        limits: FinalizationLimits,
     ) -> Result<FinalizationReceipt> {
         let result = self
-            .prepare_finalization(student_id, maximum_aggregate_event_count)
+            .prepare_finalization(student_id, limits)
             .and_then(|marker| {
                 finish_prepared(
                     &mut self.effects.0.borrow_mut().owner,
@@ -446,7 +528,22 @@ impl ProductionSession {
         student_id: &str,
         maximum: u64,
     ) -> Result<FinalizationReceipt> {
-        self.finalize_with_limit(student_id, maximum)
+        self.finalize_with_limits(
+            student_id,
+            FinalizationLimits {
+                aggregate_events: maximum,
+                ..FinalizationLimits::PACKAGE
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn finalize_with_checkpoint_limit(
+        self,
+        student_id: &str,
+        maximum: usize,
+    ) -> Result<FinalizationReceipt> {
+        self.finalize_with_limits(student_id, FinalizationLimits::with_checkpoints(maximum))
     }
 
     /// Completes or loads a prepared finalization without reading the live
@@ -467,16 +564,21 @@ impl ProductionSession {
         let mut owner = pinned
             .open_state_directory()?
             .open_journal_file(&metadata.session_id)?;
-        let started = [
-            RECEIPT_MARKER,
-            PREPARED_MARKER,
-            RECOVERY_CAPTURE,
-            INCOMPLETE_MARKER,
-        ]
-        .into_iter()
-        .try_fold(false, |found, name| {
-            artifact_exists(&owner, name).map(|exists| found || exists)
-        });
+        // A marker from a submit that stopped before its capture does not start
+        // finalization: the journal is still the only authority, so a new
+        // attempt resumes and finalizes it.
+        let started = (|| -> Result<bool> {
+            for name in CAPTURE_ARTIFACTS {
+                if artifact_exists(&owner, name)? {
+                    return Ok(true);
+                }
+            }
+            if !artifact_exists(&owner, INCOMPLETE_MARKER)? {
+                return Ok(false);
+            }
+            Ok(!read_incomplete(&owner)
+                .is_ok_and(|marker| marker.is_failed_attempt(&metadata.session_id)))
+        })();
         owner.release_ownership()?;
         if started? {
             Self::recover_finalization(root).map(Some)
@@ -512,6 +614,17 @@ impl ProductionSession {
             if incomplete.session_id != metadata.session_id {
                 return Err("incomplete finalization has the wrong session identity".into());
             }
+            if incomplete.is_failed_attempt(&metadata.session_id) {
+                let mut captured = false;
+                for name in [RECOVERY_CAPTURE, PREFIX_EVENTS, COMPLETE_EVENTS] {
+                    captured |= state.artifact_exists(name)?;
+                }
+                if !captured {
+                    return Ok(ReadOnlyFinalizationStatus::Unfinished {
+                        last_submit_failure: Some(incomplete.reason),
+                    });
+                }
+            }
             return Ok(ReadOnlyFinalizationStatus::Incomplete {
                 reason: incomplete.reason,
                 session_id: incomplete.session_id,
@@ -526,7 +639,9 @@ impl ProductionSession {
                 capture_available: true,
             });
         }
-        Ok(ReadOnlyFinalizationStatus::Unfinished)
+        Ok(ReadOnlyFinalizationStatus::Unfinished {
+            last_submit_failure: None,
+        })
     }
 
     fn recover_finalization_with_actual_limit(
@@ -707,7 +822,7 @@ impl ProductionSession {
         student_id: &str,
         stage: FinalizationInterruption,
     ) -> Result<()> {
-        let marker = self.prepare_finalization(student_id, MAX_RPROV_EVENTS)?;
+        let marker = self.prepare_finalization(student_id, FinalizationLimits::PACKAGE)?;
         let boundary = match stage {
             FinalizationInterruption::AfterCapture => FinishBoundary::AfterCapture,
             FinalizationInterruption::AfterTerminal => FinishBoundary::AfterTerminal,
@@ -720,8 +835,9 @@ impl ProductionSession {
     fn prepare_finalization(
         &mut self,
         student_id: &str,
-        maximum_aggregate_event_count: u64,
+        limits: FinalizationLimits,
     ) -> Result<PreparedMarker> {
+        let maximum_aggregate_event_count = limits.aggregate_events;
         validate_student_id(student_id)?;
         self.shutdown_command()?;
         if self.effects.0.borrow().command_active
@@ -803,9 +919,7 @@ impl ProductionSession {
             .sequence
             .checked_add(1)
             .ok_or("terminal event count overflow")?;
-        if terminal_count > MAX_RPROV_EVENTS {
-            return Err("segment terminal event exceeds package event limit".into());
-        }
+        FinalizationLimitExceeded::check("recorded events", terminal_count, MAX_RPROV_EVENTS)?;
         let terminal = EventEnvelope {
             format_version: 1,
             session_id: self.metadata.session_id.clone(),
@@ -825,7 +939,8 @@ impl ProductionSession {
         let mut terminal_replay = prefix.replay.clone();
         terminal_replay.apply(&terminal)?;
 
-        let checkpoints = read_all_checkpoints(&mut journal, &self.metadata.session_id)?;
+        let checkpoints =
+            read_all_checkpoints(&mut journal, &self.metadata.session_id, limits.checkpoints)?;
         process_probe("finalization-before-capture");
         let had_parent = parent_evidence_kind == ParentEvidenceKind::FinalizedRevision;
         let original_starter_tree_hash = (!had_parent).then_some(self.metadata.starter_hash);
@@ -838,6 +953,7 @@ impl ProductionSession {
                 prefix_events: &prefix_events,
                 terminal: None,
                 checkpoints: &checkpoints,
+                maximum_checkpoints: limits.checkpoints,
                 parent_link: None,
                 // The outer Option is authoritative for raw recovery. Zero is
                 // an inert internal sentinel and is never emitted in a manifest.
@@ -1106,16 +1222,20 @@ fn capture_current_segment(
         prefix_events,
         terminal,
         checkpoints,
+        maximum_checkpoints,
         parent_link,
         original_starter_tree_hash,
         include_initial_workspace,
         event_artifact,
         artifact_tag,
     } = input;
-    if checkpoints.len() < 2 || checkpoints.len() > MAX_RPROV_CHECKPOINTS_PER_SEGMENT {
-        return Err(
-            "finalization requires distinct initial/final full checkpoints within limits".into(),
-        );
+    FinalizationLimitExceeded::check(
+        "checkpoints",
+        checkpoints.len() as u64,
+        maximum_checkpoints as u64,
+    )?;
+    if checkpoints.len() < 2 {
+        return Err("finalization requires distinct initial/final full checkpoints".into());
     }
     let prefix_bytes = encode_event_stream(prefix_events)?;
     let mut event_bytes = prefix_bytes.clone();
@@ -1123,9 +1243,11 @@ fn capture_current_segment(
         event_bytes.extend_from_slice(&encode_envelope(terminal)?);
         event_bytes.push(b'\n');
     }
-    if event_bytes.len() as u64 > MAX_RPROV_SEGMENT_EVENTS_BYTES {
-        return Err("captured event stream exceeds the segment byte limit".into());
-    }
+    FinalizationLimitExceeded::check(
+        "bytes of recorded events",
+        event_bytes.len() as u64,
+        MAX_RPROV_SEGMENT_EVENTS_BYTES,
+    )?;
 
     let mut publications = vec![(event_artifact.to_owned(), event_bytes.clone())];
     let event_entry = format!("segments/{ordinal:04}/events.jsonl");
@@ -1654,24 +1776,34 @@ fn capture_evidence(
             usage_count = usage_count
                 .checked_add(1)
                 .ok_or("evidence usage count overflow")?;
-            if usage_count > MAX_RPROV_EVIDENCE_USAGES {
-                return Err("evidence usages exceed the package limit".into());
-            }
-            if !grouped.contains_key(&hash) && grouped.len() == MAX_RPROV_EVIDENCE_PER_SEGMENT {
-                return Err("evidence artifacts exceed the segment item limit".into());
-            }
             let group = grouped
                 .entry(hash)
                 .or_insert_with(|| (name.clone(), Vec::new()));
             if group.0 != name {
                 return Err("one evidence digest resolves to conflicting durable artifacts".into());
             }
-            if group.1.len() == MAX_RPROV_EVIDENCE_USAGES_PER_ARTIFACT {
-                return Err("one evidence artifact exceeds its usage limit".into());
-            }
             group.1.push(event_reference(envelope));
         }
     }
+    FinalizationLimitExceeded::check(
+        "recorded outside-change observations",
+        usage_count as u64,
+        MAX_RPROV_EVIDENCE_USAGES as u64,
+    )?;
+    FinalizationLimitExceeded::check(
+        "distinct outside-change evidence files",
+        grouped.len() as u64,
+        MAX_RPROV_EVIDENCE_PER_SEGMENT as u64,
+    )?;
+    FinalizationLimitExceeded::check(
+        "observations of one outside-change evidence file",
+        grouped
+            .values()
+            .map(|(_, usages)| usages.len() as u64)
+            .max()
+            .unwrap_or(0),
+        MAX_RPROV_EVIDENCE_USAGES_PER_ARTIFACT as u64,
+    )?;
     let mut refs = Vec::with_capacity(grouped.len());
     let mut inventory = Vec::with_capacity(grouped.len());
     let mut payloads = Vec::with_capacity(grouped.len());
@@ -1777,10 +1909,12 @@ fn capture_source_links(events: &[EventEnvelope]) -> Result<Vec<RprovSourceLink>
             }
             _ => {}
         }
-        if links.len() > MAX_RPROV_SOURCE_LINKS_PER_SEGMENT {
-            return Err("paste source links exceed the segment item limit".into());
-        }
     }
+    FinalizationLimitExceeded::check(
+        "recorded pastes",
+        links.len() as u64,
+        MAX_RPROV_SOURCE_LINKS_PER_SEGMENT as u64,
+    )?;
     Ok(links)
 }
 
@@ -3352,7 +3486,11 @@ fn validate_current_journal(
     if encode_event_stream(&events[..prefix_count])? != expected_bytes {
         return Err("local journal prefix differs from the immutable recovery capture".into());
     }
-    let checkpoints = read_all_checkpoints(&mut journal, &persisted.segment.session_id)?;
+    let checkpoints = read_all_checkpoints(
+        &mut journal,
+        &persisted.segment.session_id,
+        MAX_RPROV_CHECKPOINTS_PER_SEGMENT,
+    )?;
     if checkpoints.len() != persisted.segment.checkpoints.len() {
         return Err("local checkpoint count differs from the immutable recovery capture".into());
     }
@@ -3425,9 +3563,10 @@ fn read_declared_payload(payloads: &[FinalizationPayload], entry: &str) -> Resul
 
 fn read_all_events(journal: &mut Journal, session_id: &SessionId) -> Result<Vec<EventEnvelope>> {
     let chain = journal.verify_session_chain(session_id)?;
-    if chain.event_count == 0 || chain.event_count > MAX_RPROV_EVENTS {
-        return Err("journal event count is outside finalization limits".into());
+    if chain.event_count == 0 {
+        return Err("journal has no events to finalize".into());
     }
+    FinalizationLimitExceeded::check("recorded events", chain.event_count, MAX_RPROV_EVENTS)?;
     let capacity =
         usize::try_from(chain.event_count).map_err(|_| "event count does not fit usize")?;
     let mut result = Vec::with_capacity(capacity.min(MAX_EVENTS_PER_READ));
@@ -3449,13 +3588,13 @@ fn read_all_events(journal: &mut Journal, session_id: &SessionId) -> Result<Vec<
 fn read_all_checkpoints(
     journal: &mut Journal,
     session_id: &SessionId,
+    maximum: usize,
 ) -> Result<Vec<StoredCheckpoint>> {
     let verified = journal.verify_session_checkpoints(session_id)?;
-    if verified.checkpoint_count == 0
-        || verified.checkpoint_count as usize > MAX_RPROV_CHECKPOINTS_PER_SEGMENT
-    {
-        return Err("checkpoint count is outside finalization limits".into());
+    if verified.checkpoint_count == 0 {
+        return Err("journal has no checkpoints to finalize".into());
     }
+    FinalizationLimitExceeded::check("checkpoints", verified.checkpoint_count, maximum as u64)?;
     let mut result = Vec::with_capacity(verified.checkpoint_count as usize);
     let mut next = 1_u64;
     loop {
@@ -3477,7 +3616,7 @@ fn read_all_checkpoints(
 
 fn encode_event_stream(events: &[EventEnvelope]) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    for event in events {
+    for (index, event) in events.iter().enumerate() {
         let encoded = encode_envelope(event)?;
         let new_length = bytes
             .len()
@@ -3485,7 +3624,16 @@ fn encode_event_stream(events: &[EventEnvelope]) -> Result<Vec<u8>> {
             .and_then(|length| length.checked_add(1))
             .ok_or("event stream byte count overflow")?;
         if new_length as u64 > MAX_RPROV_SEGMENT_EVENTS_BYTES {
-            return Err("event stream exceeds its bounded segment limit".into());
+            // Report the whole stream's size, not where encoding stopped.
+            let mut count = new_length as u64;
+            for later in &events[index + 1..] {
+                count = count.saturating_add(encode_envelope(later)?.len() as u64 + 1);
+            }
+            return Err(Box::new(FinalizationLimitExceeded {
+                what: "bytes of recorded events",
+                count,
+                limit: MAX_RPROV_SEGMENT_EVENTS_BYTES,
+            }));
         }
         bytes.extend_from_slice(&encoded);
         bytes.push(b'\n');

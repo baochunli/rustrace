@@ -209,12 +209,25 @@ pub fn run_status(args: &[String], output: &mut impl Write) -> Result<()> {
     };
     let revision = read_revision_link(&root, metadata.parent_evidence.as_ref())?;
     match ProductionSession::inspect_finalization_read_only(&root)? {
-        ReadOnlyFinalizationStatus::Unfinished => {
+        ReadOnlyFinalizationStatus::Unfinished {
+            last_submit_failure,
+        } => {
             writeln!(
                 output,
                 "UNFINISHED session {} at {safe_root}",
                 metadata.session_id
             )?;
+            if let Some(reason) = last_submit_failure {
+                writeln!(
+                    output,
+                    "Unfinished (last submit failed: {})",
+                    display::label(&reason, 4096)
+                )?;
+                writeln!(
+                    output,
+                    "That submit stopped before capturing anything, so no work is lost: fix the cause, or run `rustrace update` if it named a limit, and run `rustrace submit` again."
+                )?;
+            }
             writeln!(
                 output,
                 "This attempt remains mutable; its journal, checkpoints, evidence, and captures are preserved."

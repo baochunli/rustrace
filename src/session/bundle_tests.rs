@@ -323,3 +323,136 @@ fn revised_bundle_contains_complete_ancestry_and_only_latest_outer_source() {
             .all(|entry| !entry.path.ends_with(".zip"))
     );
 }
+
+fn status_text(workspace: &Path) -> String {
+    let mut output = Vec::new();
+    super::run_status(&[workspace.to_string_lossy().into_owned()], &mut output).unwrap();
+    String::from_utf8(output).unwrap()
+}
+
+fn incomplete_marker(workspace: &Path) -> serde_json::Value {
+    serde_json::from_slice(
+        &fs::read(workspace.join(".rustrace/finalization-incomplete.json")).unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn over_limit_submit_is_not_sticky_and_retries_the_same_journal_once_the_limit_allows() {
+    let (fixture, mut session) = Fixture::started("bundle-over-limit-retry");
+    for character in ['B', 'C', 'D'] {
+        session.execute(EditorCommand::Insert(character)).unwrap();
+        session.capture_boundary().unwrap();
+    }
+    let id = session.session_id().clone();
+    session.quit().unwrap();
+    let destination = fixture.base.join("over-limit.zip");
+
+    for attempt in 0..2 {
+        let error = super::bundle::submit_with_limits(
+            &fixture.workspace,
+            "student-1",
+            Some(destination.as_path()),
+            super::finalization::FinalizationLimits::with_checkpoints(3),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("this attempt has ")
+                && error.contains(" checkpoints, more than the 3 one submission can hold")
+                && error.contains("no bundle was created")
+                && error.contains("Nothing was captured")
+                && error.contains("Run `rustrace update` and submit again"),
+            "attempt {attempt}: {error}"
+        );
+        assert!(!error.contains("INCOMPLETE RECOVERY"), "{error}");
+        assert!(!destination.exists());
+        let marker = incomplete_marker(&fixture.workspace);
+        assert_eq!(marker["capture_available"], false);
+        assert!(
+            !fixture
+                .workspace
+                .join(".rustrace/finalization-recovery-capture.json")
+                .exists()
+        );
+        let status = status_text(&fixture.workspace);
+        assert!(
+            status.contains("UNFINISHED session")
+                && status.contains("Unfinished (last submit failed: this attempt has ")
+                && !status.contains("INCOMPLETE RECOVERY"),
+            "{status}"
+        );
+    }
+
+    let bundle =
+        submit_finalized_workspace(&fixture.workspace, "student-1", Some(destination.as_path()))
+            .expect("the same journal finalizes once the limit allows it");
+    let report = crate::verify::verify_path(&bundle.path, None);
+    assert!(report.is_clean(), "{report:?}");
+    let imported = import_rprov(Cursor::new(fs::read(&bundle.path).unwrap())).unwrap();
+    assert_eq!(imported.manifest().segments.len(), 1);
+    assert_eq!(imported.manifest().latest_session_id, id);
+    let mut source = Vec::new();
+    imported
+        .open_outer_source(&WorkspacePath::new("main.rs").unwrap())
+        .unwrap()
+        .read_to_end(&mut source)
+        .unwrap();
+    assert_eq!(source, b"BCDA", "the retry keeps every recorded edit");
+    assert!(status_text(&fixture.workspace).contains("FINALIZED IMMUTABLE SNAPSHOT"));
+}
+
+#[test]
+fn failed_student_id_finalization_is_retried_with_a_valid_id() {
+    let (fixture, mut session) = Fixture::started("bundle-bad-id-retry");
+    session.execute(EditorCommand::Insert('B')).unwrap();
+    let error = session.finalize("bad id!").unwrap_err().to_string();
+    assert!(error.contains("student identifier"), "{error}");
+    assert_eq!(
+        incomplete_marker(&fixture.workspace)["capture_available"],
+        false
+    );
+    let status = status_text(&fixture.workspace);
+    assert!(
+        status.contains("Unfinished (last submit failed: student identifier"),
+        "{status}"
+    );
+    let mut privacy = Vec::new();
+    super::run_privacy(
+        &[fixture.workspace.to_string_lossy().into_owned()],
+        &mut privacy,
+    )
+    .expect("privacy previews a failed attempt like any unfinished one");
+
+    let destination = fixture.base.join("retry.zip");
+    let bundle =
+        submit_finalized_workspace(&fixture.workspace, "student-1", Some(destination.as_path()))
+            .unwrap();
+    assert!(crate::verify::verify_path(&bundle.path, None).is_clean());
+}
+
+#[test]
+fn a_marker_that_claims_a_missing_capture_still_blocks_submit() {
+    let (fixture, session) = Fixture::started("bundle-claimed-capture");
+    let id = session.session_id().clone();
+    session.quit().unwrap();
+    fs::write(
+        fixture
+            .workspace
+            .join(".rustrace/finalization-incomplete.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "label": "INCOMPLETE RECOVERY",
+            "reason": "captured, then the capture disappeared",
+            "session_id": id,
+            "capture_available": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(status_text(&fixture.workspace).contains("INCOMPLETE RECOVERY session"));
+    let error = submit_finalized_workspace(&fixture.workspace, "student-1", None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("INCOMPLETE RECOVERY"), "{error}");
+}
