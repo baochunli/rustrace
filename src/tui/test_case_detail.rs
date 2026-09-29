@@ -126,20 +126,41 @@ pub(crate) struct DetailRow {
 
 /// One argument as the picker shows it: between `«` and `»`, so leading,
 /// trailing and inner spaces are visible. Control characters, invisible and
-/// bidirectional formatting characters (such as U+200B and U+202E),
-/// whitespace other than the ASCII space (such as U+00A0), zero-width marks,
-/// and the two delimiters are written as Rust escapes such as `\u{202e}`.
-/// Every other character, including `\`, quotes and shell characters, appears
-/// as itself, because the program receives it literally.
+/// bidirectional formatting characters (such as U+200B and U+202E), joiners
+/// and variation selectors (such as U+200D and U+FE0F), whitespace other than
+/// the ASCII space (such as U+00A0), zero-width marks, and the two delimiters
+/// are written as Rust escapes such as `\u{202e}`. Every other character,
+/// including `\`, quotes and shell characters, appears as itself, because the
+/// program receives it literally.
 pub(crate) fn display_argument(argument: &str) -> String {
     let mut shown = String::with_capacity(argument.len() + 4);
     shown.push(ARGUMENT_OPEN);
-    for grapheme in argument.graphemes(true) {
+    push_visible(&mut shown, argument, |character| {
+        matches!(character, ARGUMENT_OPEN | ARGUMENT_CLOSE)
+    });
+    shown.push(ARGUMENT_CLOSE);
+    shown
+}
+
+/// A fixture path as the picker shows it, escaped like an argument but
+/// without delimiters, so two names that look alike on screen differ.
+pub(crate) fn display_path(path: &str) -> String {
+    let mut shown = String::with_capacity(path.len());
+    push_visible(&mut shown, path, |_| false);
+    shown
+}
+
+/// Appends `text` with every character that [`must_escape_here`] or `also`
+/// selects, and every zero-width cluster, written as an escape. A cluster
+/// holding one of them is escaped character by character, so a joiner or
+/// variation selector never hides inside a visible character.
+fn push_visible(shown: &mut String, text: &str, also: impl Fn(char) -> bool) {
+    let escape = |character: char| must_escape_here(character) || also(character);
+    for grapheme in text.graphemes(true) {
         let invisible = display::grapheme_width(grapheme, 0) == 0;
-        if invisible || grapheme.chars().any(argument_escape) {
+        if invisible || grapheme.chars().any(escape) {
             for character in grapheme.chars() {
-                if argument_escape(character)
-                    || display::must_escape(character)
+                if escape(character)
                     || display::grapheme_width(character.encode_utf8(&mut [0; 4]), 0) == 0
                 {
                     shown.extend(character.escape_default());
@@ -151,14 +172,18 @@ pub(crate) fn display_argument(argument: &str) -> String {
             shown.push_str(&display::grapheme(grapheme, 0).0);
         }
     }
-    shown.push(ARGUMENT_CLOSE);
-    shown
 }
 
-fn argument_escape(character: char) -> bool {
+/// Characters the picker escapes in arguments and fixture paths: the
+/// terminal-wide set, whitespace other than the ASCII space, and the joiners
+/// and variation selectors that the editor keeps inside visible clusters.
+fn must_escape_here(character: char) -> bool {
     display::must_escape(character)
         || (character.is_whitespace() && character != ' ')
-        || matches!(character, ARGUMENT_OPEN | ARGUMENT_CLOSE)
+        || matches!(
+            character,
+            '\u{200c}' | '\u{200d}' | '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}'
+        )
 }
 
 /// A byte count for people: bytes below 1 KiB, then KiB or MiB.
@@ -431,8 +456,8 @@ fn files_section(files: Vec<String>, width: usize) -> Section {
             }
             if files.len() <= rows {
                 return files
-                    .into_iter()
-                    .map(|file| (file, DetailTone::Plain))
+                    .iter()
+                    .map(|file| (display_path(file), DetailTone::Plain))
                     .collect();
             }
             let listed = rows.saturating_sub(1);
@@ -440,11 +465,12 @@ fn files_section(files: Vec<String>, width: usize) -> Section {
             let mut lines = files
                 .iter()
                 .take(listed)
-                .map(|file| (file.clone(), DetailTone::Plain))
+                .map(|file| (display_path(file), DetailTone::Plain))
                 .collect::<Rows>();
             if listed == 0 {
                 let suffix = format!(" … and {} more", more - 1);
-                lines.push((with_suffix(&files[0], &suffix, width), DetailTone::Plain));
+                let first = display_path(&files[0]);
+                lines.push((with_suffix(&first, &suffix, width), DetailTone::Plain));
             } else {
                 lines.push((format!("… and {more} more"), DetailTone::Muted));
             }
@@ -611,9 +637,48 @@ mod tests {
         assert_eq!(display_argument("tab\there"), "«tab\\there»");
         assert_eq!(display_argument("esc\u{1b}[2J"), "«esc\\u{1b}[2J»");
         assert_eq!(display_argument("«quoted»"), "«\\u{ab}quoted\\u{bb}»");
+        // Joiners and variation selectors after a visible character would
+        // otherwise hide inside its cluster.
+        assert_eq!(display_argument("a\u{200d}b"), "«a\\u{200d}b»");
+        assert_eq!(display_argument("a\u{200c}b"), "«a\\u{200c}b»");
+        assert_eq!(display_argument("x\u{fe0f}"), "«x\\u{fe0f}»");
+        assert_eq!(display_argument("x\u{fe00}"), "«x\\u{fe00}»");
+        assert_eq!(display_argument("x\u{e0100}"), "«x\\u{e0100}»");
+        assert_eq!(
+            display_argument("\u{1f468}\u{200d}\u{1f469}"),
+            "«\u{1f468}\\u{200d}\u{1f469}»"
+        );
         assert_eq!(display_argument("\u{301}"), "«\\u{301}»");
         assert_eq!(display_argument("café"), "«café»");
         assert_eq!(display_argument("e\u{301}"), "«e\u{301}»");
+    }
+
+    #[test]
+    fn fixture_paths_escape_like_arguments_without_delimiters() {
+        assert_eq!(display_path("tests/grep.md"), "tests/grep.md");
+        assert_eq!(display_path("tests/a\u{200d}b.md"), "tests/a\\u{200d}b.md");
+        assert_eq!(display_path("tests/x\u{fe0f}.md"), "tests/x\\u{fe0f}.md");
+        assert_eq!(display_path("rtl\u{202e}dm.txt"), "rtl\\u{202e}dm.txt");
+        assert_eq!(display_path("no\u{a0}break.md"), "no\\u{a0}break.md");
+        assert_eq!(display_path("«x».md"), "«x».md");
+
+        let detail = TestCaseDetail {
+            selection: TestCaseSelection::RunAll {
+                cases: 1,
+                passed: 0,
+                failed: 0,
+                errors: 0,
+            },
+            fixtures: TestCaseFixtures::Files {
+                folder: "lab.test-cases/files".into(),
+                files: vec!["ab.md".into(), "a\u{200d}b.md".into()],
+                changed: false,
+            },
+        };
+        assert_eq!(
+            texts(&detail_rows(&detail, 74, 10))[1..3],
+            ["Files      ab.md", "           a\\u{200d}b.md"]
+        );
     }
 
     #[test]
