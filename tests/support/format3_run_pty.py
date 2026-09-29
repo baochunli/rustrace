@@ -354,7 +354,7 @@ try:
         lambda: len(runs()) == 4
         and " TEST CASES " in rendered_screen()
         and "Results    3 cases: 3 PASS, 0 FAIL, 0 ERROR, 0 not run yet" in rendered_screen()
-        and "changed from the package; runs with them will not verify" in rendered_screen()
+        and "changed from the package; runs are reported to your instructor" in rendered_screen()
         and "Runs in    lab.test-cases/files (2 files)" in rendered_screen(),
         "Run all PASS with the touched fixtures",
     )
@@ -399,14 +399,16 @@ try:
     time.sleep(0.3)
 
     # A changed fixture tree shows in the picker before a run, still runs,
-    # and the student sees why its result will not verify.
+    # and the student sees that the run won't match the package's case and is
+    # reported to the instructor.
     (files / "data.txt").write_bytes(b"student edit\n")
     offset = len(transcript)
     send(b"\x1b[14~")
     wait_for(
         lambda: " TEST CASES " in rendered_screen()
         and "Arguments  «-i» «two words»" in rendered_screen()
-        and "changed from the package; a run with them will not verify" in rendered_screen(),
+        and "changed from the package; a run is reported to your instructor" in rendered_screen()
+        and "and won't match the package's case" in rendered_screen(),
         "picker reopened on echo with the changed-fixtures warning",
     )
     send(b"\r")
@@ -419,7 +421,7 @@ try:
         and 'got (17 bytes) "data=student edit"' in rendered_screen()
         and "● warning" in toast_text_since(offset)
         and "warning: the files in lab.test-cases/files differ from the assignment package; "
-        "the case runs with them as they are and will not verify against the package"
+        "the case runs with them as they are; the run won't match the package's case, and it is reported to your instructor"
         in toast_text_since(offset),
         "changed-fixture warning and FAIL",
     )

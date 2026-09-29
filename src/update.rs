@@ -18,6 +18,9 @@ mod test_home;
 
 const DAY: u64 = 24 * 60 * 60;
 const CURL_RESERVE: Duration = Duration::from_millis(50);
+/// Cargo can fetch the release without the git command, but the build then
+/// cannot record which release commit it is.
+const GIT_REQUIRED: &str = "Rustrace needs Git to record which release it is: install Git (sudo apt install git on Debian/Ubuntu, xcode-select --install on macOS), then run rustrace update again.";
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -617,11 +620,14 @@ struct ReleaseFormats {
     assignment_format: u64,
 }
 
+/// Checks the installed binary's version, target and formats against the
+/// release. Returns the build commit it reports when that is not the
+/// release's commit, which leaves the binary usable but unidentified.
 fn validate_installed(
     path: &Path,
     latest: &ReleaseIdentity,
     formats: &ReleaseFormats,
-) -> io::Result<()> {
+) -> io::Result<Option<String>> {
     let result = std::process::Command::new(path)
         .args(["--version", "--verbose"])
         .output()?;
@@ -648,7 +654,28 @@ fn validate_installed(
             "version, target or format metadata differs from the release",
         ));
     }
-    Ok(())
+    let commit = format!("build commit: {}", latest.commit);
+    if lines.iter().any(|line| *line == commit) {
+        return Ok(None);
+    }
+    Ok(Some(
+        lines
+            .iter()
+            .find_map(|line| line.strip_prefix("build commit: "))
+            .filter(|reported| !reported.is_empty())
+            .unwrap_or("unknown")
+            .to_owned(),
+    ))
+}
+
+fn git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn active_session() -> bool {
@@ -793,6 +820,11 @@ fn install_update(output: &mut impl Write) -> u8 {
     let Some(formats) = formats else {
         return update_unavailable(output, "release format metadata unavailable");
     };
+    if !git_available() {
+        let _ = writeln!(output, "{GIT_REQUIRED}");
+        let _ = writeln!(output, "Update failed; the previous Rustrace is unchanged.");
+        return 1;
+    }
     let _ = writeln!(
         output,
         "Building {} from source (this takes a few minutes)...",
@@ -828,19 +860,31 @@ fn install_update(output: &mut impl Write) -> u8 {
             return 1;
         }
     }
-    if let Err(error) = validate_installed(&receipt.path, &latest, &formats) {
+    let reported_commit = match validate_installed(&receipt.path, &latest, &formats) {
+        Ok(reported_commit) => reported_commit,
+        Err(error) => {
+            let _ = writeln!(
+                output,
+                "Installed binary validation failed: {}",
+                crate::display::label(&error.to_string(), 1024)
+            );
+            let _ = writeln!(
+                output,
+                "The newly built binary is already installed at {}, but its identity could not be confirmed.",
+                crate::display::label(&receipt.path.to_string_lossy(), 4096)
+            );
+            manual_remedy(output, &latest.tag);
+            return 1;
+        }
+    };
+    if let Some(reported) = reported_commit {
         let _ = writeln!(
             output,
-            "Installed binary validation failed: {}",
-            crate::display::label(&error.to_string(), 1024)
-        );
-        let _ = writeln!(
-            output,
-            "The newly built binary is already installed at {}, but its identity could not be confirmed.",
-            crate::display::label(&receipt.path.to_string_lossy(), 4096)
+            "warning: the installed Rustrace reports build commit {}, not the release commit {}, so work recorded with it is marked as an unidentified build. Check that Git works (git --version), then reinstall:",
+            crate::display::label(&reported, 256),
+            latest.commit
         );
         manual_remedy(output, &latest.tag);
-        return 1;
     }
     receipt.tag.clone_from(&latest.tag);
     receipt.version.clone_from(&latest.version);

@@ -3375,6 +3375,14 @@ fn paste_event_route(
         Event::Paste(_) if !outside_editor && matching_internal => {
             PasteEventRoute::MatchingInternal
         }
+        // A terminal paste while the console, a prompt, a picker, a menu or a
+        // confirmation has focus never reaches the source editor. Recording
+        // it as outside the editor keeps `external_input` for blocked pastes
+        // into the editor itself.
+        Event::Paste(_) if outside_editor => PasteEventRoute::Reject(
+            PasteInputChannel::TerminalBracketed,
+            PasteRejectionReason::OutsideEditor,
+        ),
         Event::Paste(_) => PasteEventRoute::Reject(
             PasteInputChannel::TerminalBracketed,
             PasteRejectionReason::ExternalInput,
@@ -3945,7 +3953,11 @@ format = ["cargo", "fmt"]
             ),
             PasteEventRoute::MatchingInternal,
         );
-        for (outside_editor, matches) in [(false, false), (true, false), (true, true)] {
+        for (outside_editor, matches, reason) in [
+            (false, false, PasteRejectionReason::ExternalInput),
+            (true, false, PasteRejectionReason::OutsideEditor),
+            (true, true, PasteRejectionReason::OutsideEditor),
+        ] {
             assert_eq!(
                 paste_event_route(
                     &Event::Paste("same".into()),
@@ -3953,10 +3965,7 @@ format = ["cargo", "fmt"]
                     matches,
                     PrimaryModifier::Control,
                 ),
-                PasteEventRoute::Reject(
-                    PasteInputChannel::TerminalBracketed,
-                    PasteRejectionReason::ExternalInput,
-                ),
+                PasteEventRoute::Reject(PasteInputChannel::TerminalBracketed, reason),
             );
         }
     }
@@ -6567,7 +6576,7 @@ format = ["cargo", "fmt"]
                 paste_rejection_for_event(&event, true, PrimaryModifier::Control),
                 Some((
                     PasteInputChannel::TerminalBracketed,
-                    PasteRejectionReason::ExternalInput,
+                    PasteRejectionReason::OutsideEditor,
                 ))
             );
             assert_eq!(panel.update(event), FindPanelAction::Continue);
@@ -6621,6 +6630,17 @@ format = ["cargo", "fmt"]
             paste_rejection_for_event(
                 &Event::Paste("blocked".to_owned()),
                 true,
+                crate::config::PrimaryModifier::Control,
+            ),
+            Some((
+                PasteInputChannel::TerminalBracketed,
+                PasteRejectionReason::OutsideEditor,
+            ))
+        );
+        assert_eq!(
+            paste_rejection_for_event(
+                &Event::Paste("blocked".to_owned()),
+                false,
                 crate::config::PrimaryModifier::Control,
             ),
             Some((

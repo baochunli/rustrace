@@ -2,9 +2,10 @@
 #[path = "support/test_home.rs"]
 mod test_home;
 use rustrace::review_flags::{
-    LARGE_SINGLE_INSERTION_BYTES, SUSTAINED_HIGH_RATE_CHARACTERS_PER_SECOND,
-    SUSTAINED_HIGH_RATE_WINDOW_MILLIS, UNIFORM_KEY_TIMING_COEFFICIENT_OF_VARIATION,
-    UNIFORM_KEY_TIMING_TRANSACTIONS,
+    AdvisoryFlagKind, LARGE_SINGLE_INSERTION_BYTES, RELEASED_BUILD_COMMIT_HEX_DIGITS,
+    SUSTAINED_HIGH_RATE_CHARACTERS_PER_SECOND, SUSTAINED_HIGH_RATE_WINDOW_MILLIS,
+    TYPED_AFTER_REJECTED_PASTE_BURST_MILLIS, TYPED_AFTER_REJECTED_PASTE_CHARACTERS,
+    TYPED_AFTER_REJECTED_PASTE_WINDOW_MILLIS,
 };
 use std::{fs, path::PathBuf};
 
@@ -124,7 +125,8 @@ fn student_guide_explains_what_the_picker_shows_for_version_3_cases() {
         "each between `«` and `»`",
         "appear as escapes such as `\\u{202e}`",
         "`no input (stdin closed)`",
-        "`changed from the package; a run with them will not verify`",
+        "`changed from the package; a run is reported to your instructor`, followed by `and won't match the package's case`",
+        "A case run with changed files still runs, but the run won't match the package's case, and it is reported to your instructor.",
         "Do not edit, add, or remove files in the fixture folder",
         "The console's `cargo run` already starts in the same folder as the case.",
         "`cargo run -- -n fn tests/grep.md < grep_n.in`",
@@ -407,12 +409,54 @@ fn files_panel_context_menu_is_the_documented_file_management_route() {
 }
 
 #[test]
-fn typing_shape_advisory_thresholds_are_stable() {
+fn advisory_thresholds_are_stable() {
     assert_eq!(LARGE_SINGLE_INSERTION_BYTES, 200);
-    assert_eq!(UNIFORM_KEY_TIMING_TRANSACTIONS, 60);
-    assert_eq!(UNIFORM_KEY_TIMING_COEFFICIENT_OF_VARIATION, 0.15);
     assert_eq!(SUSTAINED_HIGH_RATE_CHARACTERS_PER_SECOND, 15);
     assert_eq!(SUSTAINED_HIGH_RATE_WINDOW_MILLIS, 60_000);
+    assert_eq!(TYPED_AFTER_REJECTED_PASTE_CHARACTERS, 200);
+    assert_eq!(TYPED_AFTER_REJECTED_PASTE_BURST_MILLIS, 60_000);
+    assert_eq!(TYPED_AFTER_REJECTED_PASTE_WINDOW_MILLIS, 300_000);
+    assert_eq!(RELEASED_BUILD_COMMIT_HEX_DIGITS, 40);
+}
+
+/// Advisories are for instructors: students run plain `verify`, which
+/// reports validity only, so the student documents never describe them.
+#[test]
+fn student_documents_describe_verify_as_validity_only_without_advisories() {
+    let guide = unwrapped(&read_doc("student-guide.md"));
+    assert!(
+        guide.contains(
+            "`rustrace verify` checks that a ZIP validates: its structure, recorded history, checkpoints, replay, and submitted source. It prints those checks, a few recorded counts such as test-case runs, and a closing note on what the checks cannot show."
+        ),
+        "student guide must describe plain verify as validity only"
+    );
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for path in [
+        docs_dir().join("student-guide.md"),
+        docs_dir().join("installation.md"),
+        docs_dir().join("configuration.md"),
+        docs_dir().join("privacy.md"),
+        root.join("README.md"),
+    ] {
+        let text =
+            fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        for name in AdvisoryFlagKind::ALL
+            .map(AdvisoryFlagKind::name)
+            .into_iter()
+            .chain(["UNIFORM_KEY_TIMING"])
+        {
+            assert!(
+                !text.contains(name),
+                "{} mentions the advisory {name}",
+                path.display()
+            );
+        }
+        assert!(
+            !text.contains("expect false positives"),
+            "{} quotes advisory wording",
+            path.display()
+        );
+    }
 }
 
 const MANIFEST: &[u8] = br#"format_version = 1

@@ -1,10 +1,14 @@
+#[path = "support/client_advisory.rs"]
+mod client_advisory;
 #[path = "support/test_home.rs"]
 mod test_home;
 use rustrace::{
     cargo_policy::CargoAction,
     process_indicators::{INDICATOR_EXPLANATION, display_process_attempt_details},
     replay_tui::ReplayController,
-    review_flags::{AdvisoryFlagKind, EVIDENCE_LIMITATIONS_BATCH},
+    review_flags::{
+        AdvisoryFlagKind, EVIDENCE_LIMITATIONS_BATCH, TYPED_AFTER_REJECTED_PASTE_CHARACTERS,
+    },
     session::{ProductionSession, create_bundle},
     tui::EditorCommand,
 };
@@ -540,12 +544,19 @@ fn scan_advisory_golden_appends_csv_column_without_changing_priority_or_hard_fla
     let fixture = Fixture::new("scan-advisory");
     let bundle = fixture.advisory_bundle("advisory.zip");
     let report = rustrace::verify::verify_path(&bundle, None);
-    assert_eq!(report.advisories.len(), 1, "{:#?}", report.advisories);
+    let expected = client_advisory::with_client_advisory(&[AdvisoryFlagKind::LargeSingleInsertion]);
     assert_eq!(
-        report.advisories[0].kind,
-        AdvisoryFlagKind::LargeSingleInsertion
+        report
+            .advisories
+            .iter()
+            .map(|advisory| advisory.kind)
+            .collect::<Vec<_>>(),
+        expected,
+        "{:#?}",
+        report.advisories
     );
     assert!(report.is_clean(), "{report:#?}");
+    let column = client_advisory::scan_advisory_column(&expected);
 
     let csv = fixture.root.join("advisory.csv");
     let output = run_scan(&fixture.submissions, None, &csv);
@@ -554,7 +565,7 @@ fn scan_advisory_golden_appends_csv_column_without_changing_priority_or_hard_fla
     assert!(row(&terminal, "advisory.zip").contains("Normal"));
     assert!(row(&terminal, "advisory.zip").contains("No review flags"));
     assert!(
-        terminal.contains("  Advisories: LARGE_SINGLE_INSERTION: 1"),
+        terminal.contains(&format!("  Advisories: {column}\n")),
         "{terminal}"
     );
 
@@ -566,7 +577,118 @@ fn scan_advisory_golden_appends_csv_column_without_changing_priority_or_hard_fla
         .lines()
         .find(|line| line.starts_with("advisory.zip,"))
         .unwrap();
-    assert!(row.ends_with(",LARGE_SINGLE_INSERTION: 1"), "{row}");
+    assert!(row.ends_with(&format!(",{column}")), "{row}");
+}
+
+#[test]
+fn scan_and_verify_reference_report_blocked_pastes_and_typing_after_them() {
+    let test_home = test_home::TestHome::new(false);
+    let fixture = Fixture::new("scan-rejected-paste");
+    let mut session = fixture.start_session();
+    assert!(
+        session
+            .execute(EditorCommand::PasteExternal("outside text".to_owned()))
+            .is_err(),
+        "outside text must be refused"
+    );
+    for _ in 0..TYPED_AFTER_REJECTED_PASTE_CHARACTERS {
+        session.execute(EditorCommand::Insert('x')).unwrap();
+    }
+    assert!(
+        session
+            .execute(EditorCommand::PasteExternal("more outside text".to_owned()))
+            .is_err()
+    );
+    let receipt = session.finalize("student-1").unwrap();
+    let bundle = create_bundle(&receipt, &fixture.submissions.join("pasted.zip"))
+        .unwrap()
+        .path;
+
+    let report = rustrace::verify::verify_path(&bundle, None);
+    assert!(report.is_clean(), "{report:#?}");
+    let expected = client_advisory::with_client_advisory(&[
+        AdvisoryFlagKind::RejectedPasteAttempts,
+        AdvisoryFlagKind::TypedAfterRejectedPaste,
+    ]);
+    assert_eq!(
+        report
+            .advisories
+            .iter()
+            .map(|advisory| advisory.kind)
+            .collect::<Vec<_>>(),
+        expected,
+        "{:#?}",
+        report.advisories
+    );
+    let rejected = &report.advisories[expected.len() - 2];
+    assert_eq!(rejected.measured_value, "2 blocked pastes into the editor");
+    assert_eq!(Some(rejected.link), report.first_rejected_paste_attempt);
+    let typed = &report.advisories[expected.len() - 1];
+    assert_eq!(typed.link, rejected.link);
+    assert_eq!(
+        typed.measured_value,
+        "200 characters in one 60-second window within 300 seconds after it; qualifying blocked pastes: 1 of 2"
+    );
+
+    // Scan lists the kinds without a reference.
+    let csv = fixture.root.join("pasted.csv");
+    let output = run_scan(&fixture.submissions, None, &csv);
+    assert!(output.status.success());
+    let terminal = String::from_utf8(output.stdout).unwrap();
+    let column = client_advisory::scan_advisory_column(&expected);
+    assert!(
+        column.contains("REJECTED_PASTE_ATTEMPTS: 1; TYPED_AFTER_REJECTED_PASTE: 1"),
+        "{column}"
+    );
+    assert!(
+        row(&terminal, "pasted.zip").contains("Normal"),
+        "{terminal}"
+    );
+    assert!(
+        terminal.contains(&format!("  Advisories: {column}\n")),
+        "{terminal}"
+    );
+    let csv = fs::read_to_string(csv).unwrap();
+    let csv_row = csv
+        .lines()
+        .find(|line| line.starts_with("pasted.zip,"))
+        .unwrap();
+    assert!(csv_row.ends_with(&format!(",{column}")), "{csv_row}");
+
+    // `verify --reference` prints each advisory; plain `verify` prints none.
+    let reference = fixture.reference();
+    let verify = |reference: Option<&Path>| {
+        let mut command = test_home.command(env!("CARGO_BIN_EXE_rustrace"));
+        command.arg("verify").arg(&bundle);
+        if let Some(reference) = reference {
+            command.arg("--reference").arg(reference);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let instructor = verify(Some(&reference));
+    assert!(
+        instructor.contains("Assignment reference     OK"),
+        "{instructor}"
+    );
+    for advisory in &report.advisories {
+        assert!(
+            instructor.contains(&format!(
+                "Advisory: {}\n",
+                rustrace::review_flags::display_advisory(advisory)
+            )),
+            "{instructor}"
+        );
+    }
+    let student = verify(None);
+    assert!(
+        !student.to_ascii_lowercase().contains("advisor"),
+        "{student}"
+    );
+    for kind in AdvisoryFlagKind::ALL {
+        assert!(!student.contains(kind.name()), "{student}");
+    }
 }
 
 #[test]

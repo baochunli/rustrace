@@ -5,9 +5,10 @@
 #![cfg(unix)]
 
 use rustrace::{
+    review_flags::AdvisoryFlagKind,
     session::{ConsoleStart, ProductionSession, TestCaseOutcome, create_bundle},
     verify::{
-        AssignmentReferenceStatus, TestCaseEvidenceStatus, VerificationIssueKind, verify_path,
+        AssignmentReferenceStatus, TestCaseEvidenceStatus, VerificationEventLocation, verify_path,
     },
 };
 use rustrace_model::{Hash, rprov_raw_blake3, test_case_args_blake3};
@@ -401,7 +402,7 @@ fn format3_runner_child() {
     assert_eq!(
         warning.as_deref(),
         Some(
-            "warning: the files in lab.test-cases/files differ from the assignment package; the case runs with them as they are and will not verify against the package. To restore them, remove the files you changed or added, then quit and resume the workspace"
+            "warning: the files in lab.test-cases/files differ from the assignment package; the case runs with them as they are; the run won't match the package's case, and it is reported to your instructor. To restore them, remove the files you changed or added, then quit and resume the workspace"
         )
     );
     assert_eq!(
@@ -593,23 +594,52 @@ fn format3_runner_child() {
         "the restored tree matches the package again"
     );
 
-    // The evidence replays; only the changed-tree case fails the reference.
+    // The evidence replays and matches the package. The one run with the
+    // changed tree is the student's local change: it is not
+    // reference-verified, and the instructor sees one advisory linked to it.
     let recorded = verify_path(&bundle, None);
     assert!(recorded.is_clean(), "{recorded:#?}");
     let report = verify_path(&bundle, Some(&reference));
+    assert!(report.is_clean(), "{report:#?}");
     assert_eq!(
         report.assignment_reference,
-        AssignmentReferenceStatus::Mismatch,
+        AssignmentReferenceStatus::Ok,
         "{report:#?}"
     );
     assert_eq!(
         report.test_case_evidence,
         Some(TestCaseEvidenceStatus::Recorded)
     );
-    assert!(report.issues.iter().any(|issue| {
-        issue.kind == VerificationIssueKind::AssignmentReference
-            && issue.detail == "fixture tree mismatch for test case no-input"
-    }));
+    let changed_run = events
+        .iter()
+        .filter(|event| event["event"]["type"] == "test_case_compared")
+        .nth(3)
+        .unwrap()["sequence"]
+        .as_u64()
+        .unwrap();
+    let modified = report
+        .advisories
+        .iter()
+        .filter(|advisory| advisory.kind == AdvisoryFlagKind::TestFilesModified)
+        .collect::<Vec<_>>();
+    assert_eq!(modified.len(), 1, "{:#?}", report.advisories);
+    assert_eq!(
+        modified[0].link,
+        VerificationEventLocation {
+            segment: 1,
+            sequence: changed_run,
+        }
+    );
+    assert_eq!(
+        modified[0].measured_value,
+        "1 run with changed test files; first: fixture tree mismatch for test case no-input"
+    );
+    assert!(
+        !recorded
+            .advisories
+            .iter()
+            .any(|advisory| advisory.kind == AdvisoryFlagKind::TestFilesModified)
+    );
 }
 
 #[test]

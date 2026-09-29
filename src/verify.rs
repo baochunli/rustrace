@@ -4,8 +4,8 @@ use crate::{
     console::{TestCase, TestCaseOutcome, compare_test_case_bytes},
     process_indicators::{AttemptIndicatorAccumulator, ReviewIndicators, merge_factual},
     review_flags::{
-        AdvisoryFlag, EVIDENCE_LIMITATION_FIRST, EVIDENCE_LIMITATION_SECOND,
-        TypingShapeAccumulator, display_advisory, evidence_statement,
+        AdvisoryAccumulator, AdvisoryFlag, EVIDENCE_LIMITATION_FIRST, EVIDENCE_LIMITATION_SECOND,
+        display_advisory, evidence_statement, test_files_modified,
     },
     session::hash_imported_outer_source,
     toolchain::RuntimeToolchainMetadata,
@@ -116,6 +116,10 @@ pub struct VerificationReport {
     pub test_case_mismatches: Option<u64>,
     pub test_case_errors: Option<u64>,
     pub test_case_evidence: Option<TestCaseEvidenceStatus>,
+    /// With a v2 or v3 reference, the recorded runs of cases the package does
+    /// not have. They are neither checked nor flagged, and any keeps the
+    /// evidence recorded (unverified). `None` without that reference check.
+    pub test_case_runs_not_in_package: Option<u64>,
     pub first_failing_case: Option<TestCaseFailure>,
     pub external_changes: Option<u64>,
     pub unknown_edit_origins: Option<u64>,
@@ -150,6 +154,7 @@ impl VerificationReport {
             test_case_mismatches: None,
             test_case_errors: None,
             test_case_evidence: None,
+            test_case_runs_not_in_package: None,
             first_failing_case: None,
             external_changes: None,
             unknown_edit_origins: None,
@@ -348,7 +353,7 @@ pub(crate) fn validate_replay_input(
         .as_ref()
         .filter(|_| report.assignment_reference == AssignmentReferenceStatus::Ok);
     match replay_segments(&package, &starter, authenticated_reference) {
-        Ok(facts) => {
+        Ok(mut facts) => {
             report.checkpoint_hashes = VerificationStatus::Ok;
             report.replay = VerificationStatus::Ok;
             report.test_case_runs = Some(facts.test_case_runs);
@@ -357,6 +362,8 @@ pub(crate) fn validate_replay_input(
             report.test_case_errors = Some(facts.test_case_errors);
             report.test_case_evidence = Some(TestCaseEvidenceStatus::Recorded);
             report.first_failing_case = facts.first_failing_case.clone();
+            // The replay's advisories first; the reference adds its own.
+            report.advisories = std::mem::take(&mut facts.advisories);
             authenticate_test_case_reference(assignment_reference.as_ref(), &facts, &mut report);
             let indicators = facts.review_indicators;
             report.external_changes = Some(indicators.factual.rejected_external_change.attempts);
@@ -409,7 +416,6 @@ pub(crate) fn validate_replay_input(
                         }),
                     ),
                 };
-            report.advisories = facts.advisories;
         }
         Err(error) => report.fail(error.kind, error.location, error.detail),
     }
@@ -634,6 +640,8 @@ struct ReplayFacts {
 
 /// The packaged-case identity one recorded comparison claims.
 struct RecordedComparison {
+    /// The `TestCaseCompared` event.
+    location: VerificationEventLocation,
     case: String,
     expected_blake3: Hash,
     invocation: Option<TestCaseInvocation>,
@@ -721,7 +729,8 @@ fn replay_segments(
     for (index, segment) in package.manifest().segments.iter().enumerate() {
         let mut indicators =
             AttemptIndicatorAccumulator::new(segment.ordinal, segment.session_id.clone());
-        let mut advisories = TypingShapeAccumulator::new(segment.ordinal);
+        let mut advisories = AdvisoryAccumulator::new(segment.ordinal);
+        advisories.observe_producer(&segment.producer);
         let initial_ref = segment
             .checkpoints
             .first()
@@ -838,6 +847,10 @@ fn replay_segments(
             if let Event::TestCaseCompared(comparison) = &envelope.event {
                 facts.test_case_runs = facts.test_case_runs.saturating_add(1);
                 facts.comparisons.push(RecordedComparison {
+                    location: VerificationEventLocation {
+                        segment: segment.ordinal,
+                        sequence: envelope.sequence,
+                    },
                     case: comparison.case.clone(),
                     expected_blake3: comparison.expected_blake3,
                     invocation: comparison.invocation.clone(),
@@ -1163,6 +1176,13 @@ fn compare_reference(
     Some(reference)
 }
 
+/// Checks every recorded comparison against the reference package. Evidence
+/// that contradicts the package's format or working directory fails the
+/// reference. A run of a packaged case whose expected output, arguments,
+/// standard input or fixture tree differs from the package is the student's
+/// local change: it is reported as one `TEST_FILES_MODIFIED` advisory per
+/// attempt and leaves the evidence unverified. Runs of cases that the package
+/// does not have are neither flagged nor verified.
 fn authenticate_test_case_reference(
     reference: Option<&AssignmentReference>,
     facts: &ReplayFacts,
@@ -1177,48 +1197,104 @@ fn authenticate_test_case_reference(
     {
         return;
     }
+    // Per attempt: the number of runs with changed files, and the first one.
+    let mut modified = BTreeMap::<u32, (u64, VerificationEventLocation, String)>::new();
+    let mut unpackaged_runs = 0_u64;
     for recorded in &facts.comparisons {
-        if let Some(detail) = reference_case_mismatch(reference, recorded) {
-            report.fail(
-                VerificationIssueKind::AssignmentReference,
-                VerificationIssueLocation::Decoder("assignment reference".to_owned()),
-                detail,
-            );
-            return;
+        match check_reference_case(reference, recorded) {
+            ReferenceCaseCheck::Matches => {}
+            ReferenceCaseCheck::NotPackaged => unpackaged_runs += 1,
+            ReferenceCaseCheck::FilesChanged(reason) => {
+                modified
+                    .entry(recorded.location.segment)
+                    .and_modify(|(runs, _, _)| *runs += 1)
+                    .or_insert((1, recorded.location, reason));
+            }
+            ReferenceCaseCheck::Inconsistent(detail) => {
+                report.fail(
+                    VerificationIssueKind::AssignmentReference,
+                    VerificationIssueLocation::Event(recorded.location),
+                    detail,
+                );
+                return;
+            }
         }
     }
-    report.test_case_evidence = Some(TestCaseEvidenceStatus::ReferenceVerified);
+    report.test_case_runs_not_in_package = Some(unpackaged_runs);
+    if modified.is_empty() && unpackaged_runs == 0 {
+        report.test_case_evidence = Some(TestCaseEvidenceStatus::ReferenceVerified);
+    }
+    if !modified.is_empty() {
+        report.advisories.extend(
+            modified
+                .into_values()
+                .map(|(runs, first, reason)| test_files_modified(first, runs, &reason)),
+        );
+        // Keep each attempt's advisories together, in attempt order.
+        report
+            .advisories
+            .sort_by_key(|advisory| advisory.link.segment);
+    }
+}
+
+/// How one recorded comparison relates to the reference package.
+enum ReferenceCaseCheck {
+    /// The run used the packaged case's files.
+    Matches,
+    /// The package has no case with this name, so there is nothing to check.
+    NotPackaged,
+    /// The run used a packaged case whose files differ from the package.
+    FilesChanged(String),
+    /// The evidence does not fit the package: a hard reference failure.
+    Inconsistent(String),
 }
 
 /// Compares one recorded comparison with its packaged case. Format 2 checks
 /// the expected output. Format 3 also checks the program arguments, the stdin
 /// source and its bytes, and the fixture tree the Run used.
-fn reference_case_mismatch(
+fn check_reference_case(
     reference: &AssignmentReference,
     recorded: &RecordedComparison,
-) -> Option<String> {
+) -> ReferenceCaseCheck {
     let case = &recorded.case;
-    let packaged = reference
-        .test_case_expected
-        .get(case)
-        .filter(|packaged| packaged.blake3 == recorded.expected_blake3);
-    let Some(packaged) = packaged else {
-        return Some(format!(
-            "expected output hash mismatch for test case {case}"
-        ));
+    let format_3 = reference.manifest.format_version == 3;
+    let invocation = match (&recorded.invocation, format_3) {
+        (Some(_), false) => {
+            return ReferenceCaseCheck::Inconsistent(format!(
+                "test case {case} records format 3 invocation evidence for a format 2 suite"
+            ));
+        }
+        (None, true) => {
+            return ReferenceCaseCheck::Inconsistent(format!(
+                "test case {case} lacks the arguments, input, and fixture evidence of a format 3 suite"
+            ));
+        }
+        (invocation, _) => invocation.as_ref(),
     };
-    if reference.manifest.format_version != 3 {
-        return recorded.invocation.is_some().then(|| {
-            format!("test case {case} records format 3 invocation evidence for a format 2 suite")
-        });
-    }
-    let Some(invocation) = &recorded.invocation else {
-        return Some(format!(
-            "test case {case} lacks the arguments, input, and fixture evidence of a format 3 suite"
+    // Every format 3 Run of a package with a fixture tree starts in it, and
+    // no other Run does; the choice follows the package, not the disk.
+    if let Some(invocation) = invocation
+        && invocation.fixtures_blake3.is_some() != reference.fixtures_blake3.is_some()
+    {
+        return ReferenceCaseCheck::Inconsistent(format!(
+            "test case {case} records a working directory that does not match the package's fixture tree"
         ));
+    }
+    let Some(packaged) = reference.test_case_expected.get(case) else {
+        return ReferenceCaseCheck::NotPackaged;
+    };
+    if packaged.blake3 != recorded.expected_blake3 {
+        return ReferenceCaseCheck::FilesChanged(format!(
+            "expected output mismatch for test case {case}"
+        ));
+    }
+    let Some(invocation) = invocation else {
+        return ReferenceCaseCheck::Matches;
     };
     if invocation.args_blake3 != packaged.args_blake3 {
-        return Some(format!("program arguments mismatch for test case {case}"));
+        return ReferenceCaseCheck::FilesChanged(format!(
+            "program arguments mismatch for test case {case}"
+        ));
     }
     let input_matches = match (&invocation.stdin, packaged.input_blake3) {
         (TestCaseStdin::Closed, None) => true,
@@ -1226,12 +1302,16 @@ fn reference_case_mismatch(
         _ => false,
     };
     if !input_matches {
-        return Some(format!("standard input mismatch for test case {case}"));
+        return ReferenceCaseCheck::FilesChanged(format!(
+            "standard input mismatch for test case {case}"
+        ));
     }
     if invocation.fixtures_blake3 != reference.fixtures_blake3 {
-        return Some(format!("fixture tree mismatch for test case {case}"));
+        return ReferenceCaseCheck::FilesChanged(format!(
+            "fixture tree mismatch for test case {case}"
+        ));
     }
-    None
+    ReferenceCaseCheck::Matches
 }
 
 fn read_assignment_reference(path: &Path) -> Result<AssignmentReference, String> {
@@ -1420,9 +1500,13 @@ pub fn run_verify(args: &[String], output: &mut impl Write) -> Result<u8, String
         status(report.checkpoint_hashes),
     )?;
     write_remainder(output, &report, reference)?;
-    for advisory in &report.advisories {
-        writeln!(output, "Advisory: {}", display_advisory(advisory))
-            .map_err(|error| error.to_string())?;
+    // Advisories are for instructors, who verify against the assignment
+    // package. Students run plain `verify`, which reports validity only.
+    if reference.is_some() {
+        for advisory in &report.advisories {
+            writeln!(output, "Advisory: {}", display_advisory(advisory))
+                .map_err(|error| error.to_string())?;
+        }
     }
     write_evidence_limitations(output, &report)?;
     Ok(report.exit_code())
@@ -1505,6 +1589,19 @@ fn write_remainder(
             None => "unavailable",
         },
     )?;
+    // A neutral count, so the unverified evidence above is explained when
+    // the only cause is cases the student added.
+    if reference.is_some()
+        && let Some(runs) = report
+            .test_case_runs_not_in_package
+            .filter(|runs| *runs > 0)
+    {
+        write_row(
+            output,
+            "Runs not in the package",
+            &format!("{runs} (not checked)"),
+        )?;
+    }
     let first_failure = match &report.first_failing_case {
         Some(failure) => failure.line.map_or_else(
             || failure.case.clone(),

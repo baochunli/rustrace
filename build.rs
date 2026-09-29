@@ -22,7 +22,8 @@ fn main() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_else(|| "source-archive-commit-unavailable".to_owned());
     let dirty = Command::new("git")
-        .args(["diff", "--quiet"])
+        // Against HEAD, so staged changes also count as modified.
+        .args(["diff", "--quiet", "HEAD"])
         .status()
         .map(|s| !s.success())
         .unwrap_or(true);

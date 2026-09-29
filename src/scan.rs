@@ -65,6 +65,9 @@ struct ScanRow {
     test_case_mismatches: String,
     test_case_errors: String,
     test_case_evidence: &'static str,
+    /// With a reference: runs of cases the package does not have, shown only
+    /// in the terminal next to the evidence status they explain.
+    test_case_runs_not_in_package: Option<u64>,
     first_failing_case: String,
     first_failing_line: String,
     review_flags: String,
@@ -445,6 +448,9 @@ impl ScanRow {
             test_case_mismatches: scan_count(report.test_case_mismatches),
             test_case_errors: scan_count(report.test_case_errors),
             test_case_evidence,
+            test_case_runs_not_in_package: report
+                .test_case_runs_not_in_package
+                .filter(|runs| *runs > 0),
             first_failing_case,
             first_failing_line,
             review_flags,
@@ -554,9 +560,12 @@ fn write_terminal_row(output: &mut impl Write, row: &ScanRow) -> Result<(), Stri
     } else {
         format!("{} line={}", row.first_failing_case, row.first_failing_line)
     };
+    let not_in_package = row
+        .test_case_runs_not_in_package
+        .map_or_else(String::new, |runs| format!(" not-in-package={runs}"));
     writeln!(
         output,
-        "  Test cases: runs={} passes={} mismatches={} errors={} evidence={} first={}",
+        "  Test cases: runs={} passes={} mismatches={} errors={} evidence={}{not_in_package} first={}",
         row.test_case_runs,
         row.test_case_passes,
         row.test_case_mismatches,

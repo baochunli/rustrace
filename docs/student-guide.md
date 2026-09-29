@@ -224,7 +224,9 @@ curl -fsSL https://raw.githubusercontent.com/baochunli/rustrace/main/scripts/ins
 
 Install rustup from <https://rustup.rs/> first (version 1.28.1 or newer), plus
 native compiler/linker tools: Xcode Command Line Tools on macOS or
-`build-essential` on Debian/Ubuntu. The installer requires curl and Git. It
+`build-essential` on Debian/Ubuntu. The installer requires curl and Git: the
+build records which release it is, and without Git it cannot, so the installer
+stops and asks you to install Git (`sudo apt install git` on Debian/Ubuntu). It
 builds the latest release from source with Rust 1.98.1; this takes a few minutes.
 If that toolchain is missing, it installs the minimal profile with clippy and
 rustfmt. It never installs rustup or changes your default toolchain. Open a
@@ -243,7 +245,7 @@ cargo +1.98.1 install --git https://github.com/baochunli/rustrace --tag vX.Y.Z r
 
 Replace `vX.Y.Z` with the latest release tag from
 [GitHub Releases](https://github.com/baochunli/rustrace/releases), and install Rust
-1.98.1 first. From a checkout of that tag, run `cargo install --path . --locked`
+1.98.1 and Git first. From a checkout of that tag, run `cargo install --path . --locked`
 at the repository root. The root package ships only the `rustrace` binary, so
 neither command needs `--bin`. The Git form names the package because the
 repository also contains executable fixture manifests. See the
@@ -960,10 +962,14 @@ never included in workspace hashes, checkpoints, or the submitted source tree.
 For a version 2 package, provenance retains one hash of the validated packaged
 suite plus the per-run comparison fields above, so an instructor reference can
 be checked without trusting the mutable sibling. Editing the live copies
-happens outside Rustrace.
+happens outside Rustrace. Do not edit a packaged case's files: a run of a
+case whose `.expected` you changed (in a version 3 package, also its `.in`,
+`.args`, or fixture files) won't match the package's case, and it is reported
+to your instructor.
 
-Pasting into the console or test-case picker is blocked and recorded the same
-way as in the editor. The record shows only what happened inside Rustrace; it
+Pasting into the console or test-case picker is blocked and recorded, like a
+blocked paste in the editor; from Rustrace 0.1.8 the record says the paste was
+outside the editor. The record shows only what happened inside Rustrace; it
 cannot show how files you produced elsewhere were made.
 
 ### Version 3 cases in the picker
@@ -1018,14 +1024,15 @@ than an ordinary file, or when `NAME.in` is larger than 1 MiB. It appears under
 folder, or `files/`. Running such a case reports `ERROR (could not start: ...)`.
 
 If the files in the folder differ from the package, a yellow row under
-**Runs in** says `changed from the package; a run with them will not verify`,
-so you see it before you run a case. The picker reads the folder when it opens,
-when you press R, and when it reopens after a run, so it also reports files
-that your own program created or changed there. Do not edit, add, or remove
-files in the fixture folder: the cases' expected output was written for the
-packaged files, and a case run with changed files still runs but will not
-verify against the package. To restore the files, remove the files you changed
-or added, then quit and resume the workspace.
+**Runs in** says `changed from the package; a run is reported to your
+instructor`, followed by `and won't match the package's case`, so you see it
+before you run a case. The picker reads the folder when it opens, when you
+press R, and when it reopens after a run, so it also reports files that your
+own program created or changed there. Do not edit, add, or remove files in the
+fixture folder: the cases' expected output was written for the packaged files.
+A case run with changed files still runs, but the run won't match the
+package's case, and it is reported to your instructor. To restore the files,
+remove the files you changed or added, then quit and resume the workspace.
 
 The list keeps about two fifths of the picker and at least three rows, and
 scrolls when there are more cases; the details use the rest, which is about
@@ -1073,7 +1080,8 @@ locked: Cargo builds first, and a file changed during the build or the run is
 used as it is then. Do not edit the folder while a Run starts or runs. If you
 changed, added, or removed a file there, the
 program still runs with the files as they are, and a warning says so; a
-picker case run this way will not verify against the package. To restore the
+picker case run this way won't match the package's case, and it is reported to
+your instructor. To restore the
 packaged files, remove the files you changed or added, then quit and resume the
 workspace, which puts back any missing packaged file. If `files/` itself is
 missing, the Run is refused until you resume. A `.cargo` folder or file in the
@@ -1204,6 +1212,11 @@ rustrace revise lab1.work lab1-corrected.work lab1.rta
 rustrace submit lab1-corrected.work --student-id actual_utorid --output actual_utorid-lab1-corrected.zip
 rustrace verify actual_utorid-lab1-corrected.zip
 ```
+
+`rustrace verify` checks that a ZIP validates: its structure, recorded history,
+checkpoints, replay, and submitted source. It prints those checks, a few
+recorded counts such as test-case runs, and a closing note on what the checks
+cannot show.
 
 The new ZIP records the corrected ID and includes the complete recorded history.
 The original workspace, receipt, and ZIP retain their original ID. You cannot

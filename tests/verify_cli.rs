@@ -1,3 +1,5 @@
+#[path = "support/client_advisory.rs"]
+mod client_advisory;
 #[path = "support/test_home.rs"]
 mod test_home;
 use rustrace::{
@@ -559,14 +561,11 @@ fn verify_cli_accepts_production_zip_and_standalone_without_opening_the_tui() {
 }
 
 #[test]
-fn verify_advisory_golden_keeps_consistent_exit_zero_and_prints_before_evidence() {
+fn verify_prints_advisories_only_with_a_reference_and_keeps_consistent_exit_zero() {
     let test_home = test_home::TestHome::new(false);
     let fixture = Fixture::new("verify-advisory");
-    fs::write(
-        fixture.workspace.join("main.rs"),
-        (0..80).map(|_| "x\n").collect::<String>(),
-    )
-    .unwrap();
+    let starter = (0..80).map(|_| "x\n").collect::<String>();
+    fs::write(fixture.workspace.join("main.rs"), &starter).unwrap();
     let mut session = fixture.start_session();
     session.execute(EditorCommand::SelectAll).unwrap();
     session.execute(EditorCommand::ToggleComment).unwrap();
@@ -574,38 +573,82 @@ fn verify_advisory_golden_keeps_consistent_exit_zero_and_prints_before_evidence(
     let bundle = create_bundle(&receipt, &fixture.base.join("advisory.zip"))
         .unwrap()
         .path;
+    let reference = write_reference(&fixture.base, MANIFEST, starter.as_bytes());
 
-    let report = verify_path(&bundle, None);
+    let report = verify_path(&bundle, Some(&reference));
     assert!(report.is_clean(), "{report:#?}");
+    assert_eq!(report.assignment_reference, AssignmentReferenceStatus::Ok);
     assert_eq!(report.exit_code(), 0);
     assert_eq!(review_flags(&report), vec![]);
-    assert_eq!(report.advisories.len(), 1, "{:#?}", report.advisories);
     assert_eq!(
-        report.advisories[0].kind,
-        AdvisoryFlagKind::LargeSingleInsertion
+        report
+            .advisories
+            .iter()
+            .map(|advisory| advisory.kind)
+            .collect::<Vec<_>>(),
+        client_advisory::with_client_advisory(&[AdvisoryFlagKind::LargeSingleInsertion]),
+        "{:#?}",
+        report.advisories
     );
+    // Advisories are derived whether or not a reference is given; only the
+    // printing differs.
+    assert_eq!(verify_path(&bundle, None).advisories, report.advisories);
 
-    let output = test_home
-        .command(env!("CARGO_BIN_EXE_rustrace"))
-        .arg("verify")
-        .arg(&bundle)
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(0));
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let lines = stdout.lines().collect::<Vec<_>>();
-    let advisory = format!("Advisory: {}", display_advisory(&report.advisories[0]));
-    let advisory_index = lines
+    let run = |reference: Option<&Path>| {
+        let mut command = test_home.command(env!("CARGO_BIN_EXE_rustrace"));
+        command.arg("verify").arg(&bundle);
+        if let Some(reference) = reference {
+            command.arg("--reference").arg(reference);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    // `verify --reference` is the instructor view: each advisory follows the
+    // check rows and precedes the evidence limitations.
+    let instructor = run(Some(&reference));
+    let lines = instructor.lines().collect::<Vec<_>>();
+    let advisory_lines = report
+        .advisories
         .iter()
-        .position(|line| *line == advisory)
-        .unwrap_or_else(|| panic!("missing advisory golden line in {stdout:?}"));
-    assert_eq!(lines[advisory_index - 1], "Unknown edit origins     0");
+        .map(|advisory| format!("Advisory: {}", display_advisory(advisory)))
+        .collect::<Vec<_>>();
+    let first = lines
+        .iter()
+        .position(|line| *line == advisory_lines[0])
+        .unwrap_or_else(|| panic!("missing advisory golden line in {instructor:?}"));
+    assert_eq!(lines[first - 1], "Unknown edit origins     0");
+    assert_eq!(&lines[first..first + advisory_lines.len()], advisory_lines);
     assert_eq!(
-        lines[advisory_index + 1],
+        lines[first + advisory_lines.len()],
         format!(
             "Evidence limitations: {EVIDENCE_CONSISTENCY} {EVIDENCE_LIMITATION_FIRST} {EVIDENCE_LIMITATION_SECOND}"
         )
     );
+
+    // Plain `verify` is what students run: validity only, with no advisory
+    // line, count or wording, and every other line unchanged.
+    let student = run(None);
+    assert!(
+        !student.to_ascii_lowercase().contains("advisor"),
+        "{student}"
+    );
+    assert!(!student.contains("heuristic"), "{student}");
+    assert!(!student.contains("false positives"), "{student}");
+    let expected = lines
+        .iter()
+        .filter(|line| !line.starts_with("Advisory: "))
+        .map(|line| {
+            if *line == "Assignment reference     OK" {
+                "Assignment reference     unverified"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(student.lines().collect::<Vec<_>>(), expected);
 }
 
 #[test]
@@ -938,6 +981,123 @@ fn verify_streams_revised_attempts_and_counts_external_observations() {
         review_flags(&report).is_empty(),
         "a fully retained rejected external change is context, not a hard flag"
     );
+}
+
+#[test]
+fn unofficial_client_is_reported_for_every_attempt_that_records_one() {
+    let test_home = test_home::TestHome::new(false);
+    let fixture = Fixture::new("verify-unofficial-client");
+    let mut parent = fixture.start_session();
+    parent.execute(EditorCommand::Insert('B')).unwrap();
+    let parent_receipt = parent.finalize("student-1").unwrap();
+    let child_root = fixture.base.join("child");
+    fs::create_dir(&child_root).unwrap();
+    for (path, bytes) in parent_receipt.final_workspace() {
+        fs::write(child_root.join(path.as_str()), bytes).unwrap();
+    }
+    let mut child =
+        ProductionSession::start_revision(&fixture.workspace, &child_root, MANIFEST).unwrap();
+    child.execute(EditorCommand::Insert('C')).unwrap();
+    let receipt = child.finalize("student-1").unwrap();
+    let bundle = create_bundle(&receipt, &fixture.base.join("revision.zip"))
+        .unwrap()
+        .path;
+    let original = stored_zip_entry(&fs::read(&bundle).unwrap(), "session.rprov");
+    let reference = write_reference(&fixture.base, MANIFEST, b"A");
+
+    let released = RprovKnown::Known {
+        value: "0123456789abcdef0123456789abcdef01234567;aarch64-apple-darwin".to_owned(),
+    };
+    let dirty = RprovKnown::Known {
+        value: "0123456789abcdef0123456789abcdef01234567-dirty;aarch64-apple-darwin".to_owned(),
+    };
+    let development = RprovKnown::Known {
+        value: "development-build-unavailable".to_owned(),
+    };
+    // The package-level producer copies the last attempt's; only the
+    // per-attempt producers are read, so it is set against them here.
+    for (name, first, second, package, expected) in [
+        ("both-released", &released, &released, &dirty, vec![]),
+        ("first-dirty", &dirty, &released, &released, vec![1]),
+        (
+            "second-development",
+            &released,
+            &development,
+            &released,
+            vec![2],
+        ),
+        (
+            "second-unknown",
+            &released,
+            &RprovKnown::Unknown,
+            &released,
+            vec![2],
+        ),
+        ("both", &dirty, &development, &released, vec![1, 2]),
+    ] {
+        let (mut manifest, payloads) = collect_rprov(&original);
+        assert_eq!(manifest.segments.len(), 2);
+        for (segment, identity) in manifest.segments.iter_mut().zip([first, second]) {
+            segment.producer.client_version = RprovKnown::Known {
+                value: "0.1.8".to_owned(),
+            };
+            segment.producer.build_identity = identity.clone();
+        }
+        manifest.producer.client_version = RprovKnown::Known {
+            value: "0.1.8".to_owned(),
+        };
+        manifest.producer.build_identity = package.clone();
+        let path = fixture.base.join(format!("{name}.rprov"));
+        fs::write(&path, encode_rprov(&manifest, &payloads)).unwrap();
+
+        let report = verify_path(&path, Some(&reference));
+        assert!(report.is_clean(), "{name}: {report:#?}");
+        assert_eq!(report.assignment_reference, AssignmentReferenceStatus::Ok);
+        let unofficial = report
+            .advisories
+            .iter()
+            .filter(|advisory| advisory.kind == AdvisoryFlagKind::UnofficialClient)
+            .map(|advisory| {
+                assert_eq!(advisory.link.sequence, 1, "{name}");
+                advisory.link.segment
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(unofficial, expected, "{name}: {:#?}", report.advisories);
+        assert_eq!(
+            report.advisories.len(),
+            expected.len(),
+            "{name}: {:#?}",
+            report.advisories
+        );
+
+        let run = |reference: Option<&Path>| {
+            let mut command = test_home.command(env!("CARGO_BIN_EXE_rustrace"));
+            command.arg("verify").arg(&path);
+            if let Some(reference) = reference {
+                command.arg("--reference").arg(reference);
+            }
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(0), "{name}: {output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let instructor = run(Some(&reference));
+        assert_eq!(
+            instructor
+                .matches("Advisory: UNOFFICIAL_CLIENT [segment:")
+                .count(),
+            expected.len(),
+            "{name}: {instructor}"
+        );
+        if name == "first-dirty" {
+            assert!(
+                instructor.contains(
+                    "Advisory: UNOFFICIAL_CLIENT [segment:1 seq:1]: the package metadata for this attempt names a client version or build identity other than a clean released build; measured value: client version 0.1.8; build identity 0123456789abcdef0123456789abcdef01234567-dirty;aarch64-apple-darwin; advisory: heuristic; expect false positives\n"
+                ),
+                "{instructor}"
+            );
+        }
+        assert!(!run(None).contains("UNOFFICIAL_CLIENT"), "{name}");
+    }
 }
 
 #[test]
