@@ -76,15 +76,17 @@ pub enum AdvisoryFlagKind {
     RejectedPasteAttempts,
     TypedAfterRejectedPaste,
     UnofficialClient,
+    TestFilesModified,
 }
 
 impl AdvisoryFlagKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::LargeSingleInsertion,
         Self::SustainedHighRate,
         Self::RejectedPasteAttempts,
         Self::TypedAfterRejectedPaste,
         Self::UnofficialClient,
+        Self::TestFilesModified,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -94,6 +96,7 @@ impl AdvisoryFlagKind {
             Self::RejectedPasteAttempts => "REJECTED_PASTE_ATTEMPTS",
             Self::TypedAfterRejectedPaste => "TYPED_AFTER_REJECTED_PASTE",
             Self::UnofficialClient => "UNOFFICIAL_CLIENT",
+            Self::TestFilesModified => "TEST_FILES_MODIFIED",
         }
     }
 
@@ -113,6 +116,9 @@ impl AdvisoryFlagKind {
             }
             Self::UnofficialClient => {
                 "the package metadata for this attempt names a client version or build identity other than a clean released build"
+            }
+            Self::TestFilesModified => {
+                "the record contains a run of a packaged test case whose expected output, arguments, input, or fixture files differ from the reference package"
             }
         }
     }
@@ -412,6 +418,26 @@ impl AdvisoryAccumulator {
             });
         }
         self.advisories
+    }
+}
+
+/// The `TEST_FILES_MODIFIED` advisory for one attempt: `runs` recorded runs
+/// of packaged cases used files that differ from the reference package, the
+/// first at `first` for `first_reason`. Only a reference can tell, so only
+/// `verify --reference` and `scan --reference` derive it.
+pub(crate) fn test_files_modified(
+    first: VerificationEventLocation,
+    runs: u64,
+    first_reason: &str,
+) -> AdvisoryFlag {
+    AdvisoryFlag {
+        kind: AdvisoryFlagKind::TestFilesModified,
+        link: first,
+        measured_value: format!(
+            "{} with changed test files; first: {}",
+            plural(runs, "run"),
+            display::label(first_reason, 256)
+        ),
     }
 }
 

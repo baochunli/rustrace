@@ -953,7 +953,8 @@ fn production_development_fixtures_reach_verify_scan_and_replay() {
 }
 
 #[test]
-fn v2_reference_rejects_resealed_false_mismatch_details() {
+fn v2_reference_rejects_resealed_false_mismatch_details_and_reports_changed_expected_output() {
+    let test_home = test_home::TestHome::new(false);
     let fixture = FixtureRoot::new("comparison-reference-details");
     let case = fixture.case("mismatch");
     run_controlled_child(&case, "comparison-mismatch");
@@ -970,6 +971,7 @@ fn v2_reference_rejects_resealed_false_mismatch_details() {
         let event_path = manifest.segments[0].events.entry.clone();
         let mut previous = Hash::zero();
         let mut events = Vec::new();
+        let mut compared_sequence = None;
         for bytes in payloads[&event_path]
             .split(|byte| *byte == b'\n')
             .filter(|bytes| !bytes.is_empty())
@@ -980,6 +982,7 @@ fn v2_reference_rejects_resealed_false_mismatch_details() {
                 panic!("golden envelope must decode")
             };
             if let Event::TestCaseCompared(comparison) = &mut envelope.event {
+                compared_sequence = Some(envelope.sequence);
                 if name == "false-expected-hash" {
                     comparison.expected_blake3 = Hash::from_bytes([42; Hash::LENGTH]);
                 }
@@ -1022,21 +1025,88 @@ fn v2_reference_rejects_resealed_false_mismatch_details() {
         );
         let authenticated = verify_path(&path, Some(&case.join("assignment.rta")));
         if name == "false-expected-hash" {
-            assert_eq!(authenticated.replay, VerificationStatus::Ok);
+            // A run against an edited `.expected` is the student's local
+            // change: the package still validates, the run is not
+            // reference-verified, and the instructor sees an advisory.
+            assert!(authenticated.is_clean(), "{authenticated:#?}");
             assert_eq!(
                 authenticated.assignment_reference,
-                rustrace::verify::AssignmentReferenceStatus::Mismatch
+                rustrace::verify::AssignmentReferenceStatus::Ok
             );
             assert_eq!(
                 authenticated.test_case_evidence,
                 Some(TestCaseEvidenceStatus::Recorded)
             );
-            assert!(authenticated.issues.iter().any(|issue| {
-                issue.kind == VerificationIssueKind::AssignmentReference
-                    && issue
-                        .detail
-                        .contains("expected output hash mismatch for test case sample")
-            }));
+            assert_eq!(
+                advisory_kinds(&authenticated),
+                client_advisory::with_client_advisory(&[AdvisoryFlagKind::TestFilesModified]),
+                "{:#?}",
+                authenticated.advisories
+            );
+            let advisory = authenticated.advisories.last().unwrap();
+            assert_eq!(
+                advisory.link,
+                rustrace::verify::VerificationEventLocation {
+                    segment: 1,
+                    sequence: compared_sequence.unwrap(),
+                }
+            );
+            assert_eq!(
+                advisory.measured_value,
+                "1 run with changed test files; first: expected output mismatch for test case sample"
+            );
+            // Without the reference nothing can tell.
+            assert!(
+                !advisory_kinds(&recorded).contains(&AdvisoryFlagKind::TestFilesModified),
+                "{recorded:#?}"
+            );
+
+            // `verify --reference` and `scan --reference` show it; the
+            // package stays OK and scan priority stays Normal.
+            let cli = |args: &[&std::ffi::OsStr]| {
+                let output = test_home
+                    .command(env!("CARGO_BIN_EXE_rustrace"))
+                    .args(args)
+                    .output()
+                    .unwrap();
+                command_ok(&output, name);
+                String::from_utf8(output.stdout).unwrap()
+            };
+            let reference = case.join("assignment.rta");
+            let instructor = cli(&[
+                "verify".as_ref(),
+                path.as_os_str(),
+                "--reference".as_ref(),
+                reference.as_os_str(),
+            ]);
+            assert!(
+                instructor.contains("Assignment reference     OK\n"),
+                "{instructor}"
+            );
+            assert!(
+                instructor.contains(&format!(
+                    "Advisory: TEST_FILES_MODIFIED [segment:1 seq:{}]: the record contains a run of a packaged test case whose expected output, arguments, input, or fixture files differ from the reference package; measured value: 1 run with changed test files; first: expected output mismatch for test case sample; advisory: heuristic; expect false positives\n",
+                    compared_sequence.unwrap()
+                )),
+                "{instructor}"
+            );
+            assert!(!cli(&["verify".as_ref(), path.as_os_str()]).contains("TEST_FILES_MODIFIED"));
+            let batch = case.join("scan-changed-expected");
+            fs::create_dir_all(&batch).unwrap();
+            fs::copy(&path, batch.join("changed.rprov")).unwrap();
+            let scan = cli(&[
+                "scan".as_ref(),
+                batch.as_os_str(),
+                "--reference".as_ref(),
+                reference.as_os_str(),
+            ]);
+            let row = scan
+                .lines()
+                .find(|line| line.starts_with("changed.rprov"))
+                .unwrap();
+            assert!(row.contains(" OK "), "{scan}");
+            assert!(row.contains(" Normal "), "{scan}");
+            assert!(scan.contains("TEST_FILES_MODIFIED: 1"), "{scan}");
             continue;
         }
         assert_eq!(
@@ -1273,6 +1343,8 @@ fn reseal_rprov_events(original: &[u8], mut edit: impl FnMut(&mut EventEnvelope)
 
 /// A consistent rewrite of what the runner recorded for the case `sample`.
 struct Format3Run<'a> {
+    /// The case name the rewritten Run and comparison record.
+    case: &'a str,
     args: &'a [&'a str],
     fixtures: Option<Hash>,
     input: Option<Hash>,
@@ -1288,7 +1360,7 @@ fn format3_rprov(original: &[u8], manifest_path: &str, run: &Format3Run<'_>) -> 
         .map(|arg| (*arg).to_owned())
         .collect::<Vec<_>>();
     let route = ConsoleCommandRoute::packaged_case(
-        "sample",
+        run.case,
         run.input.is_some(),
         args.clone(),
         run.fixtures,
@@ -1319,6 +1391,7 @@ fn format3_rprov(original: &[u8], manifest_path: &str, run: &Format3Run<'_>) -> 
             start.console = Some(route.clone());
         }
         Event::TestCaseCompared(comparison) if comparison.case == "sample" => {
+            comparison.case = run.case.to_owned();
             comparison.invocation = run.invocation.then(|| invocation.clone());
         }
         _ => {}
@@ -1490,6 +1563,7 @@ fn format3_reference_verifies_arguments_closed_stdin_and_fixtures() {
 
     // Rewriting the same evidence reproduces the runner's bytes.
     let baseline = Format3Run {
+        case: "sample",
         args: &["-n", "fn main"],
         fixtures: Some(packaged_fixtures),
         input: None,
@@ -1509,10 +1583,21 @@ fn format3_reference_verifies_arguments_closed_stdin_and_fixtures() {
         Some(TestCaseEvidenceStatus::ReferenceVerified)
     );
 
-    // Consistent tampering replays but no longer matches the package.
+    // A run with changed test files replays and the package still
+    // validates: the run is not reference-verified, and the instructor sees
+    // one TEST_FILES_MODIFIED advisory linked to the comparison.
+    let comparisons = |path: &Path| {
+        let replay = ReplayController::open(path).unwrap();
+        replay
+            .timeline_rows(replay.event_count())
+            .into_iter()
+            .filter(|row| row.event_name == "test case compared")
+            .map(|row| row.position)
+            .collect::<Vec<_>>()
+    };
     let other_fixtures = Hash::from_bytes([0x45; Hash::LENGTH]);
     let input = rprov_raw_blake3(b"input\n");
-    for (label, run, detail) in [
+    for (label, run, reason) in [
         (
             "arguments",
             Format3Run {
@@ -1530,14 +1615,6 @@ fn format3_reference_verifies_arguments_closed_stdin_and_fixtures() {
             "fixture tree mismatch for test case sample",
         ),
         (
-            "no fixture tree",
-            Format3Run {
-                fixtures: None,
-                ..baseline
-            },
-            "fixture tree mismatch for test case sample",
-        ),
-        (
             "stdin source",
             Format3Run {
                 input: Some(input),
@@ -1546,30 +1623,117 @@ fn format3_reference_verifies_arguments_closed_stdin_and_fixtures() {
             "standard input mismatch for test case sample",
         ),
     ] {
-        let path = case.join(format!("tampered-{}.rprov", label.replace(' ', "-")));
+        let path = case.join(format!("changed-{}.rprov", label.replace(' ', "-")));
         fs::write(&path, format3_rprov(&original, manifest_path, &run)).unwrap();
         let recorded = verify_path(&path, None);
         assert!(recorded.is_clean(), "{label}: {recorded:#?}");
+        assert!(
+            !advisory_kinds(&recorded).contains(&AdvisoryFlagKind::TestFilesModified),
+            "{label}: only a reference can tell"
+        );
         let report = verify_path(&path, Some(&reference));
-        assert_eq!(report.replay, VerificationStatus::Ok, "{label}");
+        assert!(report.is_clean(), "{label}: {report:#?}");
         assert_eq!(
             report.assignment_reference,
-            rustrace::verify::AssignmentReferenceStatus::Mismatch,
-            "{label}: {report:#?}"
+            rustrace::verify::AssignmentReferenceStatus::Ok,
+            "{label}"
         );
         assert_eq!(
             report.test_case_evidence,
             Some(TestCaseEvidenceStatus::Recorded),
             "{label}"
         );
-        assert!(
-            report.issues.iter().any(|issue| {
-                issue.kind == VerificationIssueKind::AssignmentReference
-                    && issue.detail.contains(detail)
-            }),
-            "{label}: {report:#?}"
+        let modified = report
+            .advisories
+            .iter()
+            .filter(|advisory| advisory.kind == AdvisoryFlagKind::TestFilesModified)
+            .collect::<Vec<_>>();
+        assert_eq!(modified.len(), 1, "{label}: {:#?}", report.advisories);
+        // `echo` runs first; the rewritten `sample` run is the second.
+        let positions = comparisons(&path);
+        assert_eq!(positions.len(), 2);
+        assert_eq!(
+            modified[0].link,
+            rustrace::verify::VerificationEventLocation {
+                segment: positions[1].segment as u32 + 1,
+                sequence: positions[1].sequence,
+            },
+            "{label}"
+        );
+        assert_eq!(
+            modified[0].measured_value,
+            format!("1 run with changed test files; first: {reason}"),
+            "{label}"
         );
     }
+
+    // A case the package does not have is neither flagged nor verified.
+    let added = case.join("student-added.rprov");
+    fs::write(
+        &added,
+        format3_rprov(
+            &original,
+            manifest_path,
+            &Format3Run {
+                case: "extra",
+                ..baseline
+            },
+        ),
+    )
+    .unwrap();
+    let report = verify_path(&added, Some(&reference));
+    assert!(report.is_clean(), "student-added case: {report:#?}");
+    assert_eq!(
+        report.test_case_evidence,
+        Some(TestCaseEvidenceStatus::Recorded)
+    );
+    assert!(
+        !advisory_kinds(&report).contains(&AdvisoryFlagKind::TestFilesModified),
+        "{:#?}",
+        report.advisories
+    );
+
+    // Evidence that does not fit the package's working directory is a wrong
+    // reference or inconsistent evidence, not a student's edit: it still
+    // fails the reference.
+    let path = case.join("no-fixture-tree.rprov");
+    fs::write(
+        &path,
+        format3_rprov(
+            &original,
+            manifest_path,
+            &Format3Run {
+                fixtures: None,
+                ..baseline
+            },
+        ),
+    )
+    .unwrap();
+    assert!(verify_path(&path, None).is_clean());
+    let report = verify_path(&path, Some(&reference));
+    assert_eq!(report.replay, VerificationStatus::Ok);
+    assert_eq!(
+        report.assignment_reference,
+        rustrace::verify::AssignmentReferenceStatus::Mismatch,
+        "{report:#?}"
+    );
+    assert_eq!(
+        report.test_case_evidence,
+        Some(TestCaseEvidenceStatus::Recorded)
+    );
+    assert!(
+        report.issues.iter().any(|issue| {
+            issue.kind == VerificationIssueKind::AssignmentReference
+                && issue.detail
+                    == "test case sample records a working directory that does not match the package's fixture tree"
+        }),
+        "{report:#?}"
+    );
+    assert!(
+        !advisory_kinds(&report).contains(&AdvisoryFlagKind::TestFilesModified),
+        "{:#?}",
+        report.advisories
+    );
 
     // Inconsistent evidence fails replay before any reference comparison.
     for (label, run) in [
@@ -2150,6 +2314,7 @@ fn advisory_kind_vocabulary_is_reachable_from_the_golden_suite() {
             "REJECTED_PASTE_ATTEMPTS",
             "TYPED_AFTER_REJECTED_PASTE",
             "UNOFFICIAL_CLIENT",
+            "TEST_FILES_MODIFIED",
         ]
     );
 }
