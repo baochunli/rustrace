@@ -2142,11 +2142,11 @@ fn open_error(operation: &'static str, path: &Path, error: Errno) -> WorkspaceHa
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 const WRITER_LOCK_OPERATION: &str = "acquire exclusive workspace writer ownership";
 const WRITER_CONTENTION: &str = "held by another open Rustrace session";
 /// About one second in all: long enough for a read-only inspection to finish.
 const WRITER_LOCK_ATTEMPTS: u32 = 20;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const WRITER_LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 impl WorkspaceHashError {
@@ -2161,6 +2161,7 @@ impl WorkspaceHashError {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn filesystem_error(
     operation: &'static str,
     path: &Path,
