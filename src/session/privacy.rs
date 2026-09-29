@@ -7,15 +7,13 @@ use super::{
 };
 use crate::{display, toolchain::RuntimeToolchainMetadata};
 use rustrace_journal::{
-    Journal, MAX_CHECKPOINTS_PER_READ, MAX_EVENTS_PER_READ, StoredCheckpoint, decode_checkpoint,
-    encode_checkpoint,
+    CheckpointTotals, Journal, MAX_EVENTS_PER_READ, StoredCheckpoint, decode_checkpoint,
 };
 use rustrace_model::{
-    DecodeOutcome, DecodePolicy, EditorTransaction, Event, EventEnvelope, Hash,
-    MAX_RPROV_CHECKPOINTS_PER_SEGMENT, MAX_RPROV_EVENTS, MAX_RPROV_MANIFEST_BYTES,
-    MAX_RPROV_METADATA_ENTRY_BYTES, MAX_RPROV_METADATA_PER_SEGMENT, RprovEntryKind,
-    RprovInitialWorkspace, RprovInventoryEntry, RprovKnown, RprovManifest, SessionId,
-    decode_envelope, decode_rprov_manifest, encode_envelope, encode_rprov_manifest,
+    DecodeOutcome, DecodePolicy, EditorTransaction, Event, EventEnvelope, Hash, MAX_RPROV_EVENTS,
+    MAX_RPROV_MANIFEST_BYTES, MAX_RPROV_METADATA_ENTRY_BYTES, MAX_RPROV_METADATA_PER_SEGMENT,
+    RprovEntryKind, RprovInitialWorkspace, RprovInventoryEntry, RprovKnown, RprovManifest,
+    SessionId, decode_envelope, decode_rprov_manifest, encode_envelope, encode_rprov_manifest,
     rprov_raw_blake3,
 };
 use rustrace_replay::ReplayEngine;
@@ -144,10 +142,16 @@ struct RevisionLink {
     _initial_inventory: Vec<RprovInventoryEntry>,
 }
 
+/// The durable prefix of an unfinished attempt, read from a private copy of
+/// its journal. Checkpoints stay in that copy and are decoded one at a time,
+/// so a preview never holds every recorded workspace at once.
 struct PreviewCapture {
     events: Vec<EventEnvelope>,
     framed_event_bytes: Vec<u64>,
-    checkpoints: Vec<StoredCheckpoint>,
+    initial_checkpoint: StoredCheckpoint,
+    checkpoint_totals: CheckpointTotals,
+    journal: Journal,
+    scratch: ScratchDirectory,
     metadata_entries: Vec<u64>,
     evidence_entries: Vec<u64>,
     manifest_bytes: Vec<u8>,
@@ -316,15 +320,8 @@ fn summarize_receipt(receipt: &PublishedReceipt) -> Result<PrivacySummary> {
 }
 
 fn summarize_unfinished(root: &Path, metadata: &SessionMetadata) -> Result<PrivacySummary> {
-    let capture = capture_preview(root, metadata)?;
-    if capture
-        .checkpoints
-        .first()
-        .ok_or("unfinished journal has no initial checkpoint")?
-        .snapshot
-        .workspace_hash()
-        != metadata.starter_hash
-    {
+    let mut capture = capture_preview(root, metadata)?;
+    if capture.initial_checkpoint.snapshot.workspace_hash() != metadata.starter_hash {
         return Err("unfinished initial checkpoint differs from the starter identity".into());
     }
     let parent = match &capture.parent_link {
@@ -343,12 +340,8 @@ fn summarize_unfinished(root: &Path, metadata: &SessionMetadata) -> Result<Priva
             summary
         }
         None => {
-            let initial = capture
-                .checkpoints
-                .first()
-                .ok_or("unfinished journal has no initial checkpoint")?;
             let mut totals = Totals::default();
-            add_initial_workspace(&mut totals, initial)?;
+            add_initial_workspace(&mut totals, &capture.initial_checkpoint)?;
             PrivacySummary {
                 state: "PREVIEW - UNFINISHED DURABLE PREFIX",
                 student_id: None,
@@ -366,28 +359,28 @@ fn summarize_unfinished(root: &Path, metadata: &SessionMetadata) -> Result<Priva
         }
     };
 
-    let initial = capture
-        .checkpoints
-        .first()
-        .ok_or("unfinished journal has no initial checkpoint")?
-        .clone();
+    let session_id = metadata.session_id.clone();
+    let journal = &mut capture.journal;
+    let mut load = |sequence| -> Result<Option<StoredCheckpoint>> {
+        Ok(journal.load_checkpoint(&session_id, sequence)?)
+    };
     let (first_millis, last_millis) = summarize_events(
         &capture.events,
         &capture.framed_event_bytes,
-        initial,
-        Some(&capture.checkpoints),
+        capture.initial_checkpoint.clone(),
+        Some(&mut load),
         &mut summary.totals,
     )?;
-    add_pair(
-        &mut summary.totals.checkpoints,
-        &mut summary.totals.checkpoint_bytes,
-        &capture
-            .checkpoints
-            .iter()
-            .map(|checkpoint| {
-                encode_checkpoint(&checkpoint.snapshot).map(|bytes| bytes.len() as u64)
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?,
+    // A stored checkpoint is its own canonical encoding, which is exactly the
+    // `.rcpk` payload finalization exports.
+    summary.totals.checkpoints = checked_add(
+        summary.totals.checkpoints,
+        capture.checkpoint_totals.count,
+        "checkpoint inventory",
+    )?;
+    summary.totals.checkpoint_bytes = checked_add(
+        summary.totals.checkpoint_bytes,
+        capture.checkpoint_totals.encoded_bytes,
         "checkpoint inventory",
     )?;
     add_pair(
@@ -417,6 +410,8 @@ fn summarize_unfinished(root: &Path, metadata: &SessionMetadata) -> Result<Priva
             .rev()
             .find_map(|event| event.wall_clock_utc.as_ref().map(ToString::to_string)),
     });
+    drop(capture.journal);
+    capture.scratch.remove()?;
     Ok(summary)
 }
 
@@ -495,15 +490,13 @@ fn capture_preview(root: &Path, metadata: &SessionMetadata) -> Result<PreviewCap
                 return Err("journal artifact changed during privacy inspection".into());
             }
         }
-        let (events, checkpoints) = {
-            let mut journal =
-                Journal::open_read_only_no_follow(scratch.path().join(&journal_name))?;
-            (
-                read_all_events(&mut journal, &metadata.session_id)?,
-                read_all_checkpoints(&mut journal, &metadata.session_id)?,
-            )
-        };
-        scratch.remove()?;
+        let mut journal = Journal::open_read_only_no_follow(scratch.path().join(&journal_name))?;
+        let events = read_all_events(&mut journal, &metadata.session_id)?;
+        journal.verify_session_checkpoints(&metadata.session_id)?;
+        let checkpoint_totals = journal.checkpoint_totals(&metadata.session_id)?;
+        let initial_checkpoint = journal
+            .load_checkpoint(&metadata.session_id, 1)?
+            .ok_or("unfinished journal has no initial checkpoint")?;
         let framed_event_bytes = events
             .iter()
             .map(|event| {
@@ -597,7 +590,10 @@ fn capture_preview(root: &Path, metadata: &SessionMetadata) -> Result<PreviewCap
         Ok(PreviewCapture {
             events,
             framed_event_bytes,
-            checkpoints,
+            initial_checkpoint,
+            checkpoint_totals,
+            journal,
+            scratch,
             metadata_entries: metadata_by_digest.into_values().collect(),
             evidence_entries: evidence_by_digest.into_values().collect(),
             manifest_bytes,
@@ -868,11 +864,13 @@ fn add_pair(count: &mut u64, bytes: &mut u64, entries: &[u64], label: &'static s
     Ok(())
 }
 
+/// `load_checkpoint`, when given, returns the stored checkpoint a
+/// `WorkspaceCheckpoint` event owns, which replay then certifies.
 fn summarize_events(
     events: &[EventEnvelope],
     framed_bytes: &[u64],
     initial: StoredCheckpoint,
-    checkpoints: Option<&[StoredCheckpoint]>,
+    mut load_checkpoint: Option<&mut dyn FnMut(u64) -> Result<Option<StoredCheckpoint>>>,
     totals: &mut Totals,
 ) -> Result<(u64, u64)> {
     if events.is_empty() || events.len() != framed_bytes.len() {
@@ -882,12 +880,6 @@ fn summarize_events(
         return Err("initial checkpoint owner differs from the event stream".into());
     }
     let mut replay = ReplayEngine::from_initial_checkpoint(initial)?;
-    let checkpoint_by_sequence = checkpoints.map(|items| {
-        items
-            .iter()
-            .map(|checkpoint| (checkpoint.owning_event.sequence, checkpoint))
-            .collect::<BTreeMap<_, _>>()
-    });
     for (index, (envelope, encoded_bytes)) in events.iter().zip(framed_bytes).enumerate() {
         tally_event(totals, envelope, *encoded_bytes)?;
         if index == 0 {
@@ -898,11 +890,11 @@ fn summarize_events(
         }
         replay.apply(envelope)?;
         if matches!(envelope.event, Event::WorkspaceCheckpoint(_))
-            && let Some(checkpoint) = checkpoint_by_sequence
-                .as_ref()
-                .and_then(|items| items.get(&envelope.sequence))
+            && let Some(load) = load_checkpoint.as_mut()
         {
-            replay.validate_checkpoint(checkpoint)?;
+            let checkpoint =
+                load(envelope.sequence)?.ok_or("checkpoint event has no stored checkpoint")?;
+            replay.validate_checkpoint(&checkpoint)?;
         }
     }
     Ok((
@@ -1114,35 +1106,6 @@ fn read_all_events(journal: &mut Journal, session_id: &SessionId) -> Result<Vec<
         return Err("journal read differs from its verified event count".into());
     }
     Ok(events)
-}
-
-fn read_all_checkpoints(
-    journal: &mut Journal,
-    session_id: &SessionId,
-) -> Result<Vec<StoredCheckpoint>> {
-    let verified = journal.verify_session_checkpoints(session_id)?;
-    if verified.checkpoint_count == 0
-        || verified.checkpoint_count as usize > MAX_RPROV_CHECKPOINTS_PER_SEGMENT
-    {
-        return Err("checkpoint count is outside privacy-inspection limits".into());
-    }
-    let mut checkpoints = Vec::with_capacity(verified.checkpoint_count as usize);
-    let mut next = 1_u64;
-    loop {
-        let page = journal.list_checkpoints(session_id, next, MAX_CHECKPOINTS_PER_READ)?;
-        if page.is_empty() {
-            break;
-        }
-        next = page
-            .last()
-            .and_then(|checkpoint| checkpoint.owning_event.sequence.checked_add(1))
-            .ok_or("checkpoint sequence overflow")?;
-        checkpoints.extend(page);
-    }
-    if checkpoints.len() as u64 != verified.checkpoint_count {
-        return Err("checkpoint listing differs from its verified count".into());
-    }
-    Ok(checkpoints)
 }
 
 fn known_time<T: ToString>(value: &RprovKnown<T>) -> Option<String> {

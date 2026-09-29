@@ -105,6 +105,8 @@ const NONPOSITIVE_CHECKPOINT_SQL: &str =
     "SELECT 1 FROM checkpoints WHERE session_id = ?1 AND sequence < 1 LIMIT 1";
 const CHECKPOINT_PAYLOAD_SQL: &str =
     "SELECT payload FROM checkpoints WHERE session_id = ?1 AND sequence = ?2";
+const CHECKPOINT_TOTALS_SQL: &str = "SELECT count(*), coalesce(sum(length(payload)), 0) \
+     FROM checkpoints WHERE session_id = ?1";
 
 #[derive(Clone, Debug)]
 struct EventMetadata {
@@ -151,6 +153,16 @@ pub struct StoredCheckpoint {
 pub struct VerifiedSessionCheckpoints {
     pub checkpoint_count: u64,
     pub latest_sequence: Option<u64>,
+}
+
+/// One session's checkpoint count and stored payload bytes, read without
+/// decoding any payload. A payload decodes only when it is its own canonical
+/// encoding, so the byte total is exactly what exporting the checkpoints
+/// writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckpointTotals {
+    pub count: u64,
+    pub encoded_bytes: u64,
 }
 
 pub struct Journal {
@@ -1054,6 +1066,42 @@ impl Journal {
             .commit()
             .map_err(|error| error::database_error("commit checkpoint list", error))?;
         Ok(checkpoints)
+    }
+
+    /// Counts one session's checkpoints and their stored bytes in one read
+    /// snapshot. Nothing is decoded or verified; see
+    /// [`Self::verify_session_checkpoints`] for that.
+    pub fn checkpoint_totals(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<CheckpointTotals, JournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| error::database_error("begin checkpoint totals", error))?;
+        validate_schema(&transaction)?;
+        require_session(&transaction, session_id)?;
+        let (count, encoded_bytes): (i64, i64) = transaction
+            .query_row(CHECKPOINT_TOTALS_SQL, [session_id.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(|error| error::database_error("count checkpoints", error))?;
+        transaction
+            .commit()
+            .map_err(|error| error::database_error("commit checkpoint totals", error))?;
+        let column = |value: i64, field| {
+            u64::try_from(value).map_err(|_| {
+                checkpoint_corruption(
+                    session_id,
+                    None,
+                    CheckpointCorruption::InvalidColumn { field },
+                )
+            })
+        };
+        Ok(CheckpointTotals {
+            count: column(count, "sequence")?,
+            encoded_bytes: column(encoded_bytes, "payload")?,
+        })
     }
 
     /// Verifies every checkpoint/event ownership relationship in one SQLite

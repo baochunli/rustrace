@@ -1157,3 +1157,48 @@ fn runtime_observations_keep_first_changes_and_last_within_the_limit() {
     shuffled.reverse();
     assert_eq!(selected_sequences(shuffled, 5), [1, 97, 98, 99, 100]);
 }
+
+#[test]
+fn streamed_capture_exports_every_checkpoint_exactly_across_pages() {
+    let (fixture, mut session) = Fixture::started("finalization-streamed-capture");
+    // More than two listing pages of checkpoints.
+    for character in "BCDEFGHIJKLMNOPQRST".chars() {
+        session.execute(EditorCommand::Insert(character)).unwrap();
+        session.capture_boundary().unwrap();
+    }
+    let id = session.session_id().clone();
+    let receipt = session.finalize("student-1").unwrap();
+    let mut journal =
+        Journal::open_read_only_no_follow(state_artifact(&fixture.0, &format!("{id}.sqlite")))
+            .unwrap();
+    let totals = journal.checkpoint_totals(&id).unwrap();
+    let references = &receipt.manifest().segments[0].checkpoints;
+    assert!(totals.count > 2 * rustrace_journal::MAX_CHECKPOINTS_PER_READ as u64);
+    assert_eq!(references.len() as u64, totals.count);
+    let mut exported_bytes = 0;
+    for (index, reference) in references.iter().enumerate() {
+        let stored = journal
+            .load_checkpoint(&id, reference.owner.sequence)
+            .unwrap()
+            .unwrap();
+        let bytes = receipt.read_payload(&reference.entry).unwrap();
+        assert_eq!(bytes, encode_checkpoint(&stored.snapshot).unwrap());
+        assert_eq!(reference.owner.event_hash, stored.owning_event.event_hash);
+        assert_eq!(reference.workspace_hash, stored.snapshot.workspace_hash());
+        let expected_role = if index == 0 {
+            rustrace_model::RprovCheckpointRole::Initial
+        } else if index + 1 == references.len() {
+            rustrace_model::RprovCheckpointRole::Final
+        } else {
+            rustrace_model::RprovCheckpointRole::Accepted
+        };
+        assert_eq!(reference.role, expected_role);
+        exported_bytes += bytes.len() as u64;
+    }
+    assert_eq!(exported_bytes, totals.encoded_bytes);
+    assert!(
+        references
+            .windows(2)
+            .all(|pair| pair[0].owner.sequence < pair[1].owner.sequence)
+    );
+}

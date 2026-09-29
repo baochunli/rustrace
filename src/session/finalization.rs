@@ -11,8 +11,8 @@ use super::{
 };
 use crate::toolchain::{RuntimeToolchainMetadata, ToolchainReport};
 use rustrace_journal::{
-    CheckpointSnapshot, Journal, MAX_CHECKPOINTS_PER_READ, MAX_EVENTS_PER_READ, StoredCheckpoint,
-    decode_checkpoint, encode_checkpoint,
+    CheckpointSnapshot, CheckpointTotals, Journal, MAX_CHECKPOINTS_PER_READ, MAX_EVENTS_PER_READ,
+    MAX_JOURNAL_SEQUENCE, StoredCheckpoint, decode_checkpoint, encode_checkpoint,
 };
 use rustrace_model::{
     DecodeOutcome, DecodePolicy, EditOrigin, Event, EventEnvelope, Hash, MAX_IDENTIFIER_BYTES,
@@ -20,16 +20,16 @@ use rustrace_model::{
     MAX_RPROV_EVIDENCE_USAGES, MAX_RPROV_EVIDENCE_USAGES_PER_ARTIFACT,
     MAX_RPROV_INITIAL_FILE_BYTES, MAX_RPROV_INITIAL_FILES, MAX_RPROV_INITIAL_WORKSPACE_BYTES,
     MAX_RPROV_MANIFEST_BYTES, MAX_RPROV_METADATA_ENTRY_BYTES, MAX_RPROV_METADATA_PER_SEGMENT,
-    MAX_RPROV_SEGMENT_EVENTS_BYTES, MAX_RPROV_SEGMENTS, MAX_RPROV_SOURCE_LINKS_PER_SEGMENT,
-    RPROV_FORMAT_VERSION_V1, RecordedEventRef, RprovAssignmentManifestIdentity, RprovCheckpointRef,
-    RprovCheckpointRole, RprovEntryKind, RprovEventStreamCompleteness, RprovEventStreamRef,
-    RprovEvidenceKind, RprovEvidenceRef, RprovInitialWorkspace, RprovInitialWorkspaceFile,
-    RprovInterAttemptTime, RprovInventoryEntry, RprovKnown, RprovLegacyPasteVerification,
-    RprovManifest, RprovMetadataRef, RprovPackageState, RprovParentLink, RprovProducer,
-    RprovRecoveryGap, RprovSegment, RprovSegmentTime, RprovSourceLink,
-    RprovSubmittedSourceComparison, RprovToolVersion, RprovUnavailableAssurance, SessionId,
-    WorkspacePath, decode_envelope, decode_rprov_manifest, encode_envelope, encode_rprov_manifest,
-    rprov_raw_blake3, validate_rprov_event_stream, validate_rprov_payload,
+    MAX_RPROV_SEGMENT_CHECKPOINT_BYTES, MAX_RPROV_SEGMENT_EVENTS_BYTES, MAX_RPROV_SEGMENTS,
+    MAX_RPROV_SOURCE_LINKS_PER_SEGMENT, RPROV_FORMAT_VERSION_V1, RecordedEventRef,
+    RprovAssignmentManifestIdentity, RprovCheckpointRef, RprovCheckpointRole, RprovEntryKind,
+    RprovEventStreamCompleteness, RprovEventStreamRef, RprovEvidenceKind, RprovEvidenceRef,
+    RprovInitialWorkspace, RprovInitialWorkspaceFile, RprovInterAttemptTime, RprovInventoryEntry,
+    RprovKnown, RprovLegacyPasteVerification, RprovManifest, RprovMetadataRef, RprovPackageState,
+    RprovParentLink, RprovProducer, RprovRecoveryGap, RprovSegment, RprovSegmentTime,
+    RprovSourceLink, RprovSubmittedSourceComparison, RprovToolVersion, RprovUnavailableAssurance,
+    SessionId, WorkspacePath, decode_envelope, decode_rprov_manifest, encode_envelope,
+    encode_rprov_manifest, rprov_raw_blake3, validate_rprov_event_stream, validate_rprov_payload,
 };
 use rustrace_replay::ReplayEngine;
 use rustrace_workspace::hash::{
@@ -410,6 +410,7 @@ struct CapturedCurrent {
     publications: Vec<(String, Vec<u8>)>,
     prefix_bytes: Vec<u8>,
     initial_workspace: Option<RprovInitialWorkspace>,
+    initial_files: BTreeMap<WorkspacePath, Vec<u8>>,
     final_workspace: BTreeMap<WorkspacePath, Vec<u8>>,
     gaps: Vec<RprovRecoveryGap>,
 }
@@ -440,13 +441,15 @@ enum ParentEvidenceKind {
     FinalizedRevision,
 }
 
-struct CaptureCurrentInput<'a> {
+struct CaptureCurrentInput<'a, 'j> {
     metadata: &'a SessionMetadata,
     ordinal: u32,
     prefix_events: &'a [EventEnvelope],
     terminal: Option<&'a EventEnvelope>,
-    checkpoints: &'a [StoredCheckpoint],
+    checkpoints: JournalCheckpoints<'j>,
     maximum_checkpoints: usize,
+    /// The verified live workspace the last checkpoint must equal.
+    expected_final: &'a BTreeMap<WorkspacePath, Vec<u8>>,
     parent_link: Option<RprovParentLink>,
     original_starter_tree_hash: Hash,
     include_initial_workspace: bool,
@@ -939,21 +942,21 @@ impl ProductionSession {
         let mut terminal_replay = prefix.replay.clone();
         terminal_replay.apply(&terminal)?;
 
-        let checkpoints =
-            read_all_checkpoints(&mut journal, &self.metadata.session_id, limits.checkpoints)?;
+        let checkpoints = JournalCheckpoints::new(&mut journal, &self.metadata.session_id)?;
         process_probe("finalization-before-capture");
         let had_parent = parent_evidence_kind == ParentEvidenceKind::FinalizedRevision;
         let original_starter_tree_hash = (!had_parent).then_some(self.metadata.starter_hash);
         let mut current = capture_current_segment(
-            &authority.owner,
+            &authority,
             &state_directory,
             CaptureCurrentInput {
                 metadata: &self.metadata,
                 ordinal: 1,
                 prefix_events: &prefix_events,
                 terminal: None,
-                checkpoints: &checkpoints,
+                checkpoints,
                 maximum_checkpoints: limits.checkpoints,
+                expected_final: &logical,
                 parent_link: None,
                 // The outer Option is authoritative for raw recovery. Zero is
                 // an inert internal sentinel and is never emitted in a manifest.
@@ -963,9 +966,6 @@ impl ProductionSession {
                 artifact_tag: "finalization-recovery",
             },
         )?;
-        if current.final_workspace != logical {
-            return Err("captured final checkpoint differs from the verified live boundary".into());
-        }
         let manifest_bytes = authority
             .owner
             .read_artifact("manifest.toml", METADATA_LIMIT)?;
@@ -989,7 +989,7 @@ impl ProductionSession {
             payloads: current.payloads.clone(),
             gaps: current.gaps.clone(),
         };
-        publish_current_capture(&authority.owner, &authority, &current, &persisted_current)?;
+        publish_current_capture(&authority, &persisted_current)?;
 
         // The raw current boundary above is the recovery commit point. Only
         // after it exists may revision seed/link parsing fail. A certified
@@ -1037,10 +1037,7 @@ impl ProductionSession {
             // Student IDs belong to each submission, not its recorded event history.
             // A linked revision may correct the ID without changing the parent receipt.
             require_assignment_match(&parent.manifest, &self.metadata, &authority.owner)?;
-            let child_initial = checkpoints
-                .first()
-                .ok_or("revision child is missing its genesis checkpoint")?;
-            if parent.final_workspace != checkpoint_files(&child_initial.snapshot) {
+            if parent.final_workspace != current.initial_files {
                 return Err("revision child start no longer equals the parent final tree".into());
             }
         }
@@ -1211,32 +1208,104 @@ impl ProductionSession {
     }
 }
 
+/// One session's checkpoints, read from its stopped journal in bounded pages,
+/// so a capture holds at most one page of decoded workspace copies however
+/// many checkpoints the session recorded.
+struct JournalCheckpoints<'j> {
+    journal: &'j mut Journal,
+    session_id: &'j SessionId,
+    totals: CheckpointTotals,
+}
+
+impl<'j> JournalCheckpoints<'j> {
+    fn new(journal: &'j mut Journal, session_id: &'j SessionId) -> Result<Self> {
+        let totals = journal.checkpoint_totals(session_id)?;
+        Ok(Self {
+            journal,
+            session_id,
+            totals,
+        })
+    }
+
+    fn first(&mut self) -> Result<StoredCheckpoint> {
+        self.journal
+            .load_checkpoint(self.session_id, 1)?
+            .ok_or_else(|| "journal has no genesis checkpoint".into())
+    }
+
+    fn last(&mut self) -> Result<StoredCheckpoint> {
+        self.journal
+            .latest_checkpoint_at_or_before(self.session_id, MAX_JOURNAL_SEQUENCE)?
+            .ok_or_else(|| "journal has no checkpoints to finalize".into())
+    }
+
+    /// Visits every checkpoint once, in owning-sequence order.
+    fn for_each(
+        &mut self,
+        mut visit: impl FnMut(usize, StoredCheckpoint) -> Result<()>,
+    ) -> Result<()> {
+        let mut next = 1_u64;
+        let mut index = 0_usize;
+        loop {
+            let page =
+                self.journal
+                    .list_checkpoints(self.session_id, next, MAX_CHECKPOINTS_PER_READ)?;
+            let Some(last) = page.last() else {
+                break;
+            };
+            next = last
+                .owning_event
+                .sequence
+                .checked_add(1)
+                .ok_or("checkpoint sequence overflow")?;
+            for checkpoint in page {
+                visit(index, checkpoint)?;
+                index += 1;
+            }
+        }
+        if index as u64 != self.totals.count {
+            return Err("checkpoint listing differs from its counted total".into());
+        }
+        Ok(())
+    }
+}
+
+/// Captures the current prefix. Every limit and identity check runs before
+/// anything is published, so such a failure leaves nothing to replace; the
+/// components are then published, with checkpoints streamed one page at a
+/// time. The caller publishes `RECOVERY_CAPTURE`, the commit point.
 fn capture_current_segment(
-    owner: &PinnedJournalFile,
+    authority: &super::Authority,
     state_directory: &Path,
-    input: CaptureCurrentInput<'_>,
+    input: CaptureCurrentInput<'_, '_>,
 ) -> Result<CapturedCurrent> {
+    let owner = &authority.owner;
     let CaptureCurrentInput {
         metadata,
         ordinal,
         prefix_events,
         terminal,
-        checkpoints,
+        mut checkpoints,
         maximum_checkpoints,
+        expected_final,
         parent_link,
         original_starter_tree_hash,
         include_initial_workspace,
         event_artifact,
         artifact_tag,
     } = input;
-    FinalizationLimitExceeded::check(
-        "checkpoints",
-        checkpoints.len() as u64,
-        maximum_checkpoints as u64,
-    )?;
-    if checkpoints.len() < 2 {
+    let totals = checkpoints.totals;
+    FinalizationLimitExceeded::check("checkpoints", totals.count, maximum_checkpoints as u64)?;
+    if totals.count < 2 {
         return Err("finalization requires distinct initial/final full checkpoints".into());
     }
+    FinalizationLimitExceeded::check(
+        "bytes of checkpoints",
+        totals.encoded_bytes,
+        MAX_RPROV_SEGMENT_CHECKPOINT_BYTES,
+    )?;
+    let checkpoint_count =
+        usize::try_from(totals.count).map_err(|_| "checkpoint count does not fit usize")?;
     let prefix_bytes = encode_event_stream(prefix_events)?;
     let mut event_bytes = prefix_bytes.clone();
     if let Some(terminal) = terminal {
@@ -1249,7 +1318,6 @@ fn capture_current_segment(
         MAX_RPROV_SEGMENT_EVENTS_BYTES,
     )?;
 
-    let mut publications = vec![(event_artifact.to_owned(), event_bytes.clone())];
     let event_entry = format!("segments/{ordinal:04}/events.jsonl");
     let event_digest = rprov_raw_blake3(&event_bytes);
     let mut inventory = vec![RprovInventoryEntry {
@@ -1269,20 +1337,124 @@ fn capture_current_segment(
         .chain(terminal)
         .map(|event| (event.sequence, event))
         .collect::<BTreeMap<_, _>>();
+    let owned_by_prefix = |checkpoint: &StoredCheckpoint| {
+        event_by_sequence
+            .get(&checkpoint.owning_event.sequence)
+            .copied()
+            == Some(&checkpoint.owning_event)
+    };
 
-    let mut checkpoint_refs = Vec::with_capacity(checkpoints.len());
-    for (index, checkpoint) in checkpoints.iter().enumerate() {
-        let sequence = checkpoint.owning_event.sequence;
-        if event_by_sequence.get(&sequence).copied() != Some(&checkpoint.owning_event) {
+    let initial_checkpoint = checkpoints.first()?;
+    let final_checkpoint = checkpoints.last()?;
+    if !owned_by_prefix(&initial_checkpoint) || !owned_by_prefix(&final_checkpoint) {
+        return Err("checkpoint owner differs from the fixed event prefix".into());
+    }
+    if initial_checkpoint.owning_event.sequence != 1
+        || terminal
+            .is_some_and(|terminal| final_checkpoint.owning_event.sequence + 1 != terminal.sequence)
+        || terminal.is_none()
+            && final_checkpoint.owning_event.sequence
+                != prefix_events.last().map_or(0, |event| event.sequence)
+    {
+        return Err("final checkpoint is not the exact captured boundary event".into());
+    }
+    let final_workspace = checkpoint_files(&final_checkpoint.snapshot);
+    if final_workspace != *expected_final {
+        return Err("captured final checkpoint differs from the verified live boundary".into());
+    }
+
+    let runtime_metadata = capture_runtime_metadata(
+        owner,
+        state_directory,
+        metadata,
+        ordinal,
+        &event_by_sequence,
+    )?;
+    inventory.extend(runtime_metadata.inventory);
+    payloads.extend(runtime_metadata.payloads);
+    let captured_evidence =
+        capture_evidence(owner, state_directory, metadata, ordinal, prefix_events)?;
+    inventory.extend(captured_evidence.inventory);
+    payloads.extend(captured_evidence.payloads);
+    let source_links = capture_source_links(prefix_events)?;
+
+    let mut starter_publications = Vec::new();
+    let initial_workspace = if include_initial_workspace {
+        let mut files = Vec::with_capacity(initial_checkpoint.snapshot.files().len());
+        if initial_checkpoint.snapshot.files().len() > MAX_RPROV_INITIAL_FILES {
+            return Err("initial workspace exceeds the package file limit".into());
+        }
+        let mut total = 0_u64;
+        let mut published = BTreeSet::new();
+        for file in initial_checkpoint.snapshot.files() {
+            let length = file.contents.len() as u64;
+            total = total
+                .checked_add(length)
+                .ok_or("initial workspace byte count overflow")?;
+            if length > MAX_RPROV_INITIAL_FILE_BYTES || total > MAX_RPROV_INITIAL_WORKSPACE_BYTES {
+                return Err("initial workspace exceeds package byte limits".into());
+            }
+            let digest = rprov_raw_blake3(&file.contents);
+            let entry = format!("initial-workspace/blobs/{digest}");
+            files.push(RprovInitialWorkspaceFile {
+                path: file.path.clone(),
+                entry: entry.clone(),
+            });
+            if published.insert(entry.clone()) {
+                let local_name = format!("{artifact_tag}-starter-{digest}.bin");
+                inventory.push(RprovInventoryEntry {
+                    path: entry.clone(),
+                    byte_length: length,
+                    blake3: digest,
+                    kind: RprovEntryKind::InitialWorkspaceBlob,
+                });
+                payloads.push(FinalizationPayload {
+                    entry,
+                    path: state_directory.join(&local_name),
+                    byte_length: length,
+                    blake3: digest,
+                });
+                starter_publications.push((local_name, file.contents.clone()));
+            }
+        }
+        Some(RprovInitialWorkspace { files })
+    } else {
+        None
+    };
+    let initial_files = checkpoint_files(&initial_checkpoint.snapshot);
+    let initial_owner = event_reference(&initial_checkpoint.owning_event);
+    let final_owner = event_reference(&final_checkpoint.owning_event);
+    let final_tree_hash = final_checkpoint.snapshot.workspace_hash();
+    drop((initial_checkpoint, final_checkpoint));
+
+    // RECOVERY_CAPTURE, which the caller publishes, is the commit point.
+    // Components left before it by an interruption are incomplete and may be
+    // replaced by the next owned, fully validated boundary capture.
+    let starter_bytes = starter_publications
+        .iter()
+        .map(|(_, bytes)| bytes.len() as u64)
+        .sum::<u64>();
+    authority.headroom(
+        (event_bytes.len() as u64)
+            .checked_add(totals.encoded_bytes)
+            .and_then(|total| total.checked_add(starter_bytes))
+            .ok_or("recovery capture byte count overflow")?,
+    )?;
+    let replacing_partial = artifact_exists(owner, RECOVERY_EVENTS)?;
+    owner.publish_artifact(event_artifact, &event_bytes, replacing_partial)?;
+    let mut checkpoint_refs = Vec::with_capacity(checkpoint_count);
+    checkpoints.for_each(|index, checkpoint| {
+        if !owned_by_prefix(&checkpoint) {
             return Err("checkpoint owner differs from the fixed event prefix".into());
         }
+        let sequence = checkpoint.owning_event.sequence;
         let bytes = encode_checkpoint(&checkpoint.snapshot)?;
         let digest = rprov_raw_blake3(&bytes);
         let local_name = format!("{artifact_tag}-checkpoint-{sequence:020}.rcpk");
         let entry = format!("segments/{ordinal:04}/checkpoints/{sequence:020}.rcpk");
         let role = if index == 0 {
             RprovCheckpointRole::Initial
-        } else if terminal.is_some() && index + 1 == checkpoints.len() {
+        } else if terminal.is_some() && index + 1 == checkpoint_count {
             RprovCheckpointRole::Final
         } else {
             RprovCheckpointRole::Accepted
@@ -1308,34 +1480,17 @@ fn capture_current_segment(
             byte_length: bytes.len() as u64,
             blake3: digest,
         });
-        publications.push((local_name, bytes));
-    }
-    let initial_checkpoint = checkpoints.first().ok_or("missing initial checkpoint")?;
-    let final_checkpoint = checkpoints.last().ok_or("missing final checkpoint")?;
-    if initial_checkpoint.owning_event.sequence != 1
-        || terminal
-            .is_some_and(|terminal| final_checkpoint.owning_event.sequence + 1 != terminal.sequence)
-        || terminal.is_none()
-            && final_checkpoint.owning_event.sequence
-                != prefix_events.last().map_or(0, |event| event.sequence)
+        owner.publish_artifact(&local_name, &bytes, replacing_partial)?;
+        Ok(())
+    })?;
+    if checkpoint_refs.first().map(|checkpoint| &checkpoint.owner) != Some(&initial_owner)
+        || checkpoint_refs.last().map(|checkpoint| &checkpoint.owner) != Some(&final_owner)
     {
-        return Err("final checkpoint is not the exact captured boundary event".into());
+        return Err("checkpoint listing changed during the capture".into());
     }
-
-    let runtime_metadata = capture_runtime_metadata(
-        owner,
-        state_directory,
-        metadata,
-        ordinal,
-        &event_by_sequence,
-    )?;
-    inventory.extend(runtime_metadata.inventory);
-    payloads.extend(runtime_metadata.payloads);
-    let captured_evidence =
-        capture_evidence(owner, state_directory, metadata, ordinal, prefix_events)?;
-    inventory.extend(captured_evidence.inventory);
-    payloads.extend(captured_evidence.payloads);
-    let source_links = capture_source_links(prefix_events)?;
+    for (name, bytes) in &starter_publications {
+        owner.publish_artifact(name, bytes, replacing_partial)?;
+    }
 
     let last_event = terminal
         .or_else(|| prefix_events.last())
@@ -1377,51 +1532,8 @@ fn capture_current_segment(
             value: terminal.event_hash,
         }),
         final_tree_hash: terminal.map_or(RprovKnown::Unknown, |_| RprovKnown::Known {
-            value: final_checkpoint.snapshot.workspace_hash(),
+            value: final_tree_hash,
         }),
-    };
-
-    let initial_workspace = if include_initial_workspace {
-        let mut files = Vec::with_capacity(initial_checkpoint.snapshot.files().len());
-        if initial_checkpoint.snapshot.files().len() > MAX_RPROV_INITIAL_FILES {
-            return Err("initial workspace exceeds the package file limit".into());
-        }
-        let mut total = 0_u64;
-        let mut published = BTreeSet::new();
-        for file in initial_checkpoint.snapshot.files() {
-            let length = file.contents.len() as u64;
-            total = total
-                .checked_add(length)
-                .ok_or("initial workspace byte count overflow")?;
-            if length > MAX_RPROV_INITIAL_FILE_BYTES || total > MAX_RPROV_INITIAL_WORKSPACE_BYTES {
-                return Err("initial workspace exceeds package byte limits".into());
-            }
-            let digest = rprov_raw_blake3(&file.contents);
-            let entry = format!("initial-workspace/blobs/{digest}");
-            files.push(RprovInitialWorkspaceFile {
-                path: file.path.clone(),
-                entry: entry.clone(),
-            });
-            if published.insert(entry.clone()) {
-                let local_name = format!("{artifact_tag}-starter-{digest}.bin");
-                inventory.push(RprovInventoryEntry {
-                    path: entry.clone(),
-                    byte_length: length,
-                    blake3: digest,
-                    kind: RprovEntryKind::InitialWorkspaceBlob,
-                });
-                payloads.push(FinalizationPayload {
-                    entry,
-                    path: state_directory.join(&local_name),
-                    byte_length: length,
-                    blake3: digest,
-                });
-                publications.push((local_name, file.contents.clone()));
-            }
-        }
-        Some(RprovInitialWorkspace { files })
-    } else {
-        None
     };
 
     inventory.sort_by(|left, right| left.path.cmp(&right.path));
@@ -1430,41 +1542,27 @@ fn capture_current_segment(
         segment,
         inventory,
         payloads,
-        publications,
+        publications: Vec::new(),
         prefix_bytes,
         initial_workspace,
-        final_workspace: checkpoint_files(&final_checkpoint.snapshot),
+        initial_files,
+        final_workspace,
         gaps: captured_evidence.gaps,
     })
 }
 
 fn publish_current_capture(
-    owner: &PinnedJournalFile,
     authority: &super::Authority,
-    current: &CapturedCurrent,
     persisted: &PersistedCurrentCapture,
 ) -> Result<()> {
     let persisted_bytes = serde_json::to_vec(persisted)?;
     if persisted_bytes.len() > FINALIZATION_METADATA_LIMIT {
         return Err("current recovery capture exceeds its bounded metadata limit".into());
     }
-    let publication_bytes = current.publications.iter().try_fold(
-        persisted_bytes.len() as u64,
-        |total, (_, bytes)| {
-            total
-                .checked_add(bytes.len() as u64)
-                .ok_or("recovery capture byte count overflow")
-        },
-    )?;
-    authority.headroom(publication_bytes)?;
-    let replacing_partial = artifact_exists(owner, RECOVERY_EVENTS)?;
-    for (name, bytes) in &current.publications {
-        // RECOVERY_CAPTURE below is the commit point. Components left before
-        // that marker by an interruption are incomplete and may be replaced by
-        // the next owned, fully validated boundary capture.
-        owner.publish_artifact(name, bytes, replacing_partial)?;
-    }
-    owner.publish_artifact(RECOVERY_CAPTURE, &persisted_bytes, false)?;
+    authority.headroom(persisted_bytes.len() as u64)?;
+    authority
+        .owner
+        .publish_artifact(RECOVERY_CAPTURE, &persisted_bytes, false)?;
     Ok(())
 }
 
@@ -3187,6 +3285,7 @@ fn rebase_prefix_capture(
         publications: Vec::new(),
         prefix_bytes: read_declared_payload(&persisted.payloads, &persisted.segment.events.entry)?,
         initial_workspace: persisted.initial_workspace.clone(),
+        initial_files: BTreeMap::new(),
         final_workspace: BTreeMap::new(),
         gaps: persisted.gaps.clone(),
     })
@@ -3557,23 +3656,24 @@ fn validate_current_journal(
     if encode_event_stream(&events[..prefix_count])? != expected_bytes {
         return Err("local journal prefix differs from the immutable recovery capture".into());
     }
-    let checkpoints = read_all_checkpoints(
-        &mut journal,
-        &persisted.segment.session_id,
-        MAX_RPROV_CHECKPOINTS_PER_SEGMENT,
-    )?;
-    if checkpoints.len() != persisted.segment.checkpoints.len() {
+    journal.verify_session_checkpoints(&persisted.segment.session_id)?;
+    let mut checkpoints = JournalCheckpoints::new(&mut journal, &persisted.segment.session_id)?;
+    let declarations = &persisted.segment.checkpoints;
+    if checkpoints.totals.count != declarations.len() as u64 {
         return Err("local checkpoint count differs from the immutable recovery capture".into());
     }
-    for (stored, declaration) in checkpoints.iter().zip(&persisted.segment.checkpoints) {
+    checkpoints.for_each(|index, stored| {
+        let declaration = declarations
+            .get(index)
+            .ok_or("local checkpoint count differs from the immutable recovery capture")?;
         let bytes = read_declared_payload(&persisted.payloads, &declaration.entry)?;
         if declaration.owner != event_reference(&stored.owning_event)
             || encode_checkpoint(&stored.snapshot)? != bytes
         {
             return Err("local checkpoint differs from the immutable recovery capture".into());
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn artifact_exists(owner: &PinnedJournalFile, name: &str) -> Result<bool> {
@@ -3652,35 +3752,6 @@ fn read_all_events(journal: &mut Journal, session_id: &SessionId) -> Result<Vec<
             .and_then(|event| event.sequence.checked_add(1))
             .ok_or("journal event sequence overflow")?;
         result.extend(page);
-    }
-    Ok(result)
-}
-
-fn read_all_checkpoints(
-    journal: &mut Journal,
-    session_id: &SessionId,
-    maximum: usize,
-) -> Result<Vec<StoredCheckpoint>> {
-    let verified = journal.verify_session_checkpoints(session_id)?;
-    if verified.checkpoint_count == 0 {
-        return Err("journal has no checkpoints to finalize".into());
-    }
-    FinalizationLimitExceeded::check("checkpoints", verified.checkpoint_count, maximum as u64)?;
-    let mut result = Vec::with_capacity(verified.checkpoint_count as usize);
-    let mut next = 1_u64;
-    loop {
-        let page = journal.list_checkpoints(session_id, next, MAX_CHECKPOINTS_PER_READ)?;
-        if page.is_empty() {
-            break;
-        }
-        next = page
-            .last()
-            .and_then(|checkpoint| checkpoint.owning_event.sequence.checked_add(1))
-            .ok_or("checkpoint sequence overflow")?;
-        result.extend(page);
-    }
-    if result.len() as u64 != verified.checkpoint_count {
-        return Err("checkpoint listing differs from its verified count".into());
     }
     Ok(result)
 }
