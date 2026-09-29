@@ -316,6 +316,9 @@ impl PinnedFixtures {
     }
 }
 
+const FIXTURES_CHANGED_PREFIX: &str = "warning: the files in ";
+const FIXTURES_CHANGED_DIFFER: &str = " differ from the assignment package; ";
+
 /// Warns that a Run uses fixture files that differ from the package. The text
 /// keeps "warning" and none of the words that make a toast an error.
 pub(crate) fn fixtures_changed_warning(folder: &str, test_case: bool) -> String {
@@ -326,10 +329,16 @@ pub(crate) fn fixtures_changed_warning(folder: &str, test_case: bool) -> String 
     };
     crate::display::label(
         &format!(
-            "warning: the files in {folder} differ from the assignment package; {consequence}. To restore them, remove the files you changed or added, then quit and resume the workspace"
+            "{FIXTURES_CHANGED_PREFIX}{folder}{FIXTURES_CHANGED_DIFFER}{consequence}. To restore them, remove the files you changed or added, then quit and resume the workspace"
         ),
         512,
     )
+}
+
+/// Whether a status is a [`fixtures_changed_warning`], which the editor keeps
+/// showing after the short run it warned about finishes.
+pub(crate) fn is_fixtures_changed_warning(status: &str) -> bool {
+    status.starts_with(FIXTURES_CHANGED_PREFIX) && status.contains(FIXTURES_CHANGED_DIFFER)
 }
 
 /// The files of one format 3 case, read fresh from the case folder just

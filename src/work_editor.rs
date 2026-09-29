@@ -832,7 +832,10 @@ where
         let completed_test_case = if let Some(result) = session.take_test_case_result() {
             let next = test_cases.record_completed(result);
             output_scroll = usize::MAX;
-            status.clear();
+            // A changed-fixtures warning outlives its short run.
+            if !crate::console::is_fixtures_changed_warning(&status) {
+                status.clear();
+            }
             if let Some(next) = next {
                 start_test_case_sequence(session, &mut test_cases, &mut status, next);
             }
@@ -849,7 +852,9 @@ where
             session.completed_format_rejection(),
             &session.command_status(),
             &mut save_triggered_check,
-        ) {
+        ) && (toast_for_status(&next_status).is_some()
+            || !crate::console::is_fixtures_changed_warning(&status))
+        {
             status = next_status.into();
         }
         if non_test_command_owned_tick(
@@ -4291,6 +4296,25 @@ format = ["cargo", "fmt"]
         );
         assert_eq!(refusal_fixture.lifecycle_events(), before);
         assert!(refusal_fixture.0.join("src/only.rs").exists());
+    }
+
+    #[test]
+    fn changed_fixture_warnings_are_warning_toasts_that_outlive_their_run() {
+        for test_case in [true, false] {
+            let warning =
+                crate::console::fixtures_changed_warning("lab2.test-cases/files", test_case);
+            assert!(crate::console::is_fixtures_changed_warning(&warning));
+            assert_eq!(
+                toast_for_status(&warning),
+                Some(ToastState::new(ToastKind::Warning, "warning", warning.clone()))
+            );
+        }
+        assert!(!crate::console::is_fixtures_changed_warning(
+            "warning: the files in the editor"
+        ));
+        assert!(!crate::console::is_fixtures_changed_warning(
+            "console command preparation started"
+        ));
     }
 
     #[test]
