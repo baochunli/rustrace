@@ -379,6 +379,82 @@ pub fn hash_deployed_fixture_tree(
     Ok(read_deployed_fixture_tree(test_cases)?.map(|tree| tree.hash()))
 }
 
+/// A deployed `files/` directory held open by descriptor.
+///
+/// A program run from the fixture tree must run in the directory whose
+/// contents were hashed. The descriptor pins that directory: every read goes
+/// through it, and a child process can change into it with `fchdir` rather
+/// than by path, so renaming or replacing `files/` after hashing cannot give
+/// the program a different directory. The pin covers the directory object,
+/// not its contents or its parent: files can still change after the last
+/// read, and paths relative to it such as `..` resolve against wherever the
+/// directory is at that moment.
+#[derive(Debug)]
+pub struct PinnedFixtureRoot {
+    root: PinnedWorkspaceRoot,
+}
+
+impl PinnedFixtureRoot {
+    /// The absolute path `TEST_CASES/files` the directory was opened at.
+    pub fn path(&self) -> &std::path::Path {
+        self.root.path()
+    }
+
+    /// Reads the tree through the retained descriptor, with the same rules
+    /// as [`read_deployed_fixture_tree`].
+    pub fn read(&self) -> Result<FixtureTree, FixtureTreeError> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            deployed::read_root(self)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Err(FixtureTreeError::UnsupportedPlatform)
+        }
+    }
+
+    /// The fixture-tree hash of the directory's current contents.
+    pub fn hash(&self) -> Result<Hash, FixtureTreeError> {
+        Ok(self.read()?.hash())
+    }
+
+    /// Confirms that the opened path still names this same directory.
+    pub fn verify_binding(&self) -> Result<(), FixtureTreeError> {
+        self.root
+            .verify_binding()
+            .map_err(|error| FixtureTreeError::Filesystem {
+                operation: "verify the fixture root",
+                path: self.root.path().to_owned(),
+                message: error.to_string(),
+            })
+    }
+
+    /// The retained directory descriptor, for a child process to `fchdir`
+    /// into. It is close-on-exec, so it never reaches the program itself.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn directory_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.root.directory().as_fd()
+    }
+}
+
+/// Opens the deployed `files/` directory below a pinned `test-cases/` root
+/// without following links, or returns `Ok(None)` when it is absent. A
+/// `files` entry that is not a real directory is an error.
+pub fn open_deployed_fixture_root(
+    test_cases: &PinnedWorkspaceRoot,
+) -> Result<Option<PinnedFixtureRoot>, FixtureTreeError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        deployed::open_root(test_cases)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = test_cases;
+        Err(FixtureTreeError::UnsupportedPlatform)
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod deployed {
     use std::ffi::OsStr;
@@ -391,7 +467,9 @@ mod deployed {
     use rustix::io::Errno;
     use rustrace_model::WorkspacePath;
 
-    use super::{FIXTURE_ROOT, FixtureTree, FixtureTreeError, fixture_path_problem};
+    use super::{
+        FIXTURE_ROOT, FixtureTree, FixtureTreeError, PinnedFixtureRoot, fixture_path_problem,
+    };
     use crate::assignment_package::MAX_TEST_CASE_FILE_BYTES;
     use crate::hash::PinnedWorkspaceRoot;
     use crate::hash::is_excluded_file_name;
@@ -409,6 +487,17 @@ mod deployed {
     pub(super) fn read(
         test_cases: &PinnedWorkspaceRoot,
     ) -> Result<Option<FixtureTree>, FixtureTreeError> {
+        let Some(root) = open_root(test_cases)? else {
+            return Ok(None);
+        };
+        let tree = read_root(&root)?;
+        verify(test_cases)?;
+        Ok(Some(tree))
+    }
+
+    pub(super) fn open_root(
+        test_cases: &PinnedWorkspaceRoot,
+    ) -> Result<Option<PinnedFixtureRoot>, FixtureTreeError> {
         verify(test_cases)?;
         let root_path = test_cases.path().join(FIXTURE_ROOT);
         let discovered = match statat(
@@ -440,10 +529,17 @@ mod deployed {
                 path: String::new(),
             },
         })?;
+        // A real directory inside the canonical case folder, so its joined
+        // path is canonical too and binding checks compare like for like.
+        Ok(Some(PinnedFixtureRoot {
+            root: PinnedWorkspaceRoot::from_retained_directory(root_path, root, discovered),
+        }))
+    }
+
+    pub(super) fn read_root(root: &PinnedFixtureRoot) -> Result<FixtureTree, FixtureTreeError> {
         let mut tree = FixtureTree::default();
-        walk(&root, &root_path, None, &mut tree)?;
-        verify(test_cases)?;
-        Ok(Some(tree))
+        walk(root.root.directory(), root.path(), None, &mut tree)?;
+        Ok(tree)
     }
 
     fn walk(
