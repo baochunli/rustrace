@@ -250,7 +250,7 @@ fn status_distinguishes_unfinished_incomplete_and_finalized_receipts() {
         text.contains(&format!("UNFINISHED session {failed_id}"))
             && text
                 .contains("Unfinished (last submit failed: interrupted before immutable capture)")
-            && text.contains("run `rustrace submit` again"),
+            && text.contains("Running `rustrace submit` again retries it"),
         "{text}"
     );
     assert!(!text.contains("INCOMPLETE RECOVERY"), "{text}");
@@ -271,6 +271,14 @@ fn status_distinguishes_unfinished_incomplete_and_finalized_receipts() {
             "capture_available": true
         }))
         .unwrap(),
+    )
+    .unwrap();
+    // Only a capture artifact makes the marker a real incomplete recovery.
+    fs::write(
+        incomplete
+            .workspace
+            .join(".rustrace/finalization-recovery-capture.json"),
+        b"{}",
     )
     .unwrap();
     let output = run(&[Path::new("status"), &incomplete.workspace]);
@@ -731,15 +739,20 @@ fn status_counts_checkpoints_events_and_launches_only_when_no_session_is_open() 
     let checkpoints = journal.checkpoint_totals(&id).unwrap().count;
     let events = journal.verify_session_chain(&id).unwrap().event_count;
     drop(journal);
+    let (checkpoints, events) = (checkpoints as i64, events as i64);
     let output = run(&[Path::new("status"), &fixture.workspace]);
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(
+        // Room leaves out what submit itself adds: one checkpoint and up to
+        // three events.
         text.contains(&format!(
-            "Recorded checkpoints: {checkpoints} of the 8,192 one submission can hold"
+            "Checkpoints: {checkpoints} recorded; room for {} more before `rustrace submit` stops",
+            rustrace::display::grouped((8_191 - checkpoints) as u64)
         )) && text.contains(&format!(
-            "Recorded events: {events} of the 1,000,000 one submission can hold"
-        )) && text.contains("Recorded launches: 0; a submission keeps at most 64")
+            "Events: {events} recorded; room for {} more before `rustrace submit` stops",
+            rustrace::display::grouped((999_997 - events) as u64)
+        )) && text.contains("Launches: 0 recorded; a submission keeps at most 64")
             && !text.contains("Warning:"),
         "{text}"
     );

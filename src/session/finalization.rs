@@ -16,20 +16,23 @@ use rustrace_journal::{
 };
 use rustrace_model::{
     DecodeOutcome, DecodePolicy, EditOrigin, Event, EventEnvelope, Hash, MAX_IDENTIFIER_BYTES,
-    MAX_RPROV_CHECKPOINTS_PER_SEGMENT, MAX_RPROV_EVENTS, MAX_RPROV_EVIDENCE_PER_SEGMENT,
-    MAX_RPROV_EVIDENCE_USAGES, MAX_RPROV_EVIDENCE_USAGES_PER_ARTIFACT,
-    MAX_RPROV_INITIAL_FILE_BYTES, MAX_RPROV_INITIAL_FILES, MAX_RPROV_INITIAL_WORKSPACE_BYTES,
-    MAX_RPROV_MANIFEST_BYTES, MAX_RPROV_METADATA_ENTRY_BYTES, MAX_RPROV_METADATA_PER_SEGMENT,
+    MAX_RPROV_ARCHIVE_ENTRIES, MAX_RPROV_CHECKPOINT_BYTES, MAX_RPROV_CHECKPOINTS_PER_SEGMENT,
+    MAX_RPROV_EVENTS, MAX_RPROV_EVENTS_BYTES, MAX_RPROV_EVIDENCE_BYTES,
+    MAX_RPROV_EVIDENCE_PER_SEGMENT, MAX_RPROV_EVIDENCE_USAGES,
+    MAX_RPROV_EVIDENCE_USAGES_PER_ARTIFACT, MAX_RPROV_INITIAL_FILE_BYTES, MAX_RPROV_INITIAL_FILES,
+    MAX_RPROV_INITIAL_WORKSPACE_BYTES, MAX_RPROV_MANIFEST_BYTES, MAX_RPROV_METADATA_BYTES,
+    MAX_RPROV_METADATA_ENTRY_BYTES, MAX_RPROV_METADATA_PER_SEGMENT,
     MAX_RPROV_SEGMENT_CHECKPOINT_BYTES, MAX_RPROV_SEGMENT_EVENTS_BYTES, MAX_RPROV_SEGMENTS,
-    MAX_RPROV_SOURCE_LINKS_PER_SEGMENT, RPROV_FORMAT_VERSION_V1, RecordedEventRef,
-    RprovAssignmentManifestIdentity, RprovCheckpointRef, RprovCheckpointRole, RprovEntryKind,
-    RprovEventStreamCompleteness, RprovEventStreamRef, RprovEvidenceKind, RprovEvidenceRef,
-    RprovInitialWorkspace, RprovInitialWorkspaceFile, RprovInterAttemptTime, RprovInventoryEntry,
-    RprovKnown, RprovLegacyPasteVerification, RprovManifest, RprovMetadataRef, RprovPackageState,
-    RprovParentLink, RprovProducer, RprovRecoveryGap, RprovSegment, RprovSegmentTime,
-    RprovSourceLink, RprovSubmittedSourceComparison, RprovToolVersion, RprovUnavailableAssurance,
-    SessionId, WorkspacePath, decode_envelope, decode_rprov_manifest, encode_envelope,
-    encode_rprov_manifest, rprov_raw_blake3, validate_rprov_event_stream, validate_rprov_payload,
+    MAX_RPROV_SOURCE_LINKS, MAX_RPROV_SOURCE_LINKS_PER_SEGMENT, RPROV_FORMAT_VERSION_V1,
+    RecordedEventRef, RprovAssignmentManifestIdentity, RprovCheckpointRef, RprovCheckpointRole,
+    RprovEntryKind, RprovEventStreamCompleteness, RprovEventStreamRef, RprovEvidenceKind,
+    RprovEvidenceRef, RprovInitialWorkspace, RprovInitialWorkspaceFile, RprovInterAttemptTime,
+    RprovInventoryEntry, RprovKnown, RprovLegacyPasteVerification, RprovManifest, RprovMetadataRef,
+    RprovPackageState, RprovParentLink, RprovProducer, RprovRecoveryGap, RprovSegment,
+    RprovSegmentTime, RprovSourceLink, RprovSubmittedSourceComparison, RprovToolVersion,
+    RprovUnavailableAssurance, SessionId, WorkspacePath, decode_envelope, decode_rprov_manifest,
+    encode_envelope, encode_rprov_manifest, rprov_raw_blake3, validate_rprov_event_stream,
+    validate_rprov_payload,
 };
 use rustrace_replay::ReplayEngine;
 use rustrace_workspace::hash::{
@@ -55,10 +58,10 @@ const RECOVERY_CAPTURE: &str = "finalization-recovery-capture.json";
 const RECOVERY_EVENTS: &str = "finalization-recovery-events.jsonl";
 const FINALIZATION_METADATA_LIMIT: usize = MAX_RPROV_MANIFEST_BYTES;
 const INCOMPLETE_REASON_BYTES: usize = 4096;
-/// Any of these makes the finalization immutable: a new attempt can no longer
-/// resume the journal, so a failure marker next to one is a real incomplete
-/// recovery rather than a failed submit attempt.
-const CAPTURE_ARTIFACTS: [&str; 5] = [
+/// Any of these makes the finalization immutable: the journal can no longer
+/// resume, and a failure marker next to one is a real incomplete recovery.
+/// Without them, a failure marker only records why the last submit stopped.
+pub(super) const CAPTURE_ARTIFACTS: [&str; 5] = [
     RECEIPT_MARKER,
     PREPARED_MARKER,
     RECOVERY_CAPTURE,
@@ -74,14 +77,40 @@ pub(super) struct FinalizationLimitExceeded {
     what: &'static str,
     count: u64,
     limit: u64,
+    /// The count includes the earlier attempts a linked revision carries.
+    with_earlier_attempts: bool,
+    /// One of the limits Rustrace has raised as sessions grew (checkpoints
+    /// and packaged files). A newer release may raise it again, so updating
+    /// may let the same journal submit; for the others it cannot.
+    raised_by_updates: bool,
 }
 
 impl FinalizationLimitExceeded {
     fn check(what: &'static str, count: u64, limit: u64) -> Result<()> {
+        Self::check_with(what, count, limit, false, false)
+    }
+
+    pub(super) fn check_with(
+        what: &'static str,
+        count: u64,
+        limit: u64,
+        with_earlier_attempts: bool,
+        raised_by_updates: bool,
+    ) -> Result<()> {
         if count > limit {
-            return Err(Box::new(Self { what, count, limit }));
+            return Err(Box::new(Self {
+                what,
+                count,
+                limit,
+                with_earlier_attempts,
+                raised_by_updates,
+            }));
         }
         Ok(())
+    }
+
+    pub(super) fn raised_by_updates(&self) -> bool {
+        self.raised_by_updates
     }
 }
 
@@ -89,12 +118,167 @@ impl std::fmt::Display for FinalizationLimitExceeded {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "this attempt has {} {}, more than the {} one submission can hold",
+            "{} {} {}, more than the {} one submission can hold",
+            if self.with_earlier_attempts {
+                "this attempt and its earlier attempts together have"
+            } else {
+                "this attempt has"
+            },
             crate::display::grouped(self.count),
             self.what,
             crate::display::grouped(self.limit)
         )
     }
+}
+
+/// Package-wide sums over the segments of one finalized receipt: what a
+/// linked revision adds its own segment to.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ChainTotals {
+    pub(crate) segments: u64,
+    /// Inventory entries, not counting `manifest.json` or the outer ZIP.
+    pub(crate) entries: u64,
+    pub(crate) events: u64,
+    pub(crate) event_bytes: u64,
+    pub(crate) checkpoint_bytes: u64,
+    pub(crate) metadata_bytes: u64,
+    pub(crate) evidence_bytes: u64,
+    pub(crate) evidence_usages: u64,
+    pub(crate) source_links: u64,
+}
+
+impl ChainTotals {
+    fn of_manifest(manifest: &RprovManifest) -> Self {
+        let mut totals = Self {
+            segments: manifest.segments.len() as u64,
+            entries: manifest.inventory.len() as u64,
+            ..Self::default()
+        };
+        for segment in &manifest.segments {
+            totals.events = totals.events.saturating_add(segment.inclusive_event_count);
+            totals.event_bytes = totals
+                .event_bytes
+                .saturating_add(segment.events.byte_length);
+            for checkpoint in &segment.checkpoints {
+                totals.checkpoint_bytes = totals
+                    .checkpoint_bytes
+                    .saturating_add(checkpoint.byte_length);
+            }
+            for metadata in &segment.metadata {
+                totals.metadata_bytes = totals.metadata_bytes.saturating_add(metadata.byte_length);
+            }
+            for evidence in &segment.evidence {
+                totals.evidence_bytes = totals.evidence_bytes.saturating_add(evidence.byte_length);
+                totals.evidence_usages = totals
+                    .evidence_usages
+                    .saturating_add(evidence.usages.len() as u64);
+            }
+            totals.source_links = totals
+                .source_links
+                .saturating_add(segment.source_links.len() as u64);
+        }
+        totals
+    }
+
+    fn plus(self, other: Self) -> Self {
+        Self {
+            segments: self.segments.saturating_add(other.segments),
+            entries: self.entries.saturating_add(other.entries),
+            events: self.events.saturating_add(other.events),
+            event_bytes: self.event_bytes.saturating_add(other.event_bytes),
+            checkpoint_bytes: self.checkpoint_bytes.saturating_add(other.checkpoint_bytes),
+            metadata_bytes: self.metadata_bytes.saturating_add(other.metadata_bytes),
+            evidence_bytes: self.evidence_bytes.saturating_add(other.evidence_bytes),
+            evidence_usages: self.evidence_usages.saturating_add(other.evidence_usages),
+            source_links: self.source_links.saturating_add(other.source_links),
+        }
+    }
+}
+
+/// The package totals of the finalized parent a revision child continues,
+/// or `None` when its link or receipt cannot be read (finalization then
+/// reports that damage after the capture, as before).
+pub(super) fn earlier_attempt_totals(
+    link_bytes: &[u8],
+    metadata: &SessionMetadata,
+) -> Option<ChainTotals> {
+    if metadata.parent_evidence != Some(digest(link_bytes)) {
+        return None;
+    }
+    let link: RevisionLink = serde_json::from_slice(link_bytes).ok()?;
+    if link.version != 1 || link.kind != "finalized_revision" {
+        return None;
+    }
+    match ProductionSession::inspect_finalization_read_only(&link.parent_root).ok()? {
+        ReadOnlyFinalizationStatus::Finalized(parent)
+            if parent.latest_session_id == link.parent_session_id =>
+        {
+            Some(parent.chain)
+        }
+        _ => None,
+    }
+}
+
+/// Checks one submission's package-wide limits before anything is captured,
+/// so a linked revision over them stays unfinished instead of stranding its
+/// capture. `outer_files` are the source files the LMS ZIP carries beside the
+/// `.rprov`; the importer counts them against the same entry limit.
+fn check_package_totals(
+    earlier: ChainTotals,
+    own: ChainTotals,
+    outer_files: u64,
+    maximum_files: u64,
+) -> Result<()> {
+    let chained = earlier.segments > 0;
+    let total = earlier.plus(own);
+    let check = |what, count, limit, raised| {
+        FinalizationLimitExceeded::check_with(what, count, limit, chained, raised)
+    };
+    check("attempts", total.segments, MAX_RPROV_SEGMENTS as u64, false)?;
+    // manifest.json and session.rprov are the two entries beside the inventory.
+    check(
+        "packaged files",
+        total.entries.saturating_add(outer_files).saturating_add(2),
+        maximum_files,
+        true,
+    )?;
+    check("recorded events", total.events, MAX_RPROV_EVENTS, false)?;
+    check(
+        "bytes of recorded events",
+        total.event_bytes,
+        MAX_RPROV_EVENTS_BYTES,
+        false,
+    )?;
+    check(
+        "bytes of checkpoints",
+        total.checkpoint_bytes,
+        MAX_RPROV_CHECKPOINT_BYTES,
+        false,
+    )?;
+    check(
+        "bytes of toolchain observations",
+        total.metadata_bytes,
+        MAX_RPROV_METADATA_BYTES,
+        false,
+    )?;
+    check(
+        "bytes of outside-change evidence",
+        total.evidence_bytes,
+        MAX_RPROV_EVIDENCE_BYTES,
+        false,
+    )?;
+    check(
+        "recorded outside-change observations",
+        total.evidence_usages,
+        MAX_RPROV_EVIDENCE_USAGES as u64,
+        false,
+    )?;
+    check(
+        "recorded pastes",
+        total.source_links,
+        MAX_RPROV_SOURCE_LINKS as u64,
+        false,
+    )
 }
 
 impl std::error::Error for FinalizationLimitExceeded {}
@@ -105,18 +289,29 @@ impl std::error::Error for FinalizationLimitExceeded {}
 pub(super) struct FinalizationLimits {
     aggregate_events: u64,
     checkpoints: usize,
+    /// Packaged files in one submission, earlier attempts included.
+    files: u64,
 }
 
 impl FinalizationLimits {
     pub(super) const PACKAGE: Self = Self {
         aggregate_events: MAX_RPROV_EVENTS,
         checkpoints: MAX_RPROV_CHECKPOINTS_PER_SEGMENT,
+        files: MAX_RPROV_ARCHIVE_ENTRIES as u64,
     };
 
     #[cfg(test)]
     pub(super) fn with_checkpoints(maximum: usize) -> Self {
         Self {
             checkpoints: maximum,
+            ..Self::PACKAGE
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_files(maximum: u64) -> Self {
+        Self {
+            files: maximum,
             ..Self::PACKAGE
         }
     }
@@ -240,17 +435,6 @@ struct PersistedIncompleteFinalization {
     capture_available: bool,
 }
 
-impl PersistedIncompleteFinalization {
-    /// A submit that stopped before its immutable capture records only its
-    /// reason. The caller also requires that no capture artifact exists.
-    fn is_failed_attempt(&self, session_id: &SessionId) -> bool {
-        self.version == 1
-            && self.label == "INCOMPLETE RECOVERY"
-            && !self.capture_available
-            && &self.session_id == session_id
-    }
-}
-
 #[derive(Clone, Debug)]
 pub enum FinalizationStatus {
     Finalized(Box<FinalizationReceipt>),
@@ -265,6 +449,7 @@ pub(crate) struct ReadOnlyFinalizationReceipt {
     pub(crate) terminal_chain_hash: Hash,
     pub(crate) aggregate_event_count: u64,
     pub(crate) ancestry_session_ids: Vec<SessionId>,
+    pub(crate) chain: ChainTotals,
 }
 
 #[derive(Clone, Debug)]
@@ -448,8 +633,14 @@ struct CaptureCurrentInput<'a, 'j> {
     terminal: Option<&'a EventEnvelope>,
     checkpoints: JournalCheckpoints<'j>,
     maximum_checkpoints: usize,
+    maximum_files: u64,
     /// The verified live workspace the last checkpoint must equal.
     expected_final: &'a BTreeMap<WorkspacePath, Vec<u8>>,
+    /// What the earlier attempts of a linked revision already hold (zero for
+    /// a first attempt), or `None` when they cannot be read.
+    earlier: Option<ChainTotals>,
+    /// The encoded length of the terminal the submission will append.
+    terminal_bytes: u64,
     parent_link: Option<RprovParentLink>,
     original_starter_tree_hash: Hash,
     include_initial_workspace: bool,
@@ -567,20 +758,17 @@ impl ProductionSession {
         let mut owner = pinned
             .open_state_directory()?
             .open_journal_file(&metadata.session_id)?;
-        // A marker from a submit that stopped before its capture does not start
-        // finalization: the journal is still the only authority, so a new
-        // attempt resumes and finalizes it.
+        // Only a capture artifact starts finalization. Without one, a failure
+        // marker, whatever it claims or even if unreadable, records why the
+        // last submit stopped: the journal is still the only authority and
+        // resumes, so a new attempt finalizes it.
         let started = (|| -> Result<bool> {
             for name in CAPTURE_ARTIFACTS {
                 if artifact_exists(&owner, name)? {
                     return Ok(true);
                 }
             }
-            if !artifact_exists(&owner, INCOMPLETE_MARKER)? {
-                return Ok(false);
-            }
-            Ok(!read_incomplete(&owner)
-                .is_ok_and(|marker| marker.is_failed_attempt(&metadata.session_id)))
+            Ok(false)
         })();
         owner.release_ownership()?;
         if started? {
@@ -612,21 +800,27 @@ impl ProductionSession {
                 session_id: prepared.binding.session_id,
             });
         }
-        if state.artifact_exists(INCOMPLETE_MARKER)? {
+        let mut captured = false;
+        for name in CAPTURE_ARTIFACTS {
+            captured |= state.artifact_exists(name)?;
+        }
+        let has_marker = state.artifact_exists(INCOMPLETE_MARKER)?;
+        if !captured {
+            // Without a capture the journal is the only authority: the attempt
+            // is unfinished, and a marker only records why the last submit
+            // stopped, whatever else it claims.
+            let last_submit_failure = has_marker.then(|| match read_incomplete_state(&state) {
+                Ok(marker) if marker.session_id == metadata.session_id => marker.reason,
+                _ => "reason unknown: its failure record is unreadable".to_owned(),
+            });
+            return Ok(ReadOnlyFinalizationStatus::Unfinished {
+                last_submit_failure,
+            });
+        }
+        if has_marker {
             let incomplete = read_incomplete_state(&state)?;
             if incomplete.session_id != metadata.session_id {
                 return Err("incomplete finalization has the wrong session identity".into());
-            }
-            if incomplete.is_failed_attempt(&metadata.session_id) {
-                let mut captured = false;
-                for name in [RECOVERY_CAPTURE, PREFIX_EVENTS, COMPLETE_EVENTS] {
-                    captured |= state.artifact_exists(name)?;
-                }
-                if !captured {
-                    return Ok(ReadOnlyFinalizationStatus::Unfinished {
-                        last_submit_failure: Some(incomplete.reason),
-                    });
-                }
             }
             return Ok(ReadOnlyFinalizationStatus::Incomplete {
                 reason: incomplete.reason,
@@ -634,16 +828,16 @@ impl ProductionSession {
                 capture_available: incomplete.capture_available,
             });
         }
-        if state.artifact_exists(RECOVERY_CAPTURE)? {
-            return Ok(ReadOnlyFinalizationStatus::Incomplete {
-                reason: "immutable recovery capture exists without a published finalization marker"
-                    .to_owned(),
-                session_id: metadata.session_id,
-                capture_available: true,
-            });
-        }
-        Ok(ReadOnlyFinalizationStatus::Unfinished {
-            last_submit_failure: None,
+        let capture_available = state.artifact_exists(RECOVERY_CAPTURE)?;
+        Ok(ReadOnlyFinalizationStatus::Incomplete {
+            reason: if capture_available {
+                "immutable recovery capture exists without a published finalization marker"
+            } else {
+                "finalization event streams exist without their recovery capture"
+            }
+            .to_owned(),
+            session_id: metadata.session_id,
+            capture_available,
         })
     }
 
@@ -943,8 +1137,20 @@ impl ProductionSession {
         terminal_replay.apply(&terminal)?;
 
         let checkpoints = JournalCheckpoints::new(&mut journal, &self.metadata.session_id)?;
-        process_probe("finalization-before-capture");
         let had_parent = parent_evidence_kind == ParentEvidenceKind::FinalizedRevision;
+        // Unreadable ancestry is reported after the capture, as before; only
+        // readable earlier attempts can be counted up front.
+        let earlier = if had_parent {
+            authority
+                .owner
+                .read_artifact("parent.json", METADATA_LIMIT)
+                .ok()
+                .and_then(|bytes| earlier_attempt_totals(&bytes, &self.metadata))
+        } else {
+            Some(ChainTotals::default())
+        };
+        let terminal_bytes = encode_envelope(&terminal)?.len() as u64 + 1;
+        process_probe("finalization-before-capture");
         let original_starter_tree_hash = (!had_parent).then_some(self.metadata.starter_hash);
         let mut current = capture_current_segment(
             &authority,
@@ -956,7 +1162,10 @@ impl ProductionSession {
                 terminal: None,
                 checkpoints,
                 maximum_checkpoints: limits.checkpoints,
+                maximum_files: limits.files,
                 expected_final: &logical,
+                earlier,
+                terminal_bytes,
                 parent_link: None,
                 // The outer Option is authoritative for raw recovery. Zero is
                 // an inert internal sentinel and is never emitted in a manifest.
@@ -991,6 +1200,7 @@ impl ProductionSession {
             payloads: current.payloads.clone(),
             gaps: current.gaps.clone(),
         };
+        retire_failure_marker(&authority.owner, prefix.sequence)?;
         publish_current_capture(&authority, &persisted_current)?;
 
         // The raw current boundary above is the recovery commit point. Only
@@ -1275,10 +1485,12 @@ impl<'j> JournalCheckpoints<'j> {
     }
 }
 
-/// Captures the current prefix. Every limit and identity check runs before
-/// anything is published, so such a failure leaves nothing to replace; the
-/// components are then published, with checkpoints streamed one page at a
-/// time. The caller publishes `RECOVERY_CAPTURE`, the commit point.
+/// Captures the current prefix. Every limit check, and every identity check
+/// that needs no full checkpoint listing, runs before anything is published,
+/// so such a failure leaves nothing to replace. The components are then
+/// published, with checkpoints streamed one page at a time; the per-checkpoint
+/// owner checks and the listing check run during that stream, still before
+/// the caller publishes `RECOVERY_CAPTURE`, the commit point.
 fn capture_current_segment(
     authority: &super::Authority,
     state_directory: &Path,
@@ -1292,7 +1504,10 @@ fn capture_current_segment(
         terminal,
         mut checkpoints,
         maximum_checkpoints,
+        maximum_files,
         expected_final,
+        earlier,
+        terminal_bytes,
         parent_link,
         original_starter_tree_hash,
         include_initial_workspace,
@@ -1300,7 +1515,13 @@ fn capture_current_segment(
         artifact_tag,
     } = input;
     let totals = checkpoints.totals;
-    FinalizationLimitExceeded::check("checkpoints", totals.count, maximum_checkpoints as u64)?;
+    FinalizationLimitExceeded::check_with(
+        "checkpoints",
+        totals.count,
+        maximum_checkpoints as u64,
+        false,
+        true,
+    )?;
     if totals.count < 2 {
         return Err("finalization requires distinct initial/final full checkpoints".into());
     }
@@ -1430,6 +1651,35 @@ fn capture_current_segment(
     } else {
         None
     };
+    if let Some(earlier) = earlier {
+        let own = ChainTotals {
+            segments: 1,
+            entries: (inventory.len() as u64).saturating_add(totals.count),
+            events: prefix_events
+                .last()
+                .map_or(0, |event| event.sequence)
+                .saturating_add(1),
+            event_bytes: (event_bytes.len() as u64).saturating_add(terminal_bytes),
+            checkpoint_bytes: totals.encoded_bytes,
+            metadata_bytes: runtime_metadata
+                .refs
+                .iter()
+                .map(|metadata| metadata.byte_length)
+                .sum(),
+            evidence_bytes: captured_evidence
+                .refs
+                .iter()
+                .map(|evidence| evidence.byte_length)
+                .sum(),
+            evidence_usages: captured_evidence
+                .refs
+                .iter()
+                .map(|evidence| evidence.usages.len() as u64)
+                .sum(),
+            source_links: source_links.len() as u64,
+        };
+        check_package_totals(earlier, own, final_workspace.len() as u64, maximum_files)?;
+    }
     let initial_files = checkpoint_files(&initial_checkpoint.snapshot);
     let initial_owner = event_reference(&initial_checkpoint.owning_event);
     let final_owner = event_reference(&final_checkpoint.owning_event);
@@ -1560,6 +1810,21 @@ fn capture_current_segment(
         final_workspace,
         gaps: captured_evidence.gaps,
     })
+}
+
+/// A marker left by an earlier submit that stopped before its capture only
+/// records why that submit stopped. Once a new capture is about to become the
+/// commit point, the marker is renamed out of the way, so a later crash or
+/// success is never reported with the old reason; the renamed file keeps the
+/// record.
+fn retire_failure_marker(owner: &PinnedJournalFile, prefix_sequence: u64) -> Result<()> {
+    if artifact_exists(owner, INCOMPLETE_MARKER)? {
+        owner.rename_artifact(
+            INCOMPLETE_MARKER,
+            &format!("finalization-incomplete-before-{prefix_sequence:020}.json"),
+        )?;
+    }
+    Ok(())
 }
 
 fn publish_current_capture(
@@ -2824,6 +3089,7 @@ fn load_published_summary(
         .iter()
         .map(|segment| segment.session_id.clone())
         .collect();
+    let chain = ChainTotals::of_manifest(&manifest);
     Ok(ReadOnlyFinalizationReceipt {
         student_id: manifest.student_id,
         latest_session_id: manifest.latest_session_id,
@@ -2831,6 +3097,7 @@ fn load_published_summary(
         terminal_chain_hash: binding.terminal_event_hash,
         aggregate_event_count: manifest.aggregate_event_count,
         ancestry_session_ids,
+        chain,
     })
 }
 

@@ -238,7 +238,7 @@ fn write_recording_warning(
     if let Some(warning) = session
         .recording_usage()
         .ok()
-        .and_then(|usage| usage.warning(limits))
+        .and_then(|usage| usage.warning(limits, session.earlier_attempts()))
     {
         writeln!(output, "{warning}")?;
     }
@@ -702,19 +702,24 @@ format = ["cargo", "fmt"]
         let root = fs::canonicalize(root).unwrap();
         let mut session = ProductionSession::start(&root, MANIFEST).unwrap();
         let limits = crate::session::UsageLimits {
-            checkpoints: 5,
+            checkpoints: 6,
             events: u64::MAX,
+            files: u64::MAX,
         };
         let mut output = Vec::new();
         write_recording_warning(&session, limits, &mut output).unwrap();
         assert!(output.is_empty(), "the genesis checkpoint alone is 20%");
+        assert_eq!(
+            session.earlier_attempts(),
+            crate::session::EarlierAttempts::None
+        );
         for _ in 0..3 {
             session.capture_boundary().unwrap();
         }
         write_recording_warning(&session, limits, &mut output).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "Warning: this attempt has 4 checkpoints, 80% of the 5 one submission can hold. Submit it before it reaches the limit; to keep working after that, use `rustrace revise`.\n"
+            "Warning: this attempt has 4 checkpoints, and `rustrace submit` has room for only 1 more. Submit it soon; to keep working after that, use `rustrace revise`.\n"
         );
         let usage = session.recording_usage().unwrap();
         session.quit().unwrap();

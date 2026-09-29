@@ -7,6 +7,7 @@
 mod test_home;
 
 use rustrace::{
+    display::grouped,
     replay_tui::ReplayController,
     session::{ProductionSession, ResumeChoice},
     tui::EditorCommand,
@@ -162,9 +163,10 @@ fn long_attempt_past_the_old_checkpoint_limit_submits_verifies_scans_and_replays
     let status = fixture.status(&home);
     assert!(
         status.contains(&format!(
-            "Recorded checkpoints: {} of the 8,192 one submission can hold",
-            grouped(checkpoints)
-        )) && status.contains("Recorded launches: 0;")
+            "Checkpoints: {} recorded; room for {} more before `rustrace submit` stops",
+            grouped(checkpoints),
+            grouped(8_191 - checkpoints)
+        )) && status.contains("Launches: 0 recorded;")
             && !status.contains("Warning:"),
         "{status}"
     );
@@ -172,6 +174,15 @@ fn long_attempt_past_the_old_checkpoint_limit_submits_verifies_scans_and_replays
     let zip = fixture.submissions.join("student-1-lab1.zip");
     let submitted = fixture.submit(&home, &zip);
     assert!(submitted.status.success(), "{}", text(&submitted));
+    // Past 1,024 checkpoints the long capture is announced first.
+    assert!(
+        text(&submitted).starts_with(&format!(
+            "Packaging {} checkpoints; this can take a minute or two...\n",
+            grouped(checkpoints + 1)
+        )),
+        "{}",
+        text(&submitted)
+    );
     assert_clean_verification(&home, &fixture, &zip);
     let imported = import_rprov(Cursor::new(fs::read(&zip).unwrap())).unwrap();
     let segment = &imported.manifest().segments[0];
@@ -257,6 +268,16 @@ fn v0_1_7_workspace_stuck_after_its_over_limit_submit_now_submits() {
         text(&submitted)
     );
     assert_clean_verification(&home, &fixture, &zip);
+    // The retry's capture retired the v0.1.7 marker; its record is kept.
+    let state = fixture.workspace.join(".rustrace");
+    assert!(!state.join("finalization-incomplete.json").exists());
+    assert!(fs::read_dir(&state).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("finalization-incomplete-before-")
+    }));
     let imported = import_rprov(Cursor::new(fs::read(&zip).unwrap())).unwrap();
     assert_eq!(imported.manifest().latest_session_id, id);
     assert_eq!(
@@ -268,18 +289,6 @@ fn v0_1_7_workspace_stuck_after_its_over_limit_submit_now_submits() {
             .status(&home)
             .contains("FINALIZED IMMUTABLE SNAPSHOT")
     );
-}
-
-fn grouped(value: u64) -> String {
-    let digits = value.to_string();
-    let mut result = String::new();
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            result.push(',');
-        }
-        result.push(digit);
-    }
-    result
 }
 
 /// Builds the release measurement workspace: a Lab-1-sized tree of about

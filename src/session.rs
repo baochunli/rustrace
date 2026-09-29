@@ -56,8 +56,10 @@ pub(crate) use finalization::{ReadOnlyFinalizationReceipt, ReadOnlyFinalizationS
 pub use privacy::run_privacy;
 pub use retention::{run_cleanup, run_revise, run_status};
 pub use set_aside::{SetAsideVersion, run_set_aside};
+#[cfg(test)]
+pub(crate) use usage::EarlierAttempts;
 pub use usage::RecordingUsage;
-pub(crate) use usage::{UsageLimits, inspect_unfinished_usage};
+pub(crate) use usage::{UsageLimits, inspect_earlier_attempts, inspect_unfinished_usage};
 
 #[cfg(test)]
 #[path = "session_clipboard_tests.rs"]
@@ -1138,12 +1140,7 @@ impl ProductionSession {
             .display_path()
             .parent()
             .ok_or("state directory missing")?;
-        for name in [
-            "finalization-events.jsonl",
-            "finalization-prefix.jsonl",
-            "finalization-prepared.json",
-            "finalization-recovery-capture.json",
-        ] {
+        for name in finalization::CAPTURE_ARTIFACTS {
             match fs::symlink_metadata(state_directory.join(name)) {
                 Ok(_) => {
                     return Err(

@@ -225,16 +225,17 @@ pub fn run_status(args: &[String], output: &mut impl Write) -> Result<()> {
                 )?;
                 writeln!(
                     output,
-                    "That submit stopped before capturing anything, so no work is lost: fix the cause, or run `rustrace update` if it named a limit, and run `rustrace submit` again."
+                    "That submit stopped before capturing anything, so no work is lost. Running `rustrace submit` again retries it, and says what to do if it stops again."
                 )?;
             }
             writeln!(
                 output,
                 "This attempt remains mutable; its journal, checkpoints, evidence, and captures are preserved."
             )?;
-            match super::inspect_unfinished_usage(&root, &metadata.session_id) {
+            match super::inspect_unfinished_usage(&root, &metadata) {
                 Ok(Some(usage)) => {
-                    for line in usage.status_lines(super::UsageLimits::PACKAGE) {
+                    let earlier = super::inspect_earlier_attempts(&root, &metadata);
+                    for line in usage.status_lines(super::UsageLimits::PACKAGE, earlier) {
                         writeln!(output, "{line}")?;
                     }
                 }

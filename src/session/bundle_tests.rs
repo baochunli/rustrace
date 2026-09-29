@@ -431,30 +431,218 @@ fn failed_student_id_finalization_is_retried_with_a_valid_id() {
     assert!(crate::verify::verify_path(&bundle.path, None).is_clean());
 }
 
+fn state_names(workspace: &Path, prefix: &str) -> Vec<String> {
+    let mut names = fs::read_dir(workspace.join(".rustrace"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with(prefix))
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+/// Without a capture artifact the journal is the only authority, so a failure
+/// marker never blocks a submit, whatever it claims and even if unreadable.
 #[test]
-fn a_marker_that_claims_a_missing_capture_still_blocks_submit() {
-    let (fixture, session) = Fixture::started("bundle-claimed-capture");
-    let id = session.session_id().clone();
-    session.quit().unwrap();
-    fs::write(
+fn a_failure_marker_without_a_capture_never_blocks_submit() {
+    for (label, marker, reason) in [
+        (
+            "claims-capture",
+            None,
+            "captured, then the capture disappeared",
+        ),
+        (
+            "unreadable",
+            Some(b"not a marker".to_vec()),
+            "reason unknown: its failure record is unreadable",
+        ),
+    ] {
+        let (fixture, session) = Fixture::started(&format!("bundle-marker-{label}"));
+        let id = session.session_id().clone();
+        session.quit().unwrap();
+        let bytes = marker.unwrap_or_else(|| {
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "label": "INCOMPLETE RECOVERY",
+                "reason": reason,
+                "session_id": id,
+                "capture_available": true
+            }))
+            .unwrap()
+        });
+        fs::write(
+            fixture
+                .workspace
+                .join(".rustrace/finalization-incomplete.json"),
+            bytes,
+        )
+        .unwrap();
+        let status = status_text(&fixture.workspace);
+        assert!(
+            status.contains(&format!("Unfinished (last submit failed: {reason})"))
+                && !status.contains("INCOMPLETE RECOVERY"),
+            "{label}: {status}"
+        );
+        for attempt in ["first", "second"] {
+            let destination = fixture.base.join(format!("{attempt}.zip"));
+            let bundle = submit_finalized_workspace(
+                &fixture.workspace,
+                "student-1",
+                Some(destination.as_path()),
+            )
+            .unwrap_or_else(|error| panic!("{label} {attempt}: {error}"));
+            assert!(crate::verify::verify_path(&bundle.path, None).is_clean());
+        }
+        assert_eq!(
+            fs::read(fixture.base.join("first.zip")).unwrap(),
+            fs::read(fixture.base.join("second.zip")).unwrap()
+        );
+        // The capture retired the old record instead of leaving it beside the
+        // receipt.
+        assert_eq!(
+            state_names(&fixture.workspace, "finalization-incomplete").len(),
+            1,
+            "{label}"
+        );
+        assert!(
+            state_names(&fixture.workspace, "finalization-incomplete-before-").len() == 1,
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn a_retry_that_stops_after_its_capture_never_reports_the_old_failure() {
+    let (fixture, mut session) = Fixture::started("bundle-retired-marker");
+    session.execute(EditorCommand::Insert('B')).unwrap();
+    assert!(session.finalize("bad id!").is_err());
+    assert!(
+        status_text(&fixture.workspace)
+            .contains("Unfinished (last submit failed: student identifier")
+    );
+
+    // The retry captures, then stops on a lowered aggregate limit.
+    let resumed =
+        ProductionSession::resume(&fixture.workspace, MANIFEST, ResumeChoice::Resume).unwrap();
+    assert!(
+        resumed
+            .finalize_with_aggregate_limit("student-1", 0)
+            .is_err()
+    );
+    let retired = state_names(&fixture.workspace, "finalization-incomplete-before-");
+    assert_eq!(retired.len(), 1);
+    let old = fs::read_to_string(fixture.workspace.join(".rustrace").join(&retired[0])).unwrap();
+    assert!(old.contains("student identifier"), "{old}");
+    let status = status_text(&fixture.workspace);
+    assert!(
+        status.contains("INCOMPLETE RECOVERY session")
+            && status.contains("Immutable capture available: true")
+            && !status.contains("student identifier"),
+        "{status}"
+    );
+
+    // A crash right after the capture publishes no new marker: the capture
+    // alone is reported, never the retired reason.
+    fs::remove_file(
         fixture
             .workspace
             .join(".rustrace/finalization-incomplete.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "version": 1,
-            "label": "INCOMPLETE RECOVERY",
-            "reason": "captured, then the capture disappeared",
-            "session_id": id,
-            "capture_available": true
-        }))
-        .unwrap(),
     )
     .unwrap();
-    assert!(status_text(&fixture.workspace).contains("INCOMPLETE RECOVERY session"));
-    let error = submit_finalized_workspace(&fixture.workspace, "student-1", None)
+    let status = status_text(&fixture.workspace);
+    assert!(
+        status
+            .contains("immutable recovery capture exists without a published finalization marker")
+            && status.contains("Immutable capture available: true")
+            && !status.contains("student identifier"),
+        "{status}"
+    );
+    let FinalizationStatus::Incomplete(incomplete) =
+        ProductionSession::recover_finalization(&fixture.workspace).unwrap()
+    else {
+        panic!("a capture without a prepared marker stays incomplete");
+    };
+    assert!(incomplete.capture_available);
+    assert!(!incomplete.reason.contains("student identifier"));
+}
+
+#[test]
+fn a_revision_over_the_package_file_limit_stays_unfinished_and_retries() {
+    let (fixture, mut parent) = Fixture::started("bundle-chain-limit");
+    parent.execute(EditorCommand::Insert('B')).unwrap();
+    parent.capture_boundary().unwrap();
+    let parent_receipt = parent.finalize("student-1").unwrap();
+    let parent_entries = parent_receipt.manifest().inventory.len() as u64;
+    let child_root = fixture.base.join("child");
+    fs::create_dir(&child_root).unwrap();
+    for (path, bytes) in parent_receipt.final_workspace() {
+        fs::write(child_root.join(path.as_str()), bytes).unwrap();
+    }
+    let mut child =
+        ProductionSession::start_revision(&fixture.workspace, &child_root, MANIFEST).unwrap();
+    for _ in 0..3 {
+        child.execute(EditorCommand::Insert('C')).unwrap();
+        child.capture_boundary().unwrap();
+    }
+    // The earlier attempt fits, but not together with this one.
+    let maximum = parent_entries + 4;
+    let error = child
+        .finalize_with_limits(
+            "student-1",
+            super::finalization::FinalizationLimits::with_files(maximum),
+        )
         .unwrap_err()
         .to_string();
-    assert!(error.contains("INCOMPLETE RECOVERY"), "{error}");
+    assert!(
+        error.starts_with("this attempt and its earlier attempts together have ")
+            && error.ends_with(&format!(
+                " packaged files, more than the {maximum} one submission can hold"
+            )),
+        "{error}"
+    );
+    let captured = state_names(&child_root, "finalization-")
+        .into_iter()
+        .filter(|name| {
+            name != "finalization-incomplete.json" && !name.starts_with("finalization-origin-")
+        })
+        .collect::<Vec<_>>();
+    assert!(captured.is_empty(), "nothing was captured: {captured:?}");
+    let status = status_text(&child_root);
+    assert!(
+        status.contains("Unfinished (last submit failed: this attempt and its earlier attempts")
+            && status.contains("Earlier attempts: 1, already holding"),
+        "{status}"
+    );
+
+    let destination = fixture.base.join("child.zip");
+    let bundle =
+        submit_finalized_workspace(&child_root, "student-1", Some(destination.as_path())).unwrap();
+    assert!(crate::verify::verify_path(&bundle.path, None).is_clean());
+    let imported = import_rprov(Cursor::new(fs::read(&bundle.path).unwrap())).unwrap();
+    assert_eq!(imported.manifest().segments.len(), 2);
+}
+
+#[test]
+fn a_submit_limit_names_the_remedy_only_an_update_can_bring() {
+    let remedy = |raised| {
+        super::bundle::failed_before_capture(
+            super::finalization::FinalizationLimitExceeded::check_with(
+                "recorded pastes",
+                4_097,
+                4_096,
+                false,
+                raised,
+            )
+            .unwrap_err(),
+        )
+    };
+    assert_eq!(
+        remedy(false),
+        "this attempt has 4,097 recorded pastes, more than the 4,096 one submission can hold; no bundle was created. Nothing was captured, so this attempt is still unfinished and your code and recorded history are intact. Tell your course staff: updating Rustrace does not raise this limit"
+    );
+    assert!(remedy(true).ends_with(
+        "Run `rustrace update` and submit again; if it stops here again, tell your course staff"
+    ));
 }
 
 #[test]
