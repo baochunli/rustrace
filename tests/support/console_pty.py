@@ -568,12 +568,32 @@ try:
         assert len(captures) == 1, captures
         assert captures[0]["execution"]["outcome"]["reason"] == "cancelled", captures
 
+        # A terminal paste into the focused console, such as a command copied
+        # from a handout, is blocked and recorded as outside the editor.
+        send(b"\x1b[200~cargo run -- -n fn\x1b[201~")
+        wait_screen("Paste blocked:")
+
         metadata = json.loads((work / ".rustrace/session.json").read_bytes())
         database = work / ".rustrace" / f"{metadata['session_id']}.sqlite"
-        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
-            events = [json.loads(row[0]) for row in connection.execute(
-                "SELECT payload FROM events ORDER BY sequence"
-            )]
+
+        def journal_events():
+            with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+                return [json.loads(row[0]) for row in connection.execute(
+                    "SELECT payload FROM events ORDER BY sequence"
+                )]
+
+        def rejected_pastes():
+            return [
+                event["event"]["payload"]
+                for event in journal_events()
+                if event["event"]["type"] == "paste_rejected"
+            ]
+
+        wait_for(lambda: rejected_pastes(), "recorded console paste rejection")
+        assert rejected_pastes() == [
+            {"reason": "outside_editor", "channel": "terminal_bracketed"}
+        ], rejected_pastes()
+        events = journal_events()
         starts = [
             event["event"]["payload"]
             for event in events
