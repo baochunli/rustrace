@@ -41,6 +41,9 @@ pub(crate) enum ProcessStdin {
     Closed,
     File(File),
     Submitted(Receiver<StdinMessage>),
+    /// Exactly these bytes through a pipe, then end of file: the bytes a
+    /// packaged case's input was hashed from, never a reread of the file.
+    Bytes(Vec<u8>),
 }
 
 pub(crate) enum ProcessStdout {
@@ -52,6 +55,29 @@ pub(crate) struct ProcessIo {
     pub stdin: ProcessStdin,
     pub stdout: ProcessStdout,
     pub live: Option<LiveOutput>,
+}
+
+/// Start the child in the directory `descriptor` names, by `fchdir` after
+/// fork. The standard library applies any `current_dir` path first, so a path
+/// that no longer exists still fails the launch, and this then moves the
+/// child into the exact directory the caller pinned. The caller must keep the
+/// descriptor open until the spawn returns.
+#[cfg(unix)]
+pub(crate) fn change_directory_to_descriptor(
+    command: &mut std::process::Command,
+    descriptor: std::os::fd::RawFd,
+) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: fchdir is async-signal-safe and affects only the child.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fchdir(descriptor) == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
 }
 
 /// Leave `descriptor` open across exec in the child only; the parent's copy
@@ -641,15 +667,34 @@ struct SubmittedInput {
 #[cfg(unix)]
 impl SubmittedInput {
     fn new(receiver: Receiver<StdinMessage>, writer: std::process::ChildStdin) -> Self {
+        Self::start(Some(receiver), Vec::new(), writer)
+    }
+
+    /// Writes `bytes` without blocking as the child reads them, then closes
+    /// the pipe. A child that exits early just ends the writes.
+    fn from_bytes(bytes: Vec<u8>, writer: std::process::ChildStdin) -> Self {
+        Self::start(None, bytes, writer)
+    }
+
+    fn start(
+        receiver: Option<Receiver<StdinMessage>>,
+        bytes: Vec<u8>,
+        writer: std::process::ChildStdin,
+    ) -> Self {
         use std::os::fd::AsRawFd;
         let fd = writer.as_raw_fd();
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        let eof = flags == -1
+        let failed = flags == -1
             || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1;
+        let eof = failed || receiver.is_none();
         Self {
-            receiver: (!eof).then_some(receiver),
-            writer: (!eof).then_some(writer),
-            pending: VecDeque::new(),
+            receiver: receiver.filter(|_| !failed),
+            writer: (!failed).then_some(writer),
+            pending: if failed {
+                VecDeque::new()
+            } else {
+                bytes.into()
+            },
             eof,
         }
     }
@@ -804,7 +849,8 @@ pub(crate) fn execute_with_io_and_handoff(
     let (stdin, submitted) = match stdin {
         ProcessStdin::Closed => (Stdio::null(), None),
         ProcessStdin::File(file) => (Stdio::from(file), None),
-        ProcessStdin::Submitted(receiver) => (Stdio::piped(), Some(receiver)),
+        ProcessStdin::Submitted(receiver) => (Stdio::piped(), Some(Ok(receiver))),
+        ProcessStdin::Bytes(bytes) => (Stdio::piped(), Some(Err(bytes))),
     };
     command.stdin(stdin);
     let captured_stdout = matches!(stdout_mode, ProcessStdout::Captured);
@@ -844,15 +890,16 @@ pub(crate) fn execute_with_io_and_handoff(
             .take()
             .expect("requested stderr pipe"),
     );
-    let mut submitted = submitted.map(|receiver| {
-        SubmittedInput::new(
-            receiver,
-            process
-                .child_mut()
-                .stdin
-                .take()
-                .expect("requested stdin pipe"),
-        )
+    let mut submitted = submitted.map(|source| {
+        let writer = process
+            .child_mut()
+            .stdin
+            .take()
+            .expect("requested stdin pipe");
+        match source {
+            Ok(receiver) => SubmittedInput::new(receiver, writer),
+            Err(bytes) => SubmittedInput::from_bytes(bytes, writer),
+        }
     });
     let mut remaining = limits.output_bytes;
     let mut reason = None;

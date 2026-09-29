@@ -74,6 +74,134 @@ fn direct_file_stdin_and_stdout_preserve_natural_bytes_and_unavailable_capture()
 }
 
 #[test]
+fn byte_stdin_streams_every_hashed_byte_through_a_pipe_then_closes_it() {
+    // Larger than a pipe buffer, so writes must follow the child's reads.
+    let bytes = (0..(1024 * 1024 + 7))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let mut command = Command::new("python3");
+    command.args([
+        "-c",
+        "import hashlib,os,stat,sys; data=sys.stdin.buffer.read(); \
+         kind='pipe' if stat.S_ISFIFO(os.fstat(0).st_mode) else 'other'; \
+         sys.stdout.write(f'{kind} {len(data)} {hashlib.sha256(data).hexdigest()}')",
+    ]);
+    let result = execute_with_io(
+        command,
+        limits(),
+        Arc::new(AtomicU8::new(0)),
+        ProcessIo {
+            stdin: ProcessStdin::Bytes(bytes.clone()),
+            stdout: ProcessStdout::Captured,
+            live: None,
+        },
+    );
+    assert_eq!(result.outcome, CommandOutcome::Exited { code: 0 });
+    let digest = Command::new("python3")
+        .args([
+            "-c",
+            "import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest(), end='')",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(&bytes)?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(result.stdout.bytes).unwrap(),
+        format!(
+            "pipe {} {}",
+            bytes.len(),
+            String::from_utf8(digest.stdout).unwrap()
+        )
+    );
+
+    // A child that never reads its input still exits normally.
+    let mut early = Command::new("python3");
+    early.args(["-c", "pass"]);
+    let result = execute_with_io(
+        early,
+        limits(),
+        Arc::new(AtomicU8::new(0)),
+        ProcessIo {
+            stdin: ProcessStdin::Bytes(vec![b'x'; 256 * 1024]),
+            stdout: ProcessStdout::Captured,
+            live: None,
+        },
+    );
+    assert!(
+        matches!(result.outcome, CommandOutcome::Exited { .. }),
+        "{:?}",
+        result.outcome
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn descriptor_working_directory_follows_the_pinned_directory_not_its_path() {
+    use std::os::fd::AsRawFd;
+    let root = std::env::temp_dir().join(format!("rustrace-command-fchdir-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("pinned")).unwrap();
+    let root = fs::canonicalize(root).unwrap();
+    fs::write(root.join("pinned/marker"), b"pinned").unwrap();
+    let pinned = File::open(root.join("pinned")).unwrap();
+    // The path now names a different directory; the descriptor does not.
+    fs::rename(root.join("pinned"), root.join("moved")).unwrap();
+    fs::create_dir(root.join("pinned")).unwrap();
+    fs::write(root.join("pinned/marker"), b"impostor").unwrap();
+    let mut command = Command::new("python3");
+    command
+        .args([
+            "-c",
+            "import os; print(os.getcwd()); print(open('marker').read(), end='')",
+        ])
+        .current_dir(root.join("pinned"));
+    change_directory_to_descriptor(&mut command, pinned.as_raw_fd());
+    let result = execute_with_io(
+        command,
+        limits(),
+        Arc::new(AtomicU8::new(0)),
+        ProcessIo {
+            stdin: ProcessStdin::Closed,
+            stdout: ProcessStdout::Captured,
+            live: None,
+        },
+    );
+    assert_eq!(result.outcome, CommandOutcome::Exited { code: 0 });
+    assert_eq!(
+        String::from_utf8(result.stdout.bytes).unwrap(),
+        format!("{}\npinned", root.join("moved").display())
+    );
+
+    // With the path gone, the launch fails before the descriptor is used.
+    fs::remove_dir_all(root.join("pinned")).unwrap();
+    let mut command = Command::new("python3");
+    command.arg("-c").arg("pass").current_dir(root.join("pinned"));
+    change_directory_to_descriptor(&mut command, pinned.as_raw_fd());
+    let result = execute_with_io(
+        command,
+        limits(),
+        Arc::new(AtomicU8::new(0)),
+        ProcessIo {
+            stdin: ProcessStdin::Closed,
+            stdout: ProcessStdout::Captured,
+            live: None,
+        },
+    );
+    assert!(matches!(
+        result.outcome,
+        CommandOutcome::LaunchFailed { .. }
+    ));
+    drop(pinned);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn redirected_launch_failure_honestly_leaves_the_preopened_output_truncated() {
     let root = std::env::temp_dir().join(format!(
         "rustrace-command-launch-output-{}",
