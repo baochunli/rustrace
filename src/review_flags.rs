@@ -9,7 +9,7 @@ use crate::{
 };
 use rustrace_model::{
     EditOrigin, EditorTransaction, Event, EventEnvelope, PasteRejected, PasteRejectionReason,
-    inserted_text_counts,
+    RprovKnown, RprovProducer, inserted_text_counts,
 };
 use std::collections::VecDeque;
 
@@ -58,6 +58,15 @@ pub const TYPED_AFTER_REJECTED_PASTE_CHARACTERS: u64 = 200;
 /// at most 300,000 ms (five minutes) later, inclusive, on the attempt's
 /// monotonic event clock.
 pub const TYPED_AFTER_REJECTED_PASTE_WINDOW_MILLIS: u64 = 300_000;
+/// A released build records its build identity as `COMMIT;TARGET`, where
+/// COMMIT is the release's Git commit in exactly 40 lowercase hexadecimal
+/// digits, the form the release scripts require. A `-dirty` suffix,
+/// `development-build-unavailable` and `source-archive-commit-unavailable`
+/// all fall outside it.
+pub const RELEASED_BUILD_COMMIT_HEX_DIGITS: usize = 40;
+/// The longest recorded client version or build identity quoted in an
+/// `UNOFFICIAL_CLIENT` measured value.
+const MAX_QUOTED_PRODUCER_BYTES: usize = 160;
 const ADVISORY_SUFFIX: &str = "advisory: heuristic; expect false positives";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -66,14 +75,16 @@ pub enum AdvisoryFlagKind {
     SustainedHighRate,
     RejectedPasteAttempts,
     TypedAfterRejectedPaste,
+    UnofficialClient,
 }
 
 impl AdvisoryFlagKind {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::LargeSingleInsertion,
         Self::SustainedHighRate,
         Self::RejectedPasteAttempts,
         Self::TypedAfterRejectedPaste,
+        Self::UnofficialClient,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -82,6 +93,7 @@ impl AdvisoryFlagKind {
             Self::SustainedHighRate => "SUSTAINED_HIGH_RATE",
             Self::RejectedPasteAttempts => "REJECTED_PASTE_ATTEMPTS",
             Self::TypedAfterRejectedPaste => "TYPED_AFTER_REJECTED_PASTE",
+            Self::UnofficialClient => "UNOFFICIAL_CLIENT",
         }
     }
 
@@ -98,6 +110,9 @@ impl AdvisoryFlagKind {
             }
             Self::TypedAfterRejectedPaste => {
                 "the record contains at least 200 characters inserted by Keyboard transactions within 300 seconds after a blocked outside paste"
+            }
+            Self::UnofficialClient => {
+                "the package metadata for this attempt names a client version or build identity other than a clean released build"
             }
         }
     }
@@ -125,6 +140,64 @@ struct RejectedPasteWindow {
     keyboard_characters_before: u64,
 }
 
+/// True when a recorded client version and build identity describe a clean
+/// released build: a plain `MAJOR.MINOR.PATCH` version and a build identity
+/// `COMMIT;TARGET` whose commit has exactly
+/// [`RELEASED_BUILD_COMMIT_HEX_DIGITS`] lowercase hexadecimal digits and whose
+/// target is a nonempty triple. Nothing here can confirm that the commit is
+/// a published release; the check only separates released-build identities
+/// from local, modified, or unidentified builds.
+pub fn is_clean_released_build(client_version: &str, build_identity: &str) -> bool {
+    let mut parts = client_version.split('.');
+    let plain_version = parts
+        .by_ref()
+        .take(3)
+        .filter(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        .count()
+        == 3
+        && parts.next().is_none();
+    let released_identity = build_identity
+        .split_once(';')
+        .is_some_and(|(commit, target)| {
+            commit.len() == RELEASED_BUILD_COMMIT_HEX_DIGITS
+                && commit
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && !target.is_empty()
+                && target
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        });
+    plain_version && released_identity
+}
+
+/// The `UNOFFICIAL_CLIENT` measured value for an attempt's producer, or
+/// `None` for a clean released build.
+fn unofficial_client(producer: &RprovProducer) -> Option<String> {
+    let known = |value: &RprovKnown<String>| match value {
+        RprovKnown::Known { value } => Some(value.clone()),
+        RprovKnown::Unknown => None,
+    };
+    let client_version = known(&producer.client_version);
+    let build_identity = known(&producer.build_identity);
+    if let (Some(client_version), Some(build_identity)) = (&client_version, &build_identity)
+        && is_clean_released_build(client_version, build_identity)
+    {
+        return None;
+    }
+    let quote = |value: Option<String>| {
+        value.map_or_else(
+            || "unavailable".to_owned(),
+            |value| display::label(&value, MAX_QUOTED_PRODUCER_BYTES),
+        )
+    };
+    Some(format!(
+        "client version {}; build identity {}",
+        quote(client_version),
+        quote(build_identity)
+    ))
+}
+
 /// Derives every advisory for one attempt (one `.rprov` segment) from its
 /// validated events, in stream order. Advisories tied to one event are
 /// emitted as their event is observed; the per-attempt summaries follow in
@@ -143,6 +216,9 @@ pub(crate) struct AdvisoryAccumulator {
     rejected_paste_windows: VecDeque<RejectedPasteWindow>,
     typed_after_rejected_pastes: u64,
     first_typed_after_rejected_paste: Option<(VerificationEventLocation, u64)>,
+    /// The measured value of an `UNOFFICIAL_CLIENT` advisory, emitted with
+    /// the link of the attempt's first event.
+    unofficial_client: Option<String>,
 }
 
 impl AdvisoryAccumulator {
@@ -159,7 +235,16 @@ impl AdvisoryAccumulator {
             rejected_paste_windows: VecDeque::new(),
             typed_after_rejected_pastes: 0,
             first_typed_after_rejected_paste: None,
+            unofficial_client: None,
         }
+    }
+
+    /// Records the attempt's producer from the package manifest. Only the
+    /// build that started the attempt is recorded, so this is the one
+    /// identity available per attempt; it is package metadata, not part of
+    /// the hash-chained events.
+    pub(crate) fn observe_producer(&mut self, producer: &RprovProducer) {
+        self.unofficial_client = unofficial_client(producer);
     }
 
     pub(crate) fn observe(&mut self, envelope: &EventEnvelope) {
@@ -167,6 +252,13 @@ impl AdvisoryAccumulator {
             segment: self.segment,
             sequence: envelope.sequence,
         };
+        if let Some(measured_value) = self.unofficial_client.take() {
+            self.advisories.push(AdvisoryFlag {
+                kind: AdvisoryFlagKind::UnofficialClient,
+                link,
+                measured_value,
+            });
+        }
         match &envelope.event {
             Event::PasteRejected(PasteRejected {
                 reason: PasteRejectionReason::ExternalInput,
@@ -934,6 +1026,150 @@ mod tests {
         assert_eq!(
             flag.measured_value,
             "200 characters within 300 seconds after it; qualifying blocked outside pastes: 1 of 2"
+        );
+    }
+
+    const RELEASE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn producer(client_version: Option<&str>, build_identity: Option<&str>) -> RprovProducer {
+        let known = |value: Option<&str>| {
+            value.map_or(RprovKnown::Unknown, |value| RprovKnown::Known {
+                value: value.to_owned(),
+            })
+        };
+        RprovProducer {
+            client_version: known(client_version),
+            build_identity: known(build_identity),
+            os: RprovKnown::Unknown,
+            architecture: RprovKnown::Unknown,
+            rust_tools: Vec::new(),
+        }
+    }
+
+    fn derive_with_producer(
+        producer: &RprovProducer,
+        events: &[EventEnvelope],
+    ) -> Vec<AdvisoryFlag> {
+        let mut accumulator = AdvisoryAccumulator::new(3);
+        accumulator.observe_producer(producer);
+        for event in events {
+            accumulator.observe(event);
+        }
+        accumulator.finish()
+    }
+
+    #[test]
+    fn clean_released_build_needs_a_plain_version_and_a_clean_release_commit() {
+        let released = format!("{RELEASE_COMMIT};aarch64-apple-darwin");
+        assert!(is_clean_released_build("0.1.8", &released));
+        assert!(is_clean_released_build(
+            "12.0.345",
+            &format!("{RELEASE_COMMIT};x86_64-unknown-linux-gnu")
+        ));
+        assert_eq!(RELEASED_BUILD_COMMIT_HEX_DIGITS, 40);
+        for identity in [
+            format!("{RELEASE_COMMIT}-dirty;aarch64-apple-darwin"),
+            "development-build-unavailable".to_owned(),
+            "source-archive-commit-unavailable;aarch64-apple-darwin".to_owned(),
+            "source-archive-commit-unavailable-dirty;aarch64-apple-darwin".to_owned(),
+            format!("{};aarch64-apple-darwin", &RELEASE_COMMIT[..39]),
+            format!("{RELEASE_COMMIT}0;aarch64-apple-darwin"),
+            format!(
+                "{};aarch64-apple-darwin",
+                RELEASE_COMMIT.to_ascii_uppercase()
+            ),
+            format!("{}g;aarch64-apple-darwin", &RELEASE_COMMIT[..39]),
+            format!("{RELEASE_COMMIT};"),
+            RELEASE_COMMIT.to_owned(),
+            format!("{RELEASE_COMMIT};aarch64 apple"),
+            format!("{RELEASE_COMMIT};aarch64-apple-darwin;extra"),
+            String::new(),
+        ] {
+            assert!(!is_clean_released_build("0.1.8", &identity), "{identity}");
+        }
+        for version in [
+            "0.1.8-dev",
+            "0.1.8+local",
+            "0.1",
+            "0.1.8.1",
+            "v0.1.8",
+            "0..8",
+            "",
+        ] {
+            assert!(!is_clean_released_build(version, &released), "{version}");
+        }
+    }
+
+    #[test]
+    fn unofficial_client_links_the_attempts_first_event_and_quotes_the_identity() {
+        let events = [
+            edit_event(1, 0, EditOrigin::Keyboard, "x"),
+            edit_event(2, 10, EditOrigin::Keyboard, "y"),
+        ];
+        let released = format!("{RELEASE_COMMIT};aarch64-apple-darwin");
+        assert!(
+            derive_with_producer(&producer(Some("0.1.8"), Some(&released)), &events).is_empty()
+        );
+
+        let dirty = format!("{RELEASE_COMMIT}-dirty;aarch64-apple-darwin");
+        let flags = derive_with_producer(&producer(Some("0.1.8"), Some(&dirty)), &events);
+        assert_eq!(kinds(&flags), vec![AdvisoryFlagKind::UnofficialClient]);
+        assert_eq!(
+            flags[0].link,
+            VerificationEventLocation {
+                segment: 3,
+                sequence: 1
+            }
+        );
+        assert_eq!(
+            display_advisory(&flags[0]),
+            format!(
+                "UNOFFICIAL_CLIENT [segment:3 seq:1]: the package metadata for this attempt names a client version or build identity other than a clean released build; measured value: client version 0.1.8; build identity {dirty}; advisory: heuristic; expect false positives"
+            )
+        );
+
+        let flags = derive_with_producer(&producer(None, Some(&released)), &events);
+        assert_eq!(
+            flags[0].measured_value,
+            format!("client version unavailable; build identity {released}")
+        );
+        let flags = derive_with_producer(
+            &producer(Some("0.1.8"), Some("development-build-unavailable")),
+            &events,
+        );
+        assert_eq!(
+            flags[0].measured_value,
+            "client version 0.1.8; build identity development-build-unavailable"
+        );
+        let flags = derive_with_producer(&producer(Some("0.1.8"), None), &events);
+        assert_eq!(
+            flags[0].measured_value,
+            "client version 0.1.8; build identity unavailable"
+        );
+
+        // A hostile identity is quoted escaped and bounded.
+        let hostile = format!("\u{1b}[31m{}", "z".repeat(1_000));
+        let flags = derive_with_producer(&producer(Some(&hostile), Some(&dirty)), &events);
+        assert!(!flags[0].measured_value.contains('\u{1b}'));
+        assert!(flags[0].measured_value.len() < 2 * MAX_QUOTED_PRODUCER_BYTES + 64);
+
+        // The advisory comes first, once, even with other advisories.
+        let mut events = vec![rejected_paste(1, 0, PasteRejectionReason::ExternalInput)];
+        events.push(edit_event(
+            2,
+            5,
+            EditOrigin::Keyboard,
+            &"x".repeat(LARGE_SINGLE_INSERTION_BYTES),
+        ));
+        let flags = derive_with_producer(&producer(Some("0.1.8"), Some(&dirty)), &events);
+        assert_eq!(
+            kinds(&flags),
+            vec![
+                AdvisoryFlagKind::UnofficialClient,
+                AdvisoryFlagKind::LargeSingleInsertion,
+                AdvisoryFlagKind::RejectedPasteAttempts,
+                AdvisoryFlagKind::TypedAfterRejectedPaste,
+            ]
         );
     }
 

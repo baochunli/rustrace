@@ -1,6 +1,8 @@
 //! T10.1 deterministic golden-session assembly.
 #![cfg(unix)]
 
+#[path = "support/client_advisory.rs"]
+mod client_advisory;
 #[path = "support/test_home.rs"]
 mod test_home;
 use rustrace::{
@@ -1820,7 +1822,12 @@ fn editing_conveniences_verify_and_replay_to_identical_bytes() {
         &bundle,
         &BTreeMap::from([("main.rs".to_owned(), expected.as_bytes().to_vec())]),
     );
-    assert!(report.advisories.is_empty(), "{:#?}", report.advisories);
+    assert_eq!(
+        advisory_kinds(&report),
+        client_advisory::client_advisories(),
+        "{:#?}",
+        report.advisories
+    );
 }
 
 #[test]
@@ -2099,8 +2106,9 @@ fn fake_server_completion_and_degradation_fixtures_reach_all_consumers() {
         };
         let report = assert_clean_consumers(Some(fixture_id), &bundle, &expected_workspace(&root));
         if mode == "completion" {
-            assert!(
-                report.advisories.is_empty(),
+            assert_eq!(
+                advisory_kinds(&report),
+                client_advisory::client_advisories(),
                 "completion acceptance raised advisories: {:#?}",
                 report.advisories
             );
@@ -2124,6 +2132,14 @@ fn fake_server_completion_and_degradation_fixtures_reach_all_consumers() {
     }
 }
 
+fn advisory_kinds(report: &rustrace::verify::VerificationReport) -> Vec<AdvisoryFlagKind> {
+    report
+        .advisories
+        .iter()
+        .map(|advisory| advisory.kind)
+        .collect()
+}
+
 #[test]
 fn advisory_kind_vocabulary_is_reachable_from_the_golden_suite() {
     assert_eq!(
@@ -2133,6 +2149,7 @@ fn advisory_kind_vocabulary_is_reachable_from_the_golden_suite() {
             "SUSTAINED_HIGH_RATE",
             "REJECTED_PASTE_ATTEMPTS",
             "TYPED_AFTER_REJECTED_PASTE",
+            "UNOFFICIAL_CLIENT",
         ]
     );
 }

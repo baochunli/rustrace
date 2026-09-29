@@ -139,10 +139,13 @@ os.write(fd, b"\x1b[5~")
 wait_screen("no further content")
 os.write(fd, b"\x1b[6~")
 wait_main_surface("SOURCE_MISMATCH [segment:1 seq:6]: the submitted source tree does not match")
-os.write(fd, b"\x1b[6~" * 10)
+# Enough pages for any flags-view length: the last presses are no-ops. An
+# advisory section (such as UNOFFICIAL_CLIENT for a locally modified test
+# build) lengthens the view.
+os.write(fd, b"\x1b[6~" * 40)
 wait_main_surface("Internal paste is allowed and not inherently suspicious.")
 wait_screen("no further content")
-os.write(fd, b"\x1b[5~" * 10)
+os.write(fd, b"\x1b[5~" * 40)
 wait_screen("UNPROVENANCED_EXTERNAL_CHANGE")
 wait_screen("lines 1-")
 os.write(fd, b"\x1b[6~")

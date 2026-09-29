@@ -722,6 +722,7 @@ fn replay_segments(
         let mut indicators =
             AttemptIndicatorAccumulator::new(segment.ordinal, segment.session_id.clone());
         let mut advisories = AdvisoryAccumulator::new(segment.ordinal);
+        advisories.observe_producer(&segment.producer);
         let initial_ref = segment
             .checkpoints
             .first()
