@@ -227,7 +227,10 @@ fn pinned_fixture_root_reads_the_directory_it_opened_and_detects_rebinding() {
     let cases = deploy(temp.path());
     let root = PinnedWorkspaceRoot::open(&cases).unwrap();
     let pinned = open_deployed_fixture_root(&root).unwrap().unwrap();
-    assert_eq!(pinned.path(), fs::canonicalize(cases.join("files")).unwrap());
+    assert_eq!(
+        pinned.path(),
+        fs::canonicalize(cases.join("files")).unwrap()
+    );
     let packaged = packaged_hash(temp.path());
     assert_eq!(pinned.hash().unwrap(), packaged);
     assert_eq!(

@@ -232,7 +232,13 @@ fn console_run_arguments_are_literal_tokens_before_any_redirection() {
             None,
             None,
         ),
-        ("cargo run -- café 🦀", false, vec!["café", "🦀"], None, None),
+        (
+            "cargo run -- café 🦀",
+            false,
+            vec!["café", "🦀"],
+            None,
+            None,
+        ),
         (
             "cargo run -- a@b %c ^d +e ,f :g =h .i",
             false,
@@ -254,7 +260,7 @@ fn console_run_arguments_are_literal_tokens_before_any_redirection() {
         assert_eq!(parsed.stdout.as_ref().map(|path| path.as_str()), stdout);
     }
     let parsed = parse_console_command(&format!("cargo run -- {longest}")).unwrap();
-    assert_eq!(parsed.args, [longest.clone()]);
+    assert_eq!(parsed.args, std::slice::from_ref(&longest));
     assert!(parse_console_command(&format!("cargo run -- {longest}a")).is_err());
     let parsed = parse_console_command(&format!("cargo run -- {}", many.join(" "))).unwrap();
     assert_eq!(parsed.args.len(), 64);

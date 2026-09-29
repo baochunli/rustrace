@@ -6,7 +6,9 @@
 
 use rustrace::{
     session::{ConsoleStart, ProductionSession, TestCaseOutcome, create_bundle},
-    verify::{AssignmentReferenceStatus, TestCaseEvidenceStatus, VerificationIssueKind, verify_path},
+    verify::{
+        AssignmentReferenceStatus, TestCaseEvidenceStatus, VerificationIssueKind, verify_path,
+    },
 };
 use rustrace_model::{Hash, rprov_raw_blake3, test_case_args_blake3};
 use rustrace_workspace::assignment_package::{ExtractionLimits, extract_assignment_package};
@@ -96,7 +98,8 @@ fn tar(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
 /// A deployed format 3 workspace `lab.work` with its own `lab.test-cases/`,
 /// exactly as `rustrace work` leaves them, and the fake tools.
 fn format3_fixture(name: &str) -> (PathBuf, PathBuf) {
-    let parent = std::env::temp_dir().join(format!("rustrace-format3-{name}-{}", std::process::id()));
+    let parent =
+        std::env::temp_dir().join(format!("rustrace-format3-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&parent);
     let root = parent.join("lab.work");
     fs::create_dir_all(root.join("target/bin/v1")).unwrap();
@@ -106,7 +109,10 @@ fn format3_fixture(name: &str) -> (PathBuf, PathBuf) {
     fs::write(root.join("Cargo.lock"), b"fixture").unwrap();
     fs::write(root.join("main.rs"), b"").unwrap();
     let mut entries = vec![
-        ("assignment.toml".to_owned(), MANIFEST_V3.as_bytes().to_vec()),
+        (
+            "assignment.toml".to_owned(),
+            MANIFEST_V3.as_bytes().to_vec(),
+        ),
         ("starter/Cargo.toml".to_owned(), CARGO_TOML.to_vec()),
         ("starter/Cargo.lock".to_owned(), b"fixture".to_vec()),
         ("starter/main.rs".to_owned(), Vec::new()),
@@ -215,8 +221,7 @@ fn wait(session: &mut ProductionSession) {
 /// A console Run reads submitted lines; close stdin so the fake finishes.
 fn finish_console_run(session: &mut ProductionSession) {
     let until = Instant::now() + Duration::from_secs(20);
-    while session.command_active() && !session.console_accepts_stdin() && Instant::now() < until
-    {
+    while session.command_active() && !session.console_accepts_stdin() && Instant::now() < until {
         session.poll_command().unwrap();
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -369,7 +374,10 @@ fn format3_runner_child() {
         "cargo run > .rustrace-cases.json",
     ] {
         let error = session.start_console_command(line).unwrap_err().to_string();
-        assert!(error.contains("choose another file name"), "{line}: {error}");
+        assert!(
+            error.contains("choose another file name"),
+            "{line}: {error}"
+        );
     }
     assert!(!files.join("out.txt").exists());
 
@@ -405,12 +413,18 @@ fn format3_runner_child() {
         .start_test_case(session.list_test_cases().unwrap().remove(0))
         .unwrap_err()
         .to_string();
-    assert!(error.contains("remove `.cargo` from the workspace"), "{error}");
+    assert!(
+        error.contains("remove `.cargo` from the workspace"),
+        "{error}"
+    );
     let error = session
         .start_console_command("cargo run -- a")
         .unwrap_err()
         .to_string();
-    assert!(error.contains("remove `.cargo` from the workspace"), "{error}");
+    assert!(
+        error.contains("remove `.cargo` from the workspace"),
+        "{error}"
+    );
     assert!(!session.command_active());
     fs::remove_dir(root.join(".cargo")).unwrap();
     for configuration in [folder.join(".cargo"), files.join(".cargo")] {
@@ -419,7 +433,10 @@ fn format3_runner_child() {
             .start_console_command("cargo run")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("Cargo would read it as configuration"), "{error}");
+        assert!(
+            error.contains("Cargo would read it as configuration"),
+            "{error}"
+        );
         fs::remove_dir(&configuration).unwrap();
     }
 
@@ -461,8 +478,15 @@ fn format3_runner_child() {
     );
     assert_eq!(
         tail(starts[0]),
-        ["run", "--locked", "--manifest-path", manifest_path, "--", "--count"]
-            .map(Value::from)
+        [
+            "run",
+            "--locked",
+            "--manifest-path",
+            manifest_path,
+            "--",
+            "--count"
+        ]
+        .map(Value::from)
     );
     assert_eq!(
         starts[1]["console"],
@@ -503,8 +527,16 @@ fn format3_runner_child() {
     );
     assert_eq!(
         tail(starts[3]),
-        ["run", "--locked", "--manifest-path", manifest_path, "--", "a", "b"]
-            .map(Value::from)
+        [
+            "run",
+            "--locked",
+            "--manifest-path",
+            manifest_path,
+            "--",
+            "a",
+            "b"
+        ]
+        .map(Value::from)
     );
     assert_eq!(
         stdout_of(&events, &starts[3]["command_id"]),
@@ -537,7 +569,10 @@ fn format3_runner_child() {
     // The changed tree's Runs record its deployed hash, not the package's.
     let changed = starts[6]["console"]["working_directory"]["fixtures_blake3"].clone();
     assert_ne!(changed, Value::from(packaged.to_string()));
-    assert_eq!(starts[7]["console"]["working_directory"]["fixtures_blake3"], changed);
+    assert_eq!(
+        starts[7]["console"]["working_directory"]["fixtures_blake3"],
+        changed
+    );
     assert_eq!(comparisons[3]["invocation"]["fixtures_blake3"], changed);
     assert_eq!(comparisons[3]["outcome"]["kind"], "mismatch");
     assert_eq!(
@@ -584,8 +619,7 @@ fn format3_fixture_change_during_start_child() {
     };
     let parent = root.parent().unwrap().to_owned();
     let files = parent.join("lab.test-cases/files");
-    let mut session =
-        ProductionSession::start_from_assignment(&root, &extracted(&parent)).unwrap();
+    let mut session = ProductionSession::start_from_assignment(&root, &extracted(&parent)).unwrap();
     fs::write(
         root.join("target/runner-fixture.json"),
         br#"{"mode":"console_io","mutate_source":false,"echo":true,"report":true,"resolve_delay_millis":400}"#,
@@ -612,13 +646,17 @@ fn format3_fixture_change_during_start_child() {
     }
     assert_eq!(
         error.as_deref(),
-        Some(
-            "the files in lab.test-cases/files changed while the run was starting; run it again"
-        )
+        Some("the files in lab.test-cases/files changed while the run was starting; run it again")
     );
     let result = session.take_test_case_result().unwrap();
-    assert_eq!(result.outcome, TestCaseOutcome::Error("could not start".into()));
-    assert!(!root.join("target/invocation.json").exists(), "Cargo never ran");
+    assert_eq!(
+        result.outcome,
+        TestCaseOutcome::Error("could not start".into())
+    );
+    assert!(
+        !root.join("target/invocation.json").exists(),
+        "Cargo never ran"
+    );
     session.quit().unwrap();
     let events = journal_events(&root);
     assert!(payloads(&events, "controlled_command_started").is_empty());
@@ -629,10 +667,8 @@ fn console_arguments_in_a_workspace_run_parent() {
     if child_root().is_some() {
         return;
     }
-    let parent = std::env::temp_dir().join(format!(
-        "rustrace-console-arguments-{}",
-        std::process::id()
-    ));
+    let parent =
+        std::env::temp_dir().join(format!("rustrace-console-arguments-{}", std::process::id()));
     let _ = fs::remove_dir_all(&parent);
     let root = parent.join("assignment.work");
     fs::create_dir_all(root.join("target/bin/v1")).unwrap();
@@ -696,8 +732,15 @@ fn console_arguments_in_a_workspace_run_child() {
     let workspace_name = root.file_name().unwrap().to_str().unwrap();
     assert_eq!(
         stdout_of(&events, &starts[0]["command_id"]),
-        format!("cwd={}/{workspace_name}\nargs=-n|fn=main\nstdin=file:typed\n\ndata=none\n",
-            root.parent().unwrap().file_name().unwrap().to_str().unwrap())
-            .into_bytes()
+        format!(
+            "cwd={}/{workspace_name}\nargs=-n|fn=main\nstdin=file:typed\n\ndata=none\n",
+            root.parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        )
+        .into_bytes()
     );
 }

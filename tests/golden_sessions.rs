@@ -756,7 +756,10 @@ fn golden_session_child() {
                         .unwrap()
                 )
             );
-            assert_eq!(invocation["program_args"], serde_json::json!(["-n", "fn main"]));
+            assert_eq!(
+                invocation["program_args"],
+                serde_json::json!(["-n", "fn main"])
+            );
         }
         "comparison-pass" | "comparison-mismatch" | "comparison-error" => {
             let case = session

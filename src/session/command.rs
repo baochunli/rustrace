@@ -2923,7 +2923,10 @@ fn resolve(
                 &console.request,
                 &resolved,
                 &root,
-                console.fixtures.as_ref().map(|fixtures| fixtures.root.path()),
+                console
+                    .fixtures
+                    .as_ref()
+                    .map(|fixtures| fixtures.root.path()),
             )
         } else {
             cargo_policy::prepare(action, &argv, &resolved, &root)

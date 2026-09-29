@@ -4306,7 +4306,11 @@ format = ["cargo", "fmt"]
             assert!(crate::console::is_fixtures_changed_warning(&warning));
             assert_eq!(
                 toast_for_status(&warning),
-                Some(ToastState::new(ToastKind::Warning, "warning", warning.clone()))
+                Some(ToastState::new(
+                    ToastKind::Warning,
+                    "warning",
+                    warning.clone()
+                ))
             );
         }
         assert!(!crate::console::is_fixtures_changed_warning(

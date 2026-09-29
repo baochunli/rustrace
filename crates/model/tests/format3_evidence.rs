@@ -464,7 +464,11 @@ fn fixture_runs_record_one_relative_manifest_path_in_a_fixed_slot() {
         ),
         // Names Rustrace never gives a format 3 case folder.
         (
-            &["--locked", "--manifest-path", "../../lab{2}.work/Cargo.toml"][..],
+            &[
+                "--locked",
+                "--manifest-path",
+                "../../lab{2}.work/Cargo.toml",
+            ][..],
             json!([]),
         ),
         (

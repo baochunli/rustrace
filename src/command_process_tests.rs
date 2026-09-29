@@ -181,7 +181,10 @@ fn descriptor_working_directory_follows_the_pinned_directory_not_its_path() {
     // With the path gone, the launch fails before the descriptor is used.
     fs::remove_dir_all(root.join("pinned")).unwrap();
     let mut command = Command::new("python3");
-    command.arg("-c").arg("pass").current_dir(root.join("pinned"));
+    command
+        .arg("-c")
+        .arg("pass")
+        .current_dir(root.join("pinned"));
     change_directory_to_descriptor(&mut command, pinned.as_raw_fd());
     let result = execute_with_io(
         command,
