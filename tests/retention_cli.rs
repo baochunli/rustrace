@@ -702,3 +702,54 @@ fn write_octal(field: &mut [u8], value: u64) {
     let encoded = format!("{:0width$o}\0", value, width = field.len() - 1);
     field.copy_from_slice(encoded.as_bytes());
 }
+
+#[test]
+fn status_counts_checkpoints_events_and_launches_only_when_no_session_is_open() {
+    let (fixture, mut session) = Fixture::started("retention-status-counts");
+    session
+        .execute(rustrace::tui::EditorCommand::Insert('B'))
+        .unwrap();
+    session.capture_boundary().unwrap();
+    let id = session.session_id().clone();
+
+    // A live session holds the journal, so status never opens it.
+    let output = run(&[Path::new("status"), &fixture.workspace]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("UNFINISHED session")
+            && text.contains(
+                "Recorded checkpoints, events, and launches: unknown while a Rustrace session is open on this workspace"
+            ),
+        "{text}"
+    );
+    session.quit().unwrap();
+
+    let mut journal =
+        Journal::open_read_only_no_follow(fixture.workspace.join(format!(".rustrace/{id}.sqlite")))
+            .unwrap();
+    let checkpoints = journal.checkpoint_totals(&id).unwrap().count;
+    let events = journal.verify_session_chain(&id).unwrap().event_count;
+    drop(journal);
+    let output = run(&[Path::new("status"), &fixture.workspace]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains(&format!(
+            "Recorded checkpoints: {checkpoints} of the 8,192 one submission can hold"
+        )) && text.contains(&format!(
+            "Recorded events: {events} of the 1,000,000 one submission can hold"
+        )) && text.contains("Recorded launches: 0; a submission keeps at most 64")
+            && !text.contains("Warning:"),
+        "{text}"
+    );
+    // Reading the counts changed nothing: the session still resumes.
+    ProductionSession::resume(
+        &fixture.workspace,
+        MANIFEST,
+        rustrace::session::ResumeChoice::Resume,
+    )
+    .unwrap()
+    .quit()
+    .unwrap();
+}

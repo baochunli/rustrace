@@ -43,6 +43,7 @@ mod finalization;
 mod privacy;
 mod retention;
 mod set_aside;
+mod usage;
 
 pub use crate::console::{TestCase, TestCaseComparison, TestCaseMismatch, TestCaseOutcome};
 pub use bundle::{
@@ -55,6 +56,8 @@ pub(crate) use finalization::{ReadOnlyFinalizationReceipt, ReadOnlyFinalizationS
 pub use privacy::run_privacy;
 pub use retention::{run_cleanup, run_revise, run_status};
 pub use set_aside::{SetAsideVersion, run_set_aside};
+pub use usage::RecordingUsage;
+pub(crate) use usage::{UsageLimits, inspect_unfinished_usage};
 
 #[cfg(test)]
 #[path = "session_clipboard_tests.rs"]
@@ -205,6 +208,7 @@ struct RestorationOutcome {
 struct ValidatedPrefix {
     replay: ReplayEngine,
     sequence: u64,
+    checkpoints: u64,
     millis: u64,
     hash: Hash,
     saved: Files,
@@ -239,6 +243,8 @@ struct Authority {
     replay: Option<ReplayEngine>,
     poison: Option<String>,
     schedule: CheckpointScheduleState,
+    // Durable checkpoints of this session, for the startup limit warning.
+    checkpoints: u64,
     changed: bool,
     pending_checkpoint: Option<PendingCheckpoint>,
     budgets: SessionBudgets,
@@ -627,6 +633,7 @@ impl Authority {
             self.sequence = sequence;
             self.hash = event_hash;
             self.persisted_millis = pending.millis;
+            self.checkpoints = self.checkpoints.saturating_add(1);
             self.changed = false;
             Ok(())
         })();
@@ -1180,6 +1187,7 @@ impl ProductionSession {
         let ValidatedPrefix {
             replay,
             sequence,
+            checkpoints,
             millis,
             hash,
             saved,
@@ -1264,6 +1272,7 @@ impl ProductionSession {
                 Duration::from_millis(checkpoint_millis),
             );
             authority.schedule.record_edit_events(uncaptured_edits);
+            authority.checkpoints = checkpoints;
             authority.changed = changed;
         }
         let recovered = snapshot_from_replay(
@@ -2903,6 +2912,7 @@ fn make_effects(
             CheckpointPolicy::new(Duration::from_secs(30), 100)?,
             Duration::from_millis(millis),
         ),
+        checkpoints: 0,
         changed: false,
         pending_checkpoint: None,
         budgets: SessionBudgets::default(),
@@ -3107,7 +3117,7 @@ fn validate_prefix_with_evidence(
     if chain.event_count > SessionBudgets::default().events {
         return Err("event budget exceeded".into());
     }
-    journal.verify_session_checkpoints(id)?;
+    let checkpoints = journal.verify_session_checkpoints(id)?.checkpoint_count;
     let genesis = journal
         .load_checkpoint(id, 1)?
         .ok_or("missing genesis checkpoint")?;
@@ -3255,6 +3265,7 @@ fn validate_prefix_with_evidence(
     Ok(ValidatedPrefix {
         replay,
         sequence: chain.event_count,
+        checkpoints,
         millis,
         hash: chain.final_hash,
         saved: saved.ok_or("missing saved prefix")?,

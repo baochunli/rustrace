@@ -212,7 +212,9 @@ pub fn run_work(args: &[String], output: &mut impl Write) -> Result<()> {
     }
     let report = session.discover_toolchain()?;
     report.write_diagnostics(output)?;
-    if report.has_blockers() {
+    let blocked = report.has_blockers();
+    write_recording_warning(&session, crate::session::UsageLimits::PACKAGE, output)?;
+    if blocked {
         session.quit()?;
         return Err("required Rust tools unavailable; assignment preserved. Fix the reported tools and use --resume; --inspect remains available without tools".into());
     }
@@ -224,6 +226,23 @@ pub fn run_work(args: &[String], output: &mut impl Write) -> Result<()> {
     )?;
     output.flush()?;
     crate::work_editor::run_editor(session, &extracted.manifest.title, update_state)
+}
+
+/// One startup line once a recorded count passes three quarters of what one
+/// submission can hold. A warning only: a failure to count never blocks work.
+fn write_recording_warning(
+    session: &ProductionSession,
+    limits: crate::session::UsageLimits,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
+    if let Some(warning) = session
+        .recording_usage()
+        .ok()
+        .and_then(|usage| usage.warning(limits))
+    {
+        writeln!(output, "{warning}")?;
+    }
+    Ok(())
 }
 
 pub(crate) fn preflight_test_case_suite(
@@ -652,6 +671,64 @@ pub fn run_workspace_example() -> Result<()> {
         session.workspace_mut().activate_selected()?;
     }
     crate::work_editor::run_editor(session, &manifest.title, crate::update::cached_state())
+}
+
+#[cfg(test)]
+mod recording_warning_tests {
+    use super::*;
+
+    const MANIFEST: &[u8] = br#"format_version = 1
+course_id = "course"
+assignment_id = "warning"
+assignment_version = "v1"
+title = "Warning"
+toolchain = "1.98.1"
+edition = "2024"
+allowed_paths = ["*.rs"]
+[commands]
+check = ["cargo", "check"]
+test = ["cargo", "test"]
+run = ["cargo", "run"]
+clippy = ["cargo", "clippy"]
+format = ["cargo", "fmt"]
+"#;
+
+    #[test]
+    fn startup_warns_once_checkpoints_pass_three_quarters_of_the_limit() {
+        let root =
+            std::env::temp_dir().join(format!("rustrace-work-warning-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("main.rs"), "A").unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let mut session = ProductionSession::start(&root, MANIFEST).unwrap();
+        let limits = crate::session::UsageLimits {
+            checkpoints: 5,
+            events: u64::MAX,
+        };
+        let mut output = Vec::new();
+        write_recording_warning(&session, limits, &mut output).unwrap();
+        assert!(output.is_empty(), "the genesis checkpoint alone is 20%");
+        for _ in 0..3 {
+            session.capture_boundary().unwrap();
+        }
+        write_recording_warning(&session, limits, &mut output).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Warning: this attempt has 4 checkpoints, 80% of the 5 one submission can hold. Submit it before it reaches the limit; to keep working after that, use `rustrace revise`.\n"
+        );
+        let usage = session.recording_usage().unwrap();
+        session.quit().unwrap();
+        let resumed =
+            ProductionSession::resume(&root, MANIFEST, crate::session::ResumeChoice::Resume)
+                .unwrap();
+        assert_eq!(
+            resumed.recording_usage().unwrap().checkpoints,
+            usage.checkpoints,
+            "a resumed session counts the checkpoints already recorded"
+        );
+        resumed.quit().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]

@@ -232,6 +232,22 @@ pub fn run_status(args: &[String], output: &mut impl Write) -> Result<()> {
                 output,
                 "This attempt remains mutable; its journal, checkpoints, evidence, and captures are preserved."
             )?;
+            match super::inspect_unfinished_usage(&root, &metadata.session_id) {
+                Ok(Some(usage)) => {
+                    for line in usage.status_lines(super::UsageLimits::PACKAGE) {
+                        writeln!(output, "{line}")?;
+                    }
+                }
+                Ok(None) => writeln!(
+                    output,
+                    "Recorded checkpoints, events, and launches: unknown while a Rustrace session is open on this workspace"
+                )?,
+                Err(error) => writeln!(
+                    output,
+                    "Recorded checkpoints, events, and launches: unavailable ({})",
+                    display::label_fmt(format_args!("{error}"), 1024)
+                )?,
+            }
             write_revision_status(output, &metadata.session_id, revision.as_ref(), None)?;
         }
         ReadOnlyFinalizationStatus::Prepared { session_id } => {
