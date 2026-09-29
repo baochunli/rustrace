@@ -71,6 +71,9 @@ if program == "rustup":
         assert os.environ["RUSTUP_TOOLCHAIN"] == "rustrace-discovery-bootstrap"
         if config.get("mode") == "preparing_drop":
             time.sleep(20)
+        if config.get("resolve_delay_millis"):
+            (root / "target" / "resolving").write_text("ready")
+            time.sleep(config["resolve_delay_millis"] / 1000)
         if config.get("mode") == "probe_invalid":
             os.write(1, b"\xff\0")
             sys.exit(0)
