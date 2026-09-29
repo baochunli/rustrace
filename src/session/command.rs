@@ -1889,7 +1889,8 @@ impl ProductionSession {
             std::os::fd::AsRawFd::as_raw_fd(&writer_lock),
         );
         // A fixture Run starts in the directory that was just hashed, even if
-        // its path now names another one; the worker keeps it open.
+        // its path now names another one; the worker keeps it open. Its
+        // contents may still change while Cargo builds or the program runs.
         if let Some(fixtures) = &fixtures {
             command_process::change_directory_to_descriptor(
                 &mut ready.prepared.command,
@@ -2704,8 +2705,9 @@ fn reject_workspace_cargo_configuration(workspace: &Path) -> Result<()> {
 
 fn prepare_console_io(mut launch: ConsoleLaunch, workspace: &Path) -> Result<ConsoleIo> {
     // Hash the pinned fixture folder again just before the start is recorded,
-    // so the route names the tree the program is launched in. A change since
-    // the student was told whether it matches the package cancels the launch,
+    // so the route names the tree as it was when Cargo was launched; Cargo
+    // builds first, and nothing stops a later edit. A change since the
+    // student was told whether it matches the package cancels the launch,
     // and Cargo configuration added meanwhile is refused as it was at start.
     let fixtures = match launch.fixtures.take() {
         Some(pinned) => {

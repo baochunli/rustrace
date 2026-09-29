@@ -123,7 +123,8 @@ pub struct ConsoleCommandRoute {
     /// Literal program arguments; a Run argv ends with `--` and exactly these.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    /// Where the program ran. `Fixtures` pins the deployed fixture tree.
+    /// Where the program ran. `Fixtures` records the deployed fixture tree's
+    /// hash when the Run started.
     #[serde(default, skip_serializing_if = "ConsoleWorkingDirectory::is_workspace")]
     pub working_directory: ConsoleWorkingDirectory,
     /// The packaged format 3 case this Run executes. Only format 3 picker runs
@@ -193,7 +194,8 @@ pub enum ConsoleWorkingDirectory {
     #[default]
     Workspace,
     /// The sibling `test-cases/files/` tree, with its fixture-tree hash
-    /// computed immediately before launch.
+    /// computed immediately before launch. The tree can still change while
+    /// Cargo builds or the program runs.
     Fixtures { fixtures_blake3: Hash },
 }
 

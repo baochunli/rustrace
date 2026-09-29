@@ -388,14 +388,14 @@ pub fn hash_deployed_fixture_tree(
 
 /// A deployed `files/` directory held open by descriptor.
 ///
-/// A program run from the fixture tree must run in the directory whose
-/// contents were hashed. The descriptor pins that directory: every read goes
-/// through it, and a child process can change into it with `fchdir` rather
-/// than by path, so renaming or replacing `files/` after hashing cannot give
-/// the program a different directory. The pin covers the directory object,
-/// not its contents or its parent: files can still change after the last
-/// read, and paths relative to it such as `..` resolve against wherever the
-/// directory is at that moment.
+/// The descriptor fixes the directory's identity: every read goes through
+/// it, and a child process can change into it with `fchdir` rather than by
+/// path, so renaming or replacing `files/` after hashing cannot start the
+/// program in a different directory. It does not fix the directory's
+/// contents or its location: files can change after the last read, for
+/// example while Cargo builds before the program starts, and paths relative
+/// to the directory such as `..` resolve against wherever it is at that
+/// moment.
 #[derive(Debug)]
 pub struct PinnedFixtureRoot {
     root: PinnedWorkspaceRoot,

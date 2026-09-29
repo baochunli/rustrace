@@ -969,7 +969,11 @@ names only your workspace folder. Other commands, such as `cargo check` and
 and every version 1 or 2 assignment, runs programs in the workspace as before.
 
 Before each such Run, Rustrace checks the folder against the package and
-records its fixture hash. If you changed, added, or removed a file there, the
+records its fixture hash as it is when Cargo starts. The program then starts
+in that same folder even if it is renamed or replaced, but its files are not
+locked: Cargo builds first, and a file changed during the build or the run is
+used as it is then. Do not edit the folder while a Run starts or runs. If you
+changed, added, or removed a file there, the
 program still runs with the files as they are, and a warning says so; a
 picker case run this way will not verify against the package. To restore the
 packaged files, remove the files you changed or added, then quit and resume the

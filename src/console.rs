@@ -283,7 +283,9 @@ impl FixtureTreeCheck {
 }
 
 /// The deployed fixture folder a format 3 Run starts in, held open from the
-/// moment it was hashed until the program is launched in it.
+/// moment it was hashed until the program is launched in it. Holding it open
+/// fixes which directory the program starts in, not what the directory
+/// contains by then.
 #[derive(Debug)]
 pub(crate) struct PinnedFixtures {
     pub root: PinnedFixtureRoot,
