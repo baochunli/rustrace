@@ -59,32 +59,31 @@ struct TestCasePickerDetails {
 }
 
 impl TestCasePickerDetails {
+    /// Checks each case's `NAME.args` and `NAME.in` as a Run would, not as
+    /// the listing saw them: the listing skips a symlink, a hard-linked file,
+    /// a FIFO or a directory, which a Run refuses.
     fn read(
         directory: &TestCaseDirectory,
         cases: &[crate::session::TestCase],
         workspace_root: &std::path::Path,
         packaged_fixtures: Option<rustrace_model::Hash>,
     ) -> Self {
+        let reason =
+            |error: Box<dyn Error>| crate::display::label_fmt(format_args!("{error}"), 256);
         let cases = cases
             .iter()
             .map(|case| {
-                let arguments = match case.args() {
-                    Some(arguments) => TestCaseArguments::Listed(arguments.to_vec()),
-                    None => match directory.read_args(case) {
-                        Ok(arguments) => TestCaseArguments::Listed(arguments),
-                        Err(error) => TestCaseArguments::Invalid(crate::display::label_fmt(
-                            format_args!("{error}"),
-                            256,
-                        )),
-                    },
+                let arguments = match directory.case_args(case) {
+                    Ok(arguments) => TestCaseArguments::Listed(arguments),
+                    Err(error) => TestCaseArguments::Invalid(reason(error)),
                 };
-                let input = if case.has_input() {
-                    TestCaseInput::File {
+                let input = match directory.input_len(case) {
+                    Ok(None) => TestCaseInput::Closed,
+                    Ok(Some(bytes)) => TestCaseInput::File {
                         name: case.input_path().to_string(),
-                        bytes: directory.input_len(case).ok(),
-                    }
-                } else {
-                    TestCaseInput::Closed
+                        bytes,
+                    },
+                    Err(error) => TestCaseInput::Invalid(reason(error)),
                 };
                 (case.name().to_owned(), (arguments, input))
             })
@@ -96,7 +95,8 @@ impl TestCasePickerDetails {
     }
 
     /// Where the session's runs start and, for a fixture folder, its files
-    /// as they are now. The folder is read only when the package has one.
+    /// as they are now. The folder is read only when the package has one,
+    /// after the `.cargo` checks that refuse a Run from it.
     fn read_fixtures(
         directory: &TestCaseDirectory,
         workspace_root: &std::path::Path,
@@ -112,6 +112,14 @@ impl TestCasePickerDetails {
             };
         }
         let folder = directory.fixtures_display();
+        if let Err(error) = crate::session::reject_workspace_cargo_configuration(workspace_root)
+            .and_then(|()| directory.reject_cargo_configuration())
+        {
+            return TestCaseFixtures::Refused {
+                folder,
+                reason: crate::display::label_fmt(format_args!("{error}"), 256),
+            };
+        }
         match directory.check_fixture_tree(packaged_fixtures) {
             Ok((check, Some(tree))) => TestCaseFixtures::Files {
                 folder,
@@ -5142,7 +5150,7 @@ format = ["cargo", "fmt"]
                     arguments: TestCaseArguments::Listed(vec!["-i".into(), "two words".into()]),
                     input: TestCaseInput::File {
                         name: "echo.in".into(),
-                        bytes: Some(6),
+                        bytes: 6,
                     },
                     result: None,
                 },
@@ -5220,6 +5228,142 @@ format = ["cargo", "fmt"]
                 workspace: "assignment.work".to_owned()
             }
         );
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn format3_picker_says_a_case_cannot_start_when_a_run_would_refuse_its_files() {
+        use crate::console::{CASE_FOLDER_MARKER, CaseFolderMarker, TestCaseLayout};
+        use crate::tui::{TestCaseArguments, TestCaseFixtures, TestCaseInput, TestCaseSelection};
+        use std::os::unix::ffi::OsStrExt;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = std::env::temp_dir().join(format!(
+            "rustrace-picker-refused-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        let root = parent.join("assignment.work");
+        let cases = parent.join("assignment.test-cases");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(cases.join("files")).unwrap();
+        let suite = rustrace_model::Hash::from_bytes([7; 32]);
+        fs::write(
+            cases.join(CASE_FOLDER_MARKER),
+            CaseFolderMarker::new("assignment.work", suite).encode(),
+        )
+        .unwrap();
+        for name in ["big", "directory", "fifo", "hard", "link"] {
+            fs::write(cases.join(format!("{name}.expected")), b"").unwrap();
+        }
+        fs::write(parent.join("outside.txt"), b"outside\n").unwrap();
+        std::os::unix::fs::symlink("../outside.txt", cases.join("link.in")).unwrap();
+        fs::write(parent.join("shared.args"), b"-x\n").unwrap();
+        fs::hard_link(parent.join("shared.args"), cases.join("hard.args")).unwrap();
+        fs::create_dir(cases.join("directory.args")).unwrap();
+        let fifo = std::ffi::CString::new(cases.join("fifo.in").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        fs::File::create(cases.join("big.in"))
+            .unwrap()
+            .set_len(1024 * 1024 + 1)
+            .unwrap();
+        let packaged = rustrace_workspace::fixture_tree::FixtureTree::from_parts([], [])
+            .unwrap()
+            .hash();
+
+        let mut picker = TestCasePicker::default();
+        picker
+            .refresh(&root, TestCaseLayout::Extended, Some(suite), Some(packaged))
+            .unwrap();
+        let selections = (0..picker.cases.len())
+            .map(|index| {
+                picker.select(index);
+                let TestCaseSelection::Case {
+                    arguments, input, ..
+                } = picker.detail().unwrap().selection
+                else {
+                    panic!("a case row has a case detail");
+                };
+                (picker.cases[index].name().to_owned(), arguments, input)
+            })
+            .collect::<Vec<_>>();
+        let invalid = |reason: &str| reason.to_owned();
+        assert_eq!(
+            selections,
+            [
+                (
+                    "big".to_owned(),
+                    TestCaseArguments::Listed(Vec::new()),
+                    TestCaseInput::Invalid(invalid("test input exceeds the 1048576-byte limit")),
+                ),
+                (
+                    "directory".to_owned(),
+                    TestCaseArguments::Invalid(invalid(
+                        "workspace path `directory.args` is a directory, not a regular file"
+                    )),
+                    TestCaseInput::Closed,
+                ),
+                (
+                    "fifo".to_owned(),
+                    TestCaseArguments::Listed(Vec::new()),
+                    TestCaseInput::Invalid(invalid(
+                        "workspace path `fifo.in` is a FIFO, not a regular file"
+                    )),
+                ),
+                (
+                    "hard".to_owned(),
+                    TestCaseArguments::Invalid(invalid(
+                        "workspace path `hard.args` has multiple hard links and is not safe for external routing"
+                    )),
+                    TestCaseInput::Closed,
+                ),
+                (
+                    "link".to_owned(),
+                    TestCaseArguments::Listed(Vec::new()),
+                    TestCaseInput::Invalid(invalid(
+                        "workspace path `link.in` is a symlink, not a regular file"
+                    )),
+                ),
+            ]
+        );
+        assert_eq!(
+            picker.detail().unwrap().fixtures,
+            TestCaseFixtures::Files {
+                folder: "assignment.test-cases/files".to_owned(),
+                files: Vec::new(),
+                changed: false,
+            }
+        );
+
+        // A `.cargo` in the case folder, `files/` or the workspace refuses
+        // every Run from the fixture folder, and the picker says so first.
+        for (at, reason) in [
+            (
+                cases.join(".cargo"),
+                "remove `.cargo` from the test-case folder: Cargo would read it as configuration",
+            ),
+            (
+                cases.join("files/.cargo"),
+                "remove `files/.cargo` from the test-case folder: Cargo would read it as configuration",
+            ),
+            (
+                root.join(".cargo"),
+                "remove `.cargo` from the workspace: Cargo would read it for commands run in the workspace but not for a Run from the test-case fixture folder",
+            ),
+        ] {
+            fs::create_dir(&at).unwrap();
+            picker
+                .refresh(&root, TestCaseLayout::Extended, Some(suite), Some(packaged))
+                .unwrap();
+            assert_eq!(
+                picker.detail().unwrap().fixtures,
+                TestCaseFixtures::Refused {
+                    folder: "assignment.test-cases/files".to_owned(),
+                    reason: reason.to_owned(),
+                }
+            );
+            fs::remove_dir(&at).unwrap();
+        }
         fs::remove_dir_all(parent).unwrap();
     }
 

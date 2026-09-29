@@ -43,6 +43,7 @@ pub use crate::console::{TestCase, TestCaseComparison, TestCaseMismatch, TestCas
 pub use bundle::{
     BundleOutput, create_bundle, hash_imported_outer_source, run_submit, submit_finalized_workspace,
 };
+pub(crate) use command::reject_workspace_cargo_configuration;
 pub use finalization::{
     FinalizationPayload, FinalizationReceipt, FinalizationStatus, IncompleteFinalization,
 };

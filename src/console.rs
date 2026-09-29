@@ -381,12 +381,16 @@ impl TestCase {
         &self.name
     }
 
-    /// Whether the case has a `NAME.in`; without one it runs with stdin closed.
+    /// Whether the listing saw a `NAME.in`. Runs and the picker check the
+    /// file again rather than trusting this.
+    #[cfg(test)]
     pub(crate) fn has_input(&self) -> bool {
         self.has_input
     }
 
-    /// The case's program arguments, or `None` when its `NAME.args` is invalid.
+    /// The listed program arguments, or `None` when `NAME.args` was invalid.
+    /// Runs and the picker read the file again rather than trusting this.
+    #[cfg(test)]
     pub(crate) fn args(&self) -> Option<&[String]> {
         self.args.as_deref()
     }
@@ -584,12 +588,33 @@ impl TestCaseDirectory {
         crate::display::label(&format!("{folder}/{FIXTURE_ROOT}"), 300)
     }
 
-    /// The size of a case's `NAME.in`, opened like a Run opens it.
-    pub(crate) fn input_len(&self, case: &TestCase) -> Result<u64> {
+    /// A format 3 case's arguments, checked as a Run checks them: an absent
+    /// `NAME.args` means none, and a present one must be an unaliased regular
+    /// file, reached without following links, that parses.
+    pub(crate) fn case_args(&self, case: &TestCase) -> Result<Vec<String>> {
+        if external_regular_file_exists_in(&self.root, &case.args_path())? {
+            self.read_args(case)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The size of a format 3 case's `NAME.in`, or `None` without one, for
+    /// the picker. It applies the checks a Run makes before reading the
+    /// input, without reading it: a present `NAME.in` must be an unaliased
+    /// regular file, reached without following links, within the case-file
+    /// limit. The Run reads the file again, so a later change is judged then.
+    pub(crate) fn input_len(&self, case: &TestCase) -> Result<Option<u64>> {
+        if !external_regular_file_exists_in(&self.root, &case.input_path())? {
+            return Ok(None);
+        }
         let opened = self.open_input(&case.input_path())?;
         let len = opened.file().metadata()?.len();
         self.root.verify_binding()?;
-        Ok(len)
+        if len > MAX_TEST_CASE_FILE_BYTES {
+            return Err("test input exceeds the 1048576-byte limit".into());
+        }
+        Ok(Some(len))
     }
 
     /// Opens the deployed `files/` folder by descriptor, or `None` when it is
@@ -627,11 +652,7 @@ impl TestCaseDirectory {
     /// on disk now. `NAME.in` is read into memory (at most the 1 MiB case-file
     /// limit) so the program receives exactly the bytes that were hashed.
     pub(crate) fn read_extended_case(&self, case: &TestCase) -> Result<ExtendedCaseFiles> {
-        let args = if external_regular_file_exists_in(&self.root, &case.args_path())? {
-            self.read_args(case)?
-        } else {
-            Vec::new()
-        };
+        let args = self.case_args(case)?;
         let input = if external_regular_file_exists_in(&self.root, &case.input_path())? {
             Some(self.read_input_with_blake3(case)?)
         } else {

@@ -2692,7 +2692,7 @@ fn refuse_managed_case_output(path: &WorkspacePath) -> Result<()> {
 /// configuration from the directory a command runs in and its parents, so
 /// commands run in the workspace would use it while a Run from the fixture
 /// folder would not, and the two would build differently.
-fn reject_workspace_cargo_configuration(workspace: &Path) -> Result<()> {
+pub(crate) fn reject_workspace_cargo_configuration(workspace: &Path) -> Result<()> {
     match fs::symlink_metadata(workspace.join(".cargo")) {
         Ok(_) => Err(
             "remove `.cargo` from the workspace: Cargo would read it for commands run in the workspace but not for a Run from the test-case fixture folder"

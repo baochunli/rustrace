@@ -63,7 +63,8 @@ pub enum TestCaseSelection {
 pub enum TestCaseArguments {
     /// The arguments from `NAME.args`; empty without that file.
     Listed(Vec<String>),
-    /// `NAME.args` cannot be read or parsed, so the case cannot start.
+    /// `NAME.args` is not a file a Run accepts or does not parse, so the
+    /// case cannot start.
     Invalid(String),
 }
 
@@ -71,8 +72,11 @@ pub enum TestCaseArguments {
 pub enum TestCaseInput {
     /// No `NAME.in`: the program runs with standard input closed.
     Closed,
-    /// `NAME.in`, with its size in bytes when it could be read.
-    File { name: String, bytes: Option<u64> },
+    /// `NAME.in` and its size in bytes.
+    File { name: String, bytes: u64 },
+    /// `NAME.in` is not a file a Run accepts, for example a symlink or an
+    /// oversized file, so the case cannot start.
+    Invalid(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,6 +94,9 @@ pub enum TestCaseFixtures {
     Missing { folder: String },
     /// The fixture folder cannot be read, so a run fails.
     Unreadable { folder: String, reason: String },
+    /// Runs from the fixture folder are refused, for example because a
+    /// `.cargo` entry would configure Cargo differently there.
+    Refused { folder: String, reason: String },
 }
 
 /// A completed run's result, worded as in the output pane's result line.
@@ -209,8 +216,7 @@ pub(crate) fn detail_rows(detail: &TestCaseDetail, width: usize, rows: usize) ->
             result,
         } => {
             sections.push(arguments_section(arguments, text_width));
-            let (text, tone) = input_row(input);
-            sections.push(Section::fixed(4, "Input", text, tone));
+            sections.push(input_section(input, text_width));
             sections.extend(fixture_sections(&detail.fixtures, text_width, false));
             sections.push(result_section(result.as_ref(), text_width));
         }
@@ -371,23 +377,34 @@ fn arguments_section(arguments: &TestCaseArguments, width: usize) -> Section {
         TestCaseArguments::Invalid(reason) => Section::wrapped(
             1,
             "Arguments",
-            format!("{reason}; the case cannot start"),
+            format!("cannot start: {reason}"),
             DetailTone::Fail,
             width,
         ),
     }
 }
 
-fn input_row(input: &TestCaseInput) -> (String, DetailTone) {
+fn input_section(input: &TestCaseInput, width: usize) -> Section {
     match input {
-        TestCaseInput::Closed => ("no input (stdin closed)".to_owned(), DetailTone::Plain),
-        TestCaseInput::File {
-            name,
-            bytes: Some(bytes),
-        } => (format!("{name} ({})", byte_size(*bytes)), DetailTone::Plain),
-        TestCaseInput::File { name, bytes: None } => {
-            (format!("{name} (cannot be read)"), DetailTone::Warning)
-        }
+        TestCaseInput::Closed => Section::fixed(
+            4,
+            "Input",
+            "no input (stdin closed)".to_owned(),
+            DetailTone::Plain,
+        ),
+        TestCaseInput::File { name, bytes } => Section::fixed(
+            4,
+            "Input",
+            format!("{name} ({})", byte_size(*bytes)),
+            DetailTone::Plain,
+        ),
+        TestCaseInput::Invalid(reason) => Section::wrapped(
+            4,
+            "Input",
+            format!("cannot start: {reason}"),
+            DetailTone::Fail,
+            width,
+        ),
     }
 }
 
@@ -413,6 +430,16 @@ fn fixture_sections(fixtures: &TestCaseFixtures, width: usize, run_all: bool) ->
             DetailTone::Warning,
             width,
         )],
+        TestCaseFixtures::Refused { folder, reason } => vec![
+            Section::fixed(2, "Runs in", folder.clone(), DetailTone::Plain),
+            Section::wrapped(
+                3,
+                "",
+                format!("cannot start: {reason}"),
+                DetailTone::Fail,
+                width,
+            ),
+        ],
         TestCaseFixtures::Files {
             folder,
             files,
@@ -727,7 +754,7 @@ mod tests {
                 arguments: TestCaseArguments::Listed(vec!["-i".into(), "two words".into()]),
                 input: TestCaseInput::File {
                     name: "echo.in".into(),
-                    bytes: Some(6),
+                    bytes: 6,
                 },
                 result: Some(TestCaseRunResult::Pass),
             },
@@ -844,10 +871,7 @@ mod tests {
         let detail = TestCaseDetail {
             selection: TestCaseSelection::Case {
                 arguments: TestCaseArguments::Invalid("test-case arguments line 2 is empty".into()),
-                input: TestCaseInput::File {
-                    name: "bad.in".into(),
-                    bytes: None,
-                },
+                input: TestCaseInput::Invalid("test input exceeds the 1048576-byte limit".into()),
                 result: Some(TestCaseRunResult::Error(
                     "could not start: test-case arguments line 2 is empty".into(),
                 )),
@@ -860,9 +884,10 @@ mod tests {
         assert_eq!(
             texts(&rows),
             vec![
-                "Arguments  test-case arguments line 2 is",
-                "           empty; the case cannot start",
-                "Input      bad.in (cannot be read)",
+                "Arguments  cannot start: test-case",
+                "           arguments line 2 is empty",
+                "Input      cannot start: test input",
+                "           exceeds the 1048576-byte …",
                 "Runs in    lab.test-cases/files is",
                 "           missing; quit and resume the",
                 "           workspace to restore it",
@@ -872,7 +897,34 @@ mod tests {
             ]
         );
         assert_eq!(rows[0].tone, DetailTone::Fail);
-        assert_eq!(rows[2].tone, DetailTone::Warning);
-        assert_eq!(rows[3].tone, DetailTone::Warning);
+        assert_eq!(rows[2].tone, DetailTone::Fail);
+        assert_eq!(rows[4].tone, DetailTone::Warning);
+    }
+
+    #[test]
+    fn a_refused_fixture_folder_says_the_case_cannot_start() {
+        let detail = TestCaseDetail {
+            selection: TestCaseSelection::Case {
+                arguments: TestCaseArguments::Listed(Vec::new()),
+                input: TestCaseInput::Closed,
+                result: None,
+            },
+            fixtures: TestCaseFixtures::Refused {
+                folder: "lab.test-cases/files".into(),
+                reason: "remove `.cargo` from the test-case folder".into(),
+            },
+        };
+        let rows = detail_rows(&detail, 74, 10);
+        assert_eq!(
+            texts(&rows),
+            vec![
+                "Arguments  none",
+                "Input      no input (stdin closed)",
+                "Runs in    lab.test-cases/files",
+                "           cannot start: remove `.cargo` from the test-case folder",
+                "Result     not run yet",
+            ]
+        );
+        assert_eq!(rows[3].tone, DetailTone::Fail);
     }
 }
