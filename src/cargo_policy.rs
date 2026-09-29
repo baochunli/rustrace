@@ -297,7 +297,9 @@ pub fn prepare_console(
 /// Prepare a parsed console action. A Run with `fixtures` runs from that
 /// format 3 fixture folder (see [`PreparedCargoCommand::run_from_directory`]);
 /// otherwise it runs in the workspace. A Run's program arguments end the
-/// argument vector as `-- ARG...`, after every Cargo option.
+/// argument vector as `-- ARG...`, after every Cargo option. They need only
+/// the recorded-argument bounds: a packaged `NAME.args` may hold spaces,
+/// quotes, `<`, or `>`, which only the typed console grammar excludes.
 pub fn prepare_console_in(
     request: &ConsoleCommand,
     tools: &ResolvedTools,
@@ -328,10 +330,6 @@ pub fn prepare_console_in(
                 || !request.args.is_empty()
                 || fixtures.is_some())
         || !are_valid_test_case_args(&request.args)
-        || request
-            .args
-            .iter()
-            .any(|argument| argument.contains(['<', '>']))
     {
         return Err(PreparationError::UnsupportedCommand);
     }

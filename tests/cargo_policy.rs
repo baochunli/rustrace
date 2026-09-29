@@ -362,7 +362,6 @@ fn console_run_arguments_end_the_prepared_argument_vector() {
         },
         run(argv(&[""])),
         run(argv(&["a\nb"])),
-        run(argv(&["a>b"])),
         run(vec!["x".to_owned(); 65]),
         run(vec!["a".repeat(1025)]),
     ] {
@@ -372,6 +371,14 @@ fn console_run_arguments_end_the_prepared_argument_vector() {
             "{request:?}"
         );
     }
+    // Packaged `NAME.args` arguments may hold what the console cannot type.
+    let packaged = run(argv(&["a b", "<tag>", "'q'", "*.txt", "$HOME;|&"]));
+    let prepared =
+        rustrace::cargo_policy::prepare_console_in(&packaged, &tools(), &workspace, None).unwrap();
+    assert_eq!(
+        prepared.command.get_args().collect::<Vec<_>>()[5..],
+        ["--", "a b", "<tag>", "'q'", "*.txt", "$HOME;|&"].map(std::ffi::OsStr::new)
+    );
     let check = parse_console_command("cargo check").unwrap();
     assert!(
         rustrace::cargo_policy::prepare_console_in(

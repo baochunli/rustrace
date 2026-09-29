@@ -616,6 +616,15 @@ fn format3_without_fixtures_parent() {
     }
     let (parent, root) = format3_fixture_with("without-fixtures", |parent| {
         vec![
+            // Packaged arguments may hold what the console cannot type.
+            ("shell.args".into(), b"<tag>\n*.txt\n'q' \"d\"\n$HOME;&\n".to_vec()),
+            (
+                "shell.expected".into(),
+                format!(
+                    "cwd={parent}/lab.work\nargs=<tag>|*.txt|'q' \"d\"|$HOME;&\nstdin=closed:\ndata=none\n"
+                )
+                .into_bytes(),
+            ),
             ("spaced.args".into(), b"x\ny z\n".to_vec()),
             (
                 "spaced.expected".into(),
@@ -657,6 +666,10 @@ fn format3_without_fixtures_child() {
     let invocation: Value =
         serde_json::from_slice(&fs::read(root.join("target/invocation.json")).unwrap()).unwrap();
     assert_eq!(invocation["working_directory"], root.to_str().unwrap());
+    assert_eq!(
+        run_case(&mut session, "shell"),
+        (TestCaseOutcome::Pass, None)
+    );
     session.save_all().unwrap();
     let receipt = session.finalize("student-1").unwrap();
     let bundle = parent.join("session.zip");
@@ -677,12 +690,17 @@ fn format3_without_fixtures_child() {
         starts[1]["console"],
         json!({"stdin": {"kind": "submitted"}, "stdout": {"kind": "console"}, "args": ["q"]})
     );
+    assert_eq!(
+        starts[2]["console"]["args"],
+        json!(["<tag>", "*.txt", "'q' \"d\"", "$HOME;&"])
+    );
     let comparisons = payloads(&events, "test_case_compared");
     assert_eq!(
         comparisons[0]["invocation"],
         json!({"args_blake3": test_case_args_blake3(&["x", "y z"]).to_string(),
             "stdin": {"kind": "closed"}})
     );
+    assert_eq!(comparisons.len(), 2);
     let report = verify_path(&bundle, Some(&parent.join("lab.rta")));
     assert!(report.is_clean(), "{report:#?}");
     assert_eq!(
