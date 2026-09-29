@@ -50,6 +50,14 @@ pub const SUSTAINED_HIGH_RATE_CHARACTERS_PER_SECOND: u64 = 15;
 /// outside Rustrace (a `paste_rejected` event with reason `external_input`).
 /// Other rejection reasons are not counted.
 pub const REJECTED_PASTE_ATTEMPTS_MINIMUM: u64 = 1;
+/// A blocked outside paste reaches this advisory when Keyboard transactions
+/// then insert at least 200 Unicode scalar values (counted as for
+/// `SUSTAINED_HIGH_RATE`; deletions insert none) within the window.
+pub const TYPED_AFTER_REJECTED_PASTE_CHARACTERS: u64 = 200;
+/// The window after a blocked outside paste: Keyboard transactions recorded
+/// at most 300,000 ms (five minutes) later, inclusive, on the attempt's
+/// monotonic event clock.
+pub const TYPED_AFTER_REJECTED_PASTE_WINDOW_MILLIS: u64 = 300_000;
 const ADVISORY_SUFFIX: &str = "advisory: heuristic; expect false positives";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -57,13 +65,15 @@ pub enum AdvisoryFlagKind {
     LargeSingleInsertion,
     SustainedHighRate,
     RejectedPasteAttempts,
+    TypedAfterRejectedPaste,
 }
 
 impl AdvisoryFlagKind {
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 4] = [
         Self::LargeSingleInsertion,
         Self::SustainedHighRate,
         Self::RejectedPasteAttempts,
+        Self::TypedAfterRejectedPaste,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -71,6 +81,7 @@ impl AdvisoryFlagKind {
             Self::LargeSingleInsertion => "LARGE_SINGLE_INSERTION",
             Self::SustainedHighRate => "SUSTAINED_HIGH_RATE",
             Self::RejectedPasteAttempts => "REJECTED_PASTE_ATTEMPTS",
+            Self::TypedAfterRejectedPaste => "TYPED_AFTER_REJECTED_PASTE",
         }
     }
 
@@ -84,6 +95,9 @@ impl AdvisoryFlagKind {
             }
             Self::RejectedPasteAttempts => {
                 "the record contains at least one blocked attempt to paste text from outside Rustrace"
+            }
+            Self::TypedAfterRejectedPaste => {
+                "the record contains at least 200 characters inserted by Keyboard transactions within 300 seconds after a blocked outside paste"
             }
         }
     }
@@ -103,6 +117,14 @@ struct KeyboardObservation {
     inserted_characters: u64,
 }
 
+/// The typing window opened by one blocked outside paste.
+struct RejectedPasteWindow {
+    link: VerificationEventLocation,
+    monotonic_millis: u64,
+    /// The attempt's Keyboard characters inserted before the paste.
+    keyboard_characters_before: u64,
+}
+
 /// Derives every advisory for one attempt (one `.rprov` segment) from its
 /// validated events, in stream order. Advisories tied to one event are
 /// emitted as their event is observed; the per-attempt summaries follow in
@@ -115,6 +137,12 @@ pub(crate) struct AdvisoryAccumulator {
     rate_advisory_active: bool,
     rejected_pastes: u64,
     first_rejected_paste: Option<VerificationEventLocation>,
+    /// Characters inserted by every Keyboard transaction observed so far.
+    keyboard_characters: u64,
+    /// Open windows, oldest paste first.
+    rejected_paste_windows: VecDeque<RejectedPasteWindow>,
+    typed_after_rejected_pastes: u64,
+    first_typed_after_rejected_paste: Option<(VerificationEventLocation, u64)>,
 }
 
 impl AdvisoryAccumulator {
@@ -127,6 +155,10 @@ impl AdvisoryAccumulator {
             rate_advisory_active: false,
             rejected_pastes: 0,
             first_rejected_paste: None,
+            keyboard_characters: 0,
+            rejected_paste_windows: VecDeque::new(),
+            typed_after_rejected_pastes: 0,
+            first_typed_after_rejected_paste: None,
         }
     }
 
@@ -139,7 +171,7 @@ impl AdvisoryAccumulator {
             Event::PasteRejected(PasteRejected {
                 reason: PasteRejectionReason::ExternalInput,
                 ..
-            }) => self.observe_rejected_paste(link),
+            }) => self.observe_rejected_paste(link, envelope.monotonic_millis),
             Event::FileEdited(transaction) if transaction.origin == EditOrigin::Keyboard => {
                 self.observe_keyboard(link, envelope.monotonic_millis, transaction);
             }
@@ -147,9 +179,40 @@ impl AdvisoryAccumulator {
         }
     }
 
-    fn observe_rejected_paste(&mut self, link: VerificationEventLocation) {
+    fn observe_rejected_paste(&mut self, link: VerificationEventLocation, monotonic_millis: u64) {
         self.rejected_pastes = self.rejected_pastes.saturating_add(1);
         self.first_rejected_paste.get_or_insert(link);
+        self.rejected_paste_windows.push_back(RejectedPasteWindow {
+            link,
+            monotonic_millis,
+            keyboard_characters_before: self.keyboard_characters,
+        });
+    }
+
+    /// Closes every window that ends before `now`, or every open window at
+    /// the end of the attempt, and tallies the ones typed through.
+    fn close_rejected_paste_windows(&mut self, now: Option<u64>) {
+        while let Some(window) = self.rejected_paste_windows.front() {
+            if now.is_some_and(|now| {
+                now.saturating_sub(window.monotonic_millis)
+                    <= TYPED_AFTER_REJECTED_PASTE_WINDOW_MILLIS
+            }) {
+                break;
+            }
+            let window = self
+                .rejected_paste_windows
+                .pop_front()
+                .expect("front window");
+            let typed = self
+                .keyboard_characters
+                .saturating_sub(window.keyboard_characters_before);
+            if typed >= TYPED_AFTER_REJECTED_PASTE_CHARACTERS {
+                self.typed_after_rejected_pastes =
+                    self.typed_after_rejected_pastes.saturating_add(1);
+                self.first_typed_after_rejected_paste
+                    .get_or_insert((window.link, typed));
+            }
+        }
     }
 
     fn observe_keyboard(
@@ -158,6 +221,7 @@ impl AdvisoryAccumulator {
         monotonic_millis: u64,
         transaction: &EditorTransaction,
     ) {
+        self.close_rejected_paste_windows(Some(monotonic_millis));
         let inserted_bytes = transaction
             .edits
             .iter()
@@ -169,6 +233,7 @@ impl AdvisoryAccumulator {
                     .unwrap_or(u64::MAX),
             )
         });
+        self.keyboard_characters = self.keyboard_characters.saturating_add(inserted_characters);
         let observation = KeyboardObservation {
             link,
             monotonic_millis,
@@ -230,6 +295,7 @@ impl AdvisoryAccumulator {
     }
 
     pub(crate) fn finish(mut self) -> Vec<AdvisoryFlag> {
+        self.close_rejected_paste_windows(None);
         if self.rejected_pastes >= REJECTED_PASTE_ATTEMPTS_MINIMUM
             && let Some(first) = self.first_rejected_paste
         {
@@ -237,6 +303,20 @@ impl AdvisoryAccumulator {
                 kind: AdvisoryFlagKind::RejectedPasteAttempts,
                 link: first,
                 measured_value: plural(self.rejected_pastes, "blocked outside paste"),
+            });
+        }
+        // One advisory per attempt, linked to the earliest blocked paste that
+        // was typed through, with how many of the attempt's blocked pastes were.
+        if let Some((link, typed)) = self.first_typed_after_rejected_paste {
+            self.advisories.push(AdvisoryFlag {
+                kind: AdvisoryFlagKind::TypedAfterRejectedPaste,
+                link,
+                measured_value: format!(
+                    "{typed} characters within {} seconds after it; qualifying blocked outside pastes: {} of {}",
+                    TYPED_AFTER_REJECTED_PASTE_WINDOW_MILLIS / 1_000,
+                    self.typed_after_rejected_pastes,
+                    self.rejected_pastes
+                ),
             });
         }
         self.advisories
@@ -640,6 +720,220 @@ mod tests {
             ),
             "{}",
             display_advisory(&flags[0])
+        );
+    }
+
+    /// Keyboard transactions of at most 20 characters each, so that no
+    /// single one reaches `LARGE_SINGLE_INSERTION`, all at `millis`.
+    fn typed(first_sequence: u64, millis: u64, characters: usize) -> Vec<EventEnvelope> {
+        let mut remaining = characters;
+        let mut sequence = first_sequence;
+        let mut events = Vec::new();
+        while remaining > 0 {
+            let count = remaining.min(20);
+            events.push(edit_event(
+                sequence,
+                millis,
+                EditOrigin::Keyboard,
+                &"x".repeat(count),
+            ));
+            remaining -= count;
+            sequence += 1;
+        }
+        events
+    }
+
+    fn deletion(sequence: u64, millis: u64) -> EventEnvelope {
+        let mut event = edit_event(sequence, millis, EditOrigin::Keyboard, "");
+        if let Event::FileEdited(transaction) = &mut event.event {
+            transaction.edits[0].end_byte = 1;
+        }
+        event
+    }
+
+    fn typed_after(flags: &[AdvisoryFlag]) -> Option<&AdvisoryFlag> {
+        flags
+            .iter()
+            .find(|flag| flag.kind == AdvisoryFlagKind::TypedAfterRejectedPaste)
+    }
+
+    #[test]
+    fn typed_after_rejected_paste_uses_the_inclusive_character_threshold() {
+        assert_eq!(TYPED_AFTER_REJECTED_PASTE_CHARACTERS, 200);
+        for (characters, expected) in [(199, false), (200, true), (201, true)] {
+            let mut events = vec![rejected_paste(
+                1,
+                1_000,
+                PasteRejectionReason::ExternalInput,
+            )];
+            events.extend(typed(2, 2_000, characters));
+            let flags = derive(&events);
+            assert_eq!(
+                typed_after(&flags).is_some(),
+                expected,
+                "characters: {characters}"
+            );
+            assert!(
+                !kinds(&flags).contains(&AdvisoryFlagKind::LargeSingleInsertion),
+                "{flags:#?}"
+            );
+            if expected {
+                assert_eq!(
+                    kinds(&flags),
+                    vec![
+                        AdvisoryFlagKind::RejectedPasteAttempts,
+                        AdvisoryFlagKind::TypedAfterRejectedPaste,
+                    ]
+                );
+                let flag = typed_after(&flags).unwrap();
+                assert_eq!(flag.link.sequence, 1);
+                assert_eq!(flag.link.segment, 2);
+                assert_eq!(
+                    flag.measured_value,
+                    format!(
+                        "{characters} characters within 300 seconds after it; qualifying blocked outside pastes: 1 of 1"
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typed_after_rejected_paste_uses_the_inclusive_five_minute_window() {
+        assert_eq!(TYPED_AFTER_REJECTED_PASTE_WINDOW_MILLIS, 300_000);
+        for (offset, expected) in [(299_999, true), (300_000, true), (300_001, false)] {
+            let mut events = vec![rejected_paste(
+                1,
+                5_000,
+                PasteRejectionReason::ExternalInput,
+            )];
+            // 199 characters well inside the window, then the last one at the
+            // boundary under test.
+            events.extend(typed(2, 6_000, 199));
+            events.push(edit_event(20, 5_000 + offset, EditOrigin::Keyboard, "x"));
+            assert_eq!(
+                typed_after(&derive(&events)).is_some(),
+                expected,
+                "offset: {offset}"
+            );
+        }
+        // Characters in a later window never count toward an expired one.
+        let mut events = vec![rejected_paste(1, 0, PasteRejectionReason::ExternalInput)];
+        events.extend(typed(2, 300_001, 1_000));
+        assert!(typed_after(&derive(&events)).is_none());
+    }
+
+    #[test]
+    fn typed_after_rejected_paste_counts_only_later_inserted_keyboard_characters() {
+        // Deletion-only edits, such as a held Backspace, insert nothing.
+        let mut events = vec![rejected_paste(1, 0, PasteRejectionReason::ExternalInput)];
+        events.extend((0..500).map(|index| deletion(index + 2, 1_000 + index)));
+        events.extend(typed(600, 2_000, 199));
+        assert!(typed_after(&derive(&events)).is_none());
+
+        // Typing before the blocked paste does not count.
+        let mut events = typed(1, 0, 500);
+        events.push(rejected_paste(
+            100,
+            1_000,
+            PasteRejectionReason::ExternalInput,
+        ));
+        events.extend(typed(101, 2_000, 199));
+        assert!(typed_after(&derive(&events)).is_none());
+
+        // Other origins after the paste do not count.
+        let mut events = vec![rejected_paste(1, 0, PasteRejectionReason::ExternalInput)];
+        for (index, origin) in [
+            EditOrigin::Paste,
+            EditOrigin::Completion,
+            EditOrigin::Formatter,
+            EditOrigin::Undo,
+            EditOrigin::Unknown,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            events.push(edit_event(
+                index as u64 + 2,
+                1_000,
+                origin,
+                &"x".repeat(100),
+            ));
+        }
+        events.extend(typed(10, 2_000, 199));
+        assert!(typed_after(&derive(&events)).is_none());
+
+        // Characters are Unicode scalar values, not bytes.
+        for (pairs, expected) in [(99, false), (100, true)] {
+            let mut events = vec![rejected_paste(1, 0, PasteRejectionReason::ExternalInput)];
+            events.extend(
+                (0..pairs).map(|index| edit_event(index + 2, 1_000, EditOrigin::Keyboard, "é🦀")),
+            );
+            assert_eq!(
+                typed_after(&derive(&events)).is_some(),
+                expected,
+                "pairs: {pairs}"
+            );
+        }
+
+        // Only blocked outside pastes open a window.
+        let mut events = vec![
+            rejected_paste(1, 0, PasteRejectionReason::UnverifiableInput),
+            rejected_paste(2, 0, PasteRejectionReason::MissingLiveSource),
+            rejected_paste(3, 0, PasteRejectionReason::OutsideEditor),
+        ];
+        events.extend(typed(4, 1_000, 1_000));
+        assert!(derive(&events).is_empty());
+    }
+
+    #[test]
+    fn typed_after_rejected_paste_reports_the_first_qualifying_paste_with_a_count() {
+        let mut events = vec![
+            rejected_paste(1, 0, PasteRejectionReason::ExternalInput),
+            rejected_paste(2, 10_000, PasteRejectionReason::ExternalInput),
+        ];
+        events.extend(typed(3, 20_000, 250));
+        // A third blocked paste that nobody types after.
+        events.push(rejected_paste(
+            50,
+            400_000,
+            PasteRejectionReason::ExternalInput,
+        ));
+        events.push(edit_event(51, 400_001, EditOrigin::Keyboard, "x"));
+        let flags = derive(&events);
+        assert_eq!(
+            kinds(&flags),
+            vec![
+                AdvisoryFlagKind::RejectedPasteAttempts,
+                AdvisoryFlagKind::TypedAfterRejectedPaste,
+            ]
+        );
+        assert_eq!(flags[0].measured_value, "3 blocked outside pastes");
+        let flag = typed_after(&flags).unwrap();
+        assert_eq!(flag.link.sequence, 1);
+        assert_eq!(
+            flag.measured_value,
+            "250 characters within 300 seconds after it; qualifying blocked outside pastes: 2 of 3"
+        );
+        assert_eq!(
+            display_advisory(flag),
+            "TYPED_AFTER_REJECTED_PASTE [segment:2 seq:1]: the record contains at least 200 characters inserted by Keyboard transactions within 300 seconds after a blocked outside paste; measured value: 250 characters within 300 seconds after it; qualifying blocked outside pastes: 2 of 3; advisory: heuristic; expect false positives"
+        );
+
+        // Only the later paste qualifies: the link moves to it.
+        let mut events = vec![rejected_paste(1, 0, PasteRejectionReason::ExternalInput)];
+        events.extend(typed(2, 1_000, 150));
+        events.push(rejected_paste(
+            20,
+            400_000,
+            PasteRejectionReason::ExternalInput,
+        ));
+        events.extend(typed(21, 400_500, 200));
+        let flag = typed_after(&derive(&events)).cloned().unwrap();
+        assert_eq!(flag.link.sequence, 20);
+        assert_eq!(
+            flag.measured_value,
+            "200 characters within 300 seconds after it; qualifying blocked outside pastes: 1 of 2"
         );
     }
 

@@ -2132,6 +2132,7 @@ fn advisory_kind_vocabulary_is_reachable_from_the_golden_suite() {
             "LARGE_SINGLE_INSERTION",
             "SUSTAINED_HIGH_RATE",
             "REJECTED_PASTE_ATTEMPTS",
+            "TYPED_AFTER_REJECTED_PASTE",
         ]
     );
 }
