@@ -545,39 +545,50 @@ impl PinnedStateDirectory {
         }
     }
 
+    /// Waits briefly for the lock, so a read-only inspection holding it for a
+    /// moment (`rustrace status`) does not make a starting session fail.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn lock_writer(&self) -> Result<WriterOwnership, WorkspaceHashError> {
-        self.lock_writer_with(|_| {})
+        self.lock_writer_with(WRITER_LOCK_ATTEMPTS, |_| {})
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn lock_writer_with(
         &self,
+        attempts: u32,
         after_lock: impl FnOnce(&PinnedStateFile),
     ) -> Result<WriterOwnership, WorkspaceHashError> {
         self.verify()?;
         let writer = self.pin_file("writer.lock", true)?;
-        flock(&writer.descriptor, FlockOperation::NonBlockingLockExclusive).map_err(|error| {
-            let lock = self.display_path.join("writer.lock");
-            if error == rustix::io::Errno::WOULDBLOCK {
-                // Command processes inherit the lock, so it also stays held by a
-                // program that a killed session started.
-                filesystem_error(
-                    "acquire exclusive workspace writer ownership",
-                    &self.display_path,
-                    format!(
-                        "held by another open Rustrace session, or by a program a command started before Rustrace was killed; close that session or stop the program (`lsof {}` lists it), then retry",
-                        lock.display()
-                    ),
-                )
-            } else {
-                filesystem_error(
-                    "acquire exclusive workspace writer ownership",
-                    &self.display_path,
-                    error,
-                )
+        let mut attempt = 1;
+        loop {
+            match flock(&writer.descriptor, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => break,
+                Err(rustix::io::Errno::WOULDBLOCK) if attempt < attempts => {
+                    attempt += 1;
+                    std::thread::sleep(WRITER_LOCK_RETRY_INTERVAL);
+                }
+                Err(rustix::io::Errno::WOULDBLOCK) => {
+                    // Command processes inherit the lock, so it also stays held by a
+                    // program that a killed session started.
+                    return Err(filesystem_error(
+                        WRITER_LOCK_OPERATION,
+                        &self.display_path,
+                        format!(
+                            "{WRITER_CONTENTION}, or by a program a command started before Rustrace was killed; close that session or stop the program (`lsof {}` lists it), then retry",
+                            self.display_path.join("writer.lock").display()
+                        ),
+                    ));
+                }
+                Err(error) => {
+                    return Err(filesystem_error(
+                        WRITER_LOCK_OPERATION,
+                        &self.display_path,
+                        error,
+                    ));
+                }
             }
-        })?;
+        }
         // Install cleanup immediately after successful acquisition, before any
         // fallible verification. Failed contenders never own an unlock guard.
         let writer = WriterOwnership {
@@ -682,15 +693,33 @@ impl PinnedStateDirectory {
         self.journal_file(session_id, false)
     }
 
+    /// Like [`Self::open_journal_file`], but fails at once, without waiting,
+    /// when another session holds the workspace.
+    pub fn open_journal_file_if_idle(
+        self,
+        session_id: &SessionId,
+    ) -> Result<PinnedJournalFile, WorkspaceHashError> {
+        self.journal_file_with(session_id, false, 1)
+    }
+
     fn journal_file(
         self,
         session_id: &SessionId,
         create: bool,
     ) -> Result<PinnedJournalFile, WorkspaceHashError> {
+        self.journal_file_with(session_id, create, WRITER_LOCK_ATTEMPTS)
+    }
+
+    fn journal_file_with(
+        self,
+        session_id: &SessionId,
+        create: bool,
+        lock_attempts: u32,
+    ) -> Result<PinnedJournalFile, WorkspaceHashError> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             self.verify()?;
-            let writer = self.lock_writer()?;
+            let writer = self.lock_writer_with(lock_attempts, |_| {})?;
             let file_name = format!("{session_id}.sqlite");
             let display_path = self.display_path.join(&file_name);
             // A new database must not adopt leftover evidence from an earlier
@@ -778,7 +807,7 @@ impl PinnedStateDirectory {
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            let _ = (session_id, create);
+            let _ = (session_id, create, lock_attempts);
             Err(WorkspaceHashError::UnsupportedPlatform)
         }
     }
@@ -2114,6 +2143,24 @@ fn open_error(operation: &'static str, path: &Path, error: Errno) -> WorkspaceHa
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+const WRITER_LOCK_OPERATION: &str = "acquire exclusive workspace writer ownership";
+const WRITER_CONTENTION: &str = "held by another open Rustrace session";
+/// About one second in all: long enough for a read-only inspection to finish.
+const WRITER_LOCK_ATTEMPTS: u32 = 20;
+const WRITER_LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+impl WorkspaceHashError {
+    /// Whether the writer lock is held by an open session or by a program a
+    /// command started, rather than failing for another reason.
+    pub fn is_writer_contention(&self) -> bool {
+        matches!(
+            self,
+            Self::Filesystem { operation, message, .. }
+                if *operation == WRITER_LOCK_OPERATION && message.starts_with(WRITER_CONTENTION)
+        )
+    }
+}
+
 fn filesystem_error(
     operation: &'static str,
     path: &Path,
@@ -2371,7 +2418,7 @@ mod tests {
         let linked = temp.path().join(".rustrace/writer.lock");
         let retained = temp.path().join(".rustrace/retained.lock");
         let mut inherited = None;
-        let result = state.lock_writer_with(|writer| {
+        let result = state.lock_writer_with(1, |writer| {
             // Same open-file-description retention as fork, isolated from
             // process timing. Exercise the actual fallible verification path.
             inherited = Some(dup(&writer.descriptor).unwrap());

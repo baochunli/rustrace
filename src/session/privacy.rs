@@ -17,9 +17,7 @@ use rustrace_model::{
     rprov_raw_blake3,
 };
 use rustrace_replay::ReplayEngine;
-use rustrace_workspace::hash::{
-    PinnedStateDirectory, PinnedStateInspection, PinnedWorkspaceRoot, WorkspaceHashError,
-};
+use rustrace_workspace::hash::{PinnedStateDirectory, PinnedStateInspection, PinnedWorkspaceRoot};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -418,10 +416,7 @@ fn summarize_unfinished(root: &Path, metadata: &SessionMetadata) -> Result<Priva
 fn lock_for_privacy_inspection(state: PinnedStateDirectory) -> Result<PinnedStateInspection> {
     match state.lock_for_inspection() {
         Ok(inspection) => Ok(inspection),
-        Err(WorkspaceHashError::Filesystem {
-            operation: "acquire exclusive workspace writer ownership",
-            ..
-        }) => {
+        Err(error) if error.is_writer_contention() => {
             Err("a rustrace session is currently open on this workspace; close it and retry".into())
         }
         Err(error) => Err(error.into()),
