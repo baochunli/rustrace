@@ -303,12 +303,17 @@ fn test_case_result_summary(result: &crate::session::TestCaseComparison) -> Stri
 fn start_test_case_sequence(
     session: &mut crate::session::ProductionSession,
     picker: &mut TestCasePicker,
+    status: &mut StatusMessage,
     mut case: crate::session::TestCase,
 ) {
     loop {
         match session.start_test_case(case.clone()) {
             Ok(()) => {
                 picker.note_started(case);
+                // A format 3 case whose fixture files differ still runs.
+                if let Some(warning) = session.take_run_warning() {
+                    status.replace(warning);
+                }
                 return;
             }
             Err(error) => {
@@ -533,7 +538,7 @@ fn handle_console_key(
             *status = match session.start_console_command(console_line.text()) {
                 Ok(ConsoleStart::Started) => {
                     console_line.take();
-                    "console command preparation started".into()
+                    console_started_status(session).into()
                 }
                 Ok(ConsoleStart::OverwriteConfirmation { .. }) => {
                     console_line.take();
@@ -567,6 +572,14 @@ fn handle_console_key(
         }
         _ => {}
     }
+}
+
+/// The status after a console command starts: silent, unless the Run
+/// starts with fixture files that differ from the assignment package.
+fn console_started_status(session: &mut crate::session::ProductionSession) -> String {
+    session
+        .take_run_warning()
+        .unwrap_or_else(|| String::from("console command preparation started"))
 }
 
 /// Esc or Ctrl-C cancels a running menu command or test-case run.
@@ -821,7 +834,7 @@ where
             output_scroll = usize::MAX;
             status.clear();
             if let Some(next) = next {
-                start_test_case_sequence(session, &mut test_cases, next);
+                start_test_case_sequence(session, &mut test_cases, &mut status, next);
             }
             session.set_command_modal(test_cases.is_open());
             true
@@ -1549,7 +1562,7 @@ where
                     if let Some(case) = test_cases.begin_selected() {
                         view = WorkView::Workspace;
                         focus = WorkspaceFocus::Editor;
-                        start_test_case_sequence(session, &mut test_cases, case);
+                        start_test_case_sequence(session, &mut test_cases, &mut status, case);
                     }
                     draw_gate.request_change(true);
                 }
@@ -1878,7 +1891,7 @@ where
                 Some(ShellInput::ConfirmModal) => {
                     draw_gate.request_change(true);
                     status = match session.confirm_console_overwrite() {
-                        Ok(()) => "console command preparation started".into(),
+                        Ok(()) => console_started_status(session).into(),
                         Err(error) => format!("console command rejected: {error}").into(),
                     };
                 }
@@ -2021,7 +2034,7 @@ where
                     if let Some(case) = test_cases.begin_selected() {
                         view = WorkView::Workspace;
                         focus = WorkspaceFocus::Editor;
-                        start_test_case_sequence(session, &mut test_cases, case);
+                        start_test_case_sequence(session, &mut test_cases, &mut status, case);
                     }
                 }
                 TestCasePickerKeyAction::Refresh => {
@@ -2094,7 +2107,7 @@ where
                 match key.code {
                     KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
                         status = match session.confirm_console_overwrite() {
-                            Ok(()) => "console command preparation started".into(),
+                            Ok(()) => console_started_status(session).into(),
                             Err(error) => format!("console command rejected: {error}").into(),
                         };
                     }
@@ -2783,7 +2796,7 @@ fn activate_command_menu_entry(
             status.replace(match session.start_console_command("cargo run") {
                 Ok(ConsoleStart::Started) => {
                     console_line.take();
-                    String::from("console command preparation started")
+                    console_started_status(session)
                 }
                 Ok(ConsoleStart::OverwriteConfirmation { .. }) => {
                     console_line.take();
@@ -5109,9 +5122,11 @@ format = ["cargo", "fmt"]
         let case = picker.begin_selected().unwrap();
         fs::remove_file(parent.join("test-cases/sample.in")).unwrap();
 
-        start_test_case_sequence(&mut session, &mut picker, case);
+        let mut status: StatusMessage = "".into();
+        start_test_case_sequence(&mut session, &mut picker, &mut status, case);
 
         assert!(!session.command_active());
+        assert_eq!(status.as_str(), "");
         assert!(picker.is_open());
         assert_eq!(picker.rows()[0].status(), "ERROR");
         let rows = test_case_output(
