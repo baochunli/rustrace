@@ -621,13 +621,13 @@ fn scan_and_verify_reference_report_blocked_pastes_and_typing_after_them() {
         report.advisories
     );
     let rejected = &report.advisories[expected.len() - 2];
-    assert_eq!(rejected.measured_value, "2 blocked outside pastes");
+    assert_eq!(rejected.measured_value, "2 blocked pastes into the editor");
     assert_eq!(Some(rejected.link), report.first_rejected_paste_attempt);
     let typed = &report.advisories[expected.len() - 1];
     assert_eq!(typed.link, rejected.link);
     assert_eq!(
         typed.measured_value,
-        "200 characters within 300 seconds after it; qualifying blocked outside pastes: 1 of 2"
+        "200 characters in one 60-second window within 300 seconds after it; qualifying blocked pastes: 1 of 2"
     );
 
     // Scan lists the kinds without a reference.
