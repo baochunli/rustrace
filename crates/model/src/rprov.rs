@@ -27,13 +27,21 @@ use crate::{
 use crate::{Hash, MAX_IDENTIFIER_BYTES, RecordedEventRef, SessionId, WorkspacePath};
 
 pub const RPROV_FORMAT_VERSION_V1: u32 = 1;
+// Count limits are sized together so that one segment at its checkpoint limit
+// always fits the aggregate limits: 8,192 checkpoints (about 68 active hours at
+// the 30-second schedule) plus its events, metadata, evidence and starter
+// entries stay under 16,384 archive entries; the inventory array fits the JSON
+// array limit; at about 17 JSON values and 613 manifest bytes per entry, a full
+// inventory stays under 524,288 values and 32 MiB. Raising a limit keeps the
+// container version: every byte a version-1 package holds is unchanged, and
+// only a package above the earlier limits needs a verifier with these values.
 pub const RPROV_CONTAINER_HEADER_BYTES: usize = 40;
 pub const RPROV_RECORD_HEADER_BYTES: usize = 16;
 pub const MAX_RPROV_STORED_BYTES: u64 = 2_147_483_648;
 pub const MAX_RPROV_EXPANDED_BYTES: u64 = 4_294_967_296;
-pub const MAX_RPROV_ARCHIVE_ENTRIES: usize = 4_096;
+pub const MAX_RPROV_ARCHIVE_ENTRIES: usize = 16_384;
 pub const MAX_RPROV_RECORD_PAYLOAD_BYTES: u64 = 1_073_741_824;
-pub const MAX_RPROV_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_RPROV_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_RPROV_ARCHIVE_PATH_BYTES: usize = 192;
 pub const MAX_RPROV_ARCHIVE_COMPONENT_BYTES: usize = 80;
 pub const MAX_RPROV_ARCHIVE_PATH_DEPTH: usize = 6;
@@ -41,7 +49,7 @@ pub const MAX_RPROV_SEGMENTS: usize = 128;
 pub const MAX_RPROV_EVENTS: u64 = 1_000_000;
 pub const MAX_RPROV_SEGMENT_EVENTS_BYTES: u64 = 1_073_741_824;
 pub const MAX_RPROV_EVENTS_BYTES: u64 = 1_610_612_736;
-pub const MAX_RPROV_CHECKPOINTS_PER_SEGMENT: usize = 1_024;
+pub const MAX_RPROV_CHECKPOINTS_PER_SEGMENT: usize = 8_192;
 pub const MAX_RPROV_CHECKPOINT_ENCODED_BYTES: u64 = 11_128_194;
 pub const MAX_RPROV_CHECKPOINT_EXPANDED_BYTES: u64 = 11_062_597;
 pub const MAX_RPROV_SEGMENT_CHECKPOINT_BYTES: u64 = 512 * 1024 * 1024;
@@ -69,10 +77,10 @@ pub const MAX_RPROV_PRODUCER_VALUE_BYTES: usize = 256;
 pub const MAX_RPROV_UNAVAILABLE_ASSURANCES: usize = 16;
 pub const MAX_RPROV_RECOVERY_GAPS: usize = 8_192;
 pub const MAX_RPROV_JSON_NESTING: usize = 16;
-pub const MAX_RPROV_JSON_VALUES: usize = 131_072;
+pub const MAX_RPROV_JSON_VALUES: usize = 524_288;
 pub const MAX_RPROV_JSON_KEY_BYTES: usize = 64;
 pub const MAX_RPROV_JSON_STRING_BYTES: usize = 4_096;
-pub const MAX_RPROV_JSON_ARRAY_ITEMS: usize = 8_192;
+pub const MAX_RPROV_JSON_ARRAY_ITEMS: usize = 16_384;
 
 const RPROV_MAGIC: &[u8; 8] = b"RUSTPROV";
 const RPROV_COMPRESSION_NONE: u8 = 0;
@@ -3684,7 +3692,7 @@ mod tests {
         assert!(preflight_manifest_json(array_over.as_bytes()).is_err());
 
         let group_count = MAX_RPROV_JSON_ARRAY_ITEMS - 1;
-        let base_group_items = 15;
+        let base_group_items = (MAX_RPROV_JSON_VALUES - 1 - group_count) / group_count;
         let first_group_items =
             MAX_RPROV_JSON_VALUES - 1 - group_count - base_group_items * (group_count - 1);
         let base_group = format!(

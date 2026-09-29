@@ -30,34 +30,38 @@ const MUTATION_CEILING: usize = 512 * 1024;
 /// Five review rounds each found one more legal input above a hand-derived bound,
 /// so this target enumerates a family and measures it instead.
 ///
-/// The family, one line per input, each inside every documented limit:
+/// The family, one line per input, each inside every documented limit. It was
+/// re-measured when T10.53 raised the count limits (8,192 checkpoints per
+/// segment, 16,384 archive entries and JSON array items, 524,288 JSON values,
+/// 32 MiB manifest):
 ///
 /// | Input | Peak |
 /// | --- | --- |
-/// | `manifest-decode-with-ceiling-checkpoint`, 4 segments x 1 022 checkpoints x 1 000 source links, first entry declaring the entry ceiling | **20 232 546 B** |
-/// | `outer-directory-at-limit`, 4 096 maximum-length ZIP directory entries, all directories | 17 608 720 B |
-/// | the same archive with 256 of those entries classified as source files, the most the importer accepts, measured by review 8 and not enumerated here | 17 883 160 B |
-/// | `manifest-decode-four-segment`, the same manifest without the ceiling claim | 14 445 626 B |
+/// | `manifest-decode-wide-two-segment`, 2 segments x 8 190 checkpoints x 4 096 source links, with 128-byte session and document identifiers and 983-byte source paths (a 26 MB manifest) | **74 061 752 B** |
+/// | `outer-directory-at-limit`, 16 384 maximum-length ZIP directory entries, all directories | 70 434 832 B |
+/// | `manifest-decode-with-ceiling-checkpoint`, 4 segments x 4 094 checkpoints x 2 048 source links, first entry declaring the entry ceiling | 42 030 874 B |
+/// | `manifest-decode-four-segment`, the same manifest without the ceiling claim | 42 030 850 B |
+/// | `manifest-bytes-at-limit`, 69 B container claiming the manifest ceiling | at least 33 554 432 B (asserted) |
+/// | `manifest-decode-one-segment`, 1 segment x 8 192 checkpoints x 4 096 source links | 21 626 416 B |
 /// | `near-maximum-package`, a real payload at the checkpoint entry ceiling, imports | 11 137 446 B |
 /// | `checkpoint-claim-at-ceiling`, 4 KB container claiming that ceiling | 11 137 395 B |
-/// | `manifest-decode-one-segment`, 1 segment x 1 024 checkpoints x 4 096 source links | 9 908 302 B |
-/// | `manifest-bytes-at-limit`, 69 B container claiming the manifest ceiling | 8 388 661 B |
 /// | `clean-outer-zip` | 52 459 B |
 /// | `clean-standalone` | 21 808 B |
-/// | `outer-extra-field`, `outer-entry-comment`, at 1 and at `u16::MAX` | 343 B |
+/// | `outer-extra-field`, `outer-entry-comment`, at 1 and at `u16::MAX` | 320 B |
 ///
-/// Review 6 independently measured **24 824 094 B** on a legal container this
-/// builder does not reproduce — a larger manifest that stays under the JSON
-/// value preflight. That measurement is part of the envelope even though no
-/// case here produces it.
+/// Before the raise, review 8 measured the outer-directory archive with 256
+/// entries classified as source files, the most the importer accepts, at
+/// 274 440 B above the all-directory archive; review 6 measured a larger
+/// manifest under the JSON value preflight at 24 824 094 B, a shape the wide
+/// two-segment case now stands for at the raised limits.
 ///
-/// The bound is the largest of those, 24 824 094, times 1.25.
+/// The bound is the largest of those, 74 061 752, times 1.25.
 ///
 /// **The true worst case over all legal inputs is not derived and may be
 /// higher than this.** The bound is an observed envelope guarding against
 /// regression; what these cases establish is that the importer does not panic
 /// and that its allocation is a bounded function of the documented limits.
-const MEASURED_MAXIMUM: usize = 24_824_094;
+const MEASURED_MAXIMUM: usize = 74_061_752;
 const ALLOCATION_BOUND: usize = MEASURED_MAXIMUM * 5 / 4;
 
 /// The tight guard for the two clean fixtures and for any claim the importer
@@ -463,18 +467,34 @@ fn boundary_cases() {
 
     // Containers whose manifest is large enough that decoding it, not any one
     // declared length, is the importer's dominant allocation.
-    for (label, segments, checkpoints, links, ceiling) in [
-        ("manifest-decode-one-segment", 1, 1_024, 4_096, false),
-        ("manifest-decode-four-segment", 4, 1_022, 1_000, false),
+    for (label, segments, checkpoints, links, ceiling, wide) in [
+        ("manifest-decode-one-segment", 1, 8_192, 4_096, false, false),
+        (
+            "manifest-decode-four-segment",
+            4,
+            4_094,
+            2_048,
+            false,
+            false,
+        ),
         (
             "manifest-decode-with-ceiling-checkpoint",
             4,
-            1_022,
-            1_000,
+            4_094,
+            2_048,
+            true,
+            false,
+        ),
+        (
+            "manifest-decode-wide-two-segment",
+            2,
+            8_190,
+            4_096,
+            false,
             true,
         ),
     ] {
-        let container = large_manifest_container(segments, checkpoints, links, ceiling);
+        let container = large_manifest_container(segments, checkpoints, links, ceiling, wide);
         let (outcome, peak) = fuzz_support::assert_measured(label, ALLOCATION_BOUND, || {
             import_rprov(Cursor::new(container.as_slice()))
         });
@@ -520,9 +540,9 @@ fn boundary_cases() {
         "the near-maximum package failed to import: {imported:?}"
     );
     assert!(
-        peak > MAX_RPROV_MANIFEST_BYTES,
-        "the near-maximum package peaked at {peak} bytes, below the manifest ceiling, so it no \
-         longer measures a full-size successful import"
+        peak > MAX_RPROV_CHECKPOINT_ENCODED_BYTES as usize,
+        "the near-maximum package peaked at {peak} bytes, below the checkpoint entry ceiling, so \
+         it no longer measures a full-size successful import"
     );
     println!(
         "FUZZ_PEAK case=near-maximum-package input={} peak={peak}",
@@ -1125,6 +1145,7 @@ fn large_manifest_container(
     checkpoints: u64,
     links: u64,
     ceiling_checkpoint: bool,
+    wide: bool,
 ) -> Vec<u8> {
     let events = 4 * (checkpoints + links) + 16;
     let mut inventory: Vec<RprovInventoryEntry> = Vec::new();
@@ -1132,7 +1153,11 @@ fn large_manifest_container(
     let mut parent: Option<RprovParentLink> = None;
 
     for ordinal in 1..=segments {
-        let session_id = session(&format!("session-{ordinal}"));
+        let session_id = if wide {
+            session(&format!("session-{ordinal:04}-{}", "s".repeat(115)))
+        } else {
+            session(&format!("session-{ordinal}"))
+        };
         let event_path = format!("segments/{ordinal:04}/events.jsonl");
         let terminal = hash((ordinal + 40) as u8);
         let final_tree = hash((ordinal + 80) as u8);
@@ -1199,12 +1224,19 @@ fn large_manifest_container(
                         sequence: paste - 1,
                         event_hash: hash(index as u8),
                     },
-                    document_id: DocumentId::new(format!("document-{index:06}-{}", "d".repeat(48)))
-                        .unwrap(),
-                    path: WorkspacePath::new(format!(
-                        "src/{}/module{index:06}.rs",
-                        "p".repeat(200)
+                    document_id: DocumentId::new(format!(
+                        "document-{index:06}-{}",
+                        "d".repeat(if wide { 111 } else { 48 })
                     ))
+                    .unwrap(),
+                    path: WorkspacePath::new(if wide {
+                        format!(
+                            "src/{}/module{index:06}.rs",
+                            vec!["p".repeat(240); 4].join("/")
+                        )
+                    } else {
+                        format!("src/{}/module{index:06}.rs", "p".repeat(200))
+                    })
                     .unwrap(),
                     version: index,
                     content_hash: hash(index as u8),
