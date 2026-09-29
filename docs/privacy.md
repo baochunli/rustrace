@@ -102,13 +102,17 @@ The complete version 1 event vocabulary is:
   versions, before/after workspace links, resource limits, output bytes, and
   outcome. The environment summary records only which fixed environment names
   are retained and never their values. Console routing is also recorded when
-  present. For a version 3 assignment, the route of a console Run can also
-  record the program's literal arguments, which also end the argument vector
-  after `--`; whether the program ran in the workspace or in the `files/`
-  folder of the assignment's test-case folder, with the BLAKE3 fixture-tree
-  hash of that folder; and the packaged case name for a test-case run. A run
-  in `files/` records `--manifest-path ../../WORKSPACE/Cargo.toml`, which
-  names only the workspace directory, not where it is on the computer. Console Test filters and output-option spellings are part
+  present. The route of a console Run records the program arguments exactly as
+  typed after `--` in `cargo run -- ARG...`, or read from a version 3 case's
+  `NAME.args`; they also end the argument vector after `--`. Unlike the lines
+  typed as a program's standard input, which are not recorded, arguments are
+  part of the recorded command, so avoid typing anything private there. For a
+  version 3 assignment, the route also records whether the program ran in the
+  workspace or in the `files/` folder of the assignment's test-case folder,
+  with the BLAKE3 fixture-tree hash of that folder as it was just before the
+  run, and the packaged case name for a test-case run. A run in `files/`
+  records `--manifest-path ../../WORKSPACE/Cargo.toml`, which names only the
+  workspace directory, not where it is on the computer. Console Test filters and output-option spellings are part
   of the recorded argument vector. `--no-capture` and its `--nocapture` alias disable
   the Rust test harness's capture, not Rustrace's recording; `--show-output`
   exposes successful-test output after tests finish. Rustrace records output

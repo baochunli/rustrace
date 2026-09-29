@@ -121,7 +121,33 @@ fn console_literal_grammar_rejects_shell_syntax_flags_and_malformed_routes() {
         "cargo test > out",
         "cargo run --release --release",
         "cargo run x",
-        "cargo run -- x",
+        "cargo run --",
+        "cargo run -- < in",
+        "cargo run < in -- x",
+        "cargo run --release -- x --release --release extra < in trailing",
+        "cargo run -- a>b",
+        "cargo run -- >out",
+        "cargo run -- 2>err",
+        "cargo run -- x <in",
+        // Quotes, backticks, and shell operators stay refused in arguments,
+        // and a control character anywhere.
+        "cargo run -- 'quoted arg'",
+        "cargo run -- \"quoted\"",
+        "cargo run -- it's",
+        "cargo run -- `date`",
+        "cargo run -- a|b",
+        "cargo run -- a&b",
+        "cargo run -- a;b",
+        "cargo run -- x\ty",
+        "cargo run -- x\u{7f}",
+        // Before `--` and in redirection paths, every shell character.
+        "cargo run! -- x",
+        "cargo run --release* -- x",
+        "cargo run -- a > *.txt",
+        "cargo run -- a < $IN",
+        "cargo run -- a > (out)",
+        "cargo run --release --release -- x",
+        "cargo run x -- y",
         "cargo run <",
         "cargo run >",
         "cargo run < in < other",
@@ -168,6 +194,240 @@ fn console_literal_grammar_rejects_shell_syntax_flags_and_malformed_routes() {
     ] {
         assert!(parse_console_command(input).is_err(), "accepted {input:?}");
     }
+}
+
+#[test]
+fn console_run_arguments_are_literal_tokens_before_any_redirection() {
+    let longest = "a".repeat(1024);
+    let many = vec!["x"; 64];
+    let too_many = vec!["x"; 65];
+    for (input, release, args, stdin, stdout) in [
+        ("cargo run -- a", false, vec!["a"], None, None),
+        (
+            "  cargo   run   --   -n   fn=main  ",
+            false,
+            vec!["-n", "fn=main"],
+            None,
+            None,
+        ),
+        (
+            "cargo run --release -- -i pattern dir/file.txt",
+            true,
+            vec!["-i", "pattern", "dir/file.txt"],
+            None,
+            None,
+        ),
+        (
+            "cargo run -- a b < in.txt",
+            false,
+            vec!["a", "b"],
+            Some("in.txt"),
+            None,
+        ),
+        (
+            "cargo run --release -- a > out.txt < in.txt",
+            true,
+            vec!["a"],
+            Some("in.txt"),
+            Some("out.txt"),
+        ),
+        // After `--`, Cargo flags and a second `--` are program arguments.
+        (
+            "cargo run -- --release --locked -- x",
+            false,
+            vec!["--release", "--locked", "--", "x"],
+            None,
+            None,
+        ),
+        (
+            "cargo run -- café 🦀",
+            false,
+            vec!["café", "🦀"],
+            None,
+            None,
+        ),
+        (
+            "cargo run -- a@b %c ^d +e ,f :g =h .i",
+            false,
+            vec!["a@b", "%c", "^d", "+e", ",f", ":g", "=h", ".i"],
+            None,
+            None,
+        ),
+    ] {
+        let parsed =
+            parse_console_command(input).unwrap_or_else(|error| panic!("{input}: {error}"));
+        assert_eq!(parsed.action, CargoAction::Run, "{input}");
+        let mut expected_argv = vec!["cargo", "run"];
+        if release {
+            expected_argv.push("--release");
+        }
+        assert_eq!(parsed.argv, expected_argv, "{input}");
+        assert_eq!(parsed.args, args, "{input}");
+        assert_eq!(parsed.stdin.as_ref().map(|path| path.as_str()), stdin);
+        assert_eq!(parsed.stdout.as_ref().map(|path| path.as_str()), stdout);
+    }
+    let parsed = parse_console_command(&format!("cargo run -- {longest}")).unwrap();
+    assert_eq!(parsed.args, std::slice::from_ref(&longest));
+    assert!(parse_console_command(&format!("cargo run -- {longest}a")).is_err());
+    let parsed = parse_console_command(&format!("cargo run -- {}", many.join(" "))).unwrap();
+    assert_eq!(parsed.args.len(), 64);
+    assert!(parse_console_command(&format!("cargo run -- {}", too_many.join(" "))).is_err());
+    for input in ["cargo run", "cargo run --release < in > out"] {
+        assert!(parse_console_command(input).unwrap().args.is_empty());
+    }
+    for input in ["cargo test -- --nocapture", "cargo check"] {
+        assert!(parse_console_command(input).unwrap().args.is_empty());
+    }
+}
+
+#[test]
+fn console_run_arguments_pass_shell_characters_literally() {
+    for (input, args) in [
+        (
+            "cargo run -- fn(x) tests/grep.md",
+            vec!["fn(x)", "tests/grep.md"],
+        ),
+        ("cargo run -- a*b file", vec!["a*b", "file"]),
+        ("cargo run -- $HOME", vec!["$HOME"]),
+        (
+            "cargo run -- \\d+ [a-z]? ~/notes #tag !bang {a,b} *.txt",
+            vec![
+                "\\d+", "[a-z]?", "~/notes", "#tag", "!bang", "{a,b}", "*.txt",
+            ],
+        ),
+        ("cargo run -- a\\ b < in.txt", vec!["a\\", "b"]),
+    ] {
+        let parsed =
+            parse_console_command(input).unwrap_or_else(|error| panic!("{input}: {error}"));
+        assert_eq!(parsed.args, args, "{input}");
+        let prepared = prepare_console(&parsed, &tools(), &PathBuf::from("/workspace")).unwrap();
+        let passed = prepared
+            .command
+            .get_args()
+            .skip_while(|arg| *arg != "--")
+            .skip(1)
+            .map(|arg| arg.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(passed, args, "{input}: nothing expands them");
+    }
+}
+
+#[test]
+fn console_run_arguments_end_the_prepared_argument_vector() {
+    let workspace = PathBuf::from("/course/lab2.work");
+    let fixtures = PathBuf::from("/course/lab2.test-cases/files");
+    for (input, fixture_run, tail) in [
+        ("cargo run", false, vec!["run", "--locked"]),
+        (
+            "cargo run -- a --locked",
+            false,
+            vec!["run", "--locked", "--", "a", "--locked"],
+        ),
+        (
+            "cargo run --release -- a < in",
+            false,
+            vec!["run", "--release", "--locked", "--", "a"],
+        ),
+        (
+            "cargo run",
+            true,
+            vec![
+                "run",
+                "--locked",
+                "--manifest-path",
+                "../../lab2.work/Cargo.toml",
+            ],
+        ),
+        (
+            "cargo run --release -- -n fn",
+            true,
+            vec![
+                "run",
+                "--release",
+                "--locked",
+                "--manifest-path",
+                "../../lab2.work/Cargo.toml",
+                "--",
+                "-n",
+                "fn",
+            ],
+        ),
+    ] {
+        let request = parse_console_command(input).unwrap();
+        let prepared = rustrace::cargo_policy::prepare_console_in(
+            &request,
+            &tools(),
+            &workspace,
+            fixture_run.then_some(fixtures.as_path()),
+        )
+        .unwrap();
+        let mut expected = vec!["run", "pinned", "/trusted/cargo"];
+        expected.extend(tail);
+        assert_eq!(
+            prepared.command.get_args().collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(std::ffi::OsStr::new)
+                .collect::<Vec<_>>(),
+            "{input}"
+        );
+        assert_eq!(
+            prepared.command.get_current_dir(),
+            Some(if fixture_run {
+                fixtures.as_path()
+            } else {
+                workspace.as_path()
+            }),
+            "{input}"
+        );
+    }
+
+    // Direct requests cannot smuggle arguments or a fixture folder into
+    // another action, or unbounded or redirection-like arguments into a Run.
+    let run = |args: Vec<String>| ConsoleCommand {
+        action: CargoAction::Run,
+        argv: argv(&["cargo", "run"]),
+        args,
+        stdin: None,
+        stdout: None,
+    };
+    for request in [
+        ConsoleCommand {
+            action: CargoAction::Check,
+            argv: argv(&["cargo", "check"]),
+            args: argv(&["x"]),
+            stdin: None,
+            stdout: None,
+        },
+        run(argv(&[""])),
+        run(argv(&["a\nb"])),
+        run(vec!["x".to_owned(); 65]),
+        run(vec!["a".repeat(1025)]),
+    ] {
+        assert!(
+            rustrace::cargo_policy::prepare_console_in(&request, &tools(), &workspace, None)
+                .is_err(),
+            "{request:?}"
+        );
+    }
+    // Packaged `NAME.args` arguments may hold what the console cannot type.
+    let packaged = run(argv(&["a b", "<tag>", "'q'", "*.txt", "$HOME;|&"]));
+    let prepared =
+        rustrace::cargo_policy::prepare_console_in(&packaged, &tools(), &workspace, None).unwrap();
+    assert_eq!(
+        prepared.command.get_args().collect::<Vec<_>>()[5..],
+        ["--", "a b", "<tag>", "'q'", "*.txt", "$HOME;|&"].map(std::ffi::OsStr::new)
+    );
+    let check = parse_console_command("cargo check").unwrap();
+    assert!(
+        rustrace::cargo_policy::prepare_console_in(
+            &check,
+            &tools(),
+            &workspace,
+            Some(fixtures.as_path())
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -462,6 +722,7 @@ fn console_test_forms_prepare_the_exact_literal_tail_after_controller_locking() 
     let request = ConsoleCommand {
         action: CargoAction::Test,
         argv: vec!["cargo".into(), "test".into(), longest_filter.clone()],
+        args: Vec::new(),
         stdin: None,
         stdout: None,
     };
@@ -521,6 +782,7 @@ fn direct_console_test_requests_cannot_bypass_grammar_action_or_routes() {
         let request = ConsoleCommand {
             action,
             argv: argv(&arguments),
+            args: Vec::new(),
             stdin,
             stdout,
         };
@@ -534,6 +796,7 @@ fn direct_console_test_requests_cannot_bypass_grammar_action_or_routes() {
         let request = ConsoleCommand {
             action: CargoAction::Test,
             argv: vec!["cargo".into(), "test".into(), filter],
+            args: Vec::new(),
             stdin: None,
             stdout: None,
         };
@@ -559,7 +822,7 @@ fn rejection_names_the_complete_student_allowlist_without_internal_ids() {
         .to_string();
     assert_eq!(
         message,
-        "unsupported Cargo command; allowed: cargo build, cargo check, cargo test [FILTER] [-- OUTPUT_OPTION] (OUTPUT_OPTION: --nocapture, --no-capture, or --show-output), cargo run, cargo clippy, cargo doc, cargo add NAME, cargo add NAME@VERSION, cargo remove NAME, cargo update"
+        "unsupported Cargo command; allowed: cargo build, cargo check, cargo test [FILTER] [-- OUTPUT_OPTION] (OUTPUT_OPTION: --nocapture, --no-capture, or --show-output), cargo run [--release] [-- ARGS] [< IN] [> OUT], cargo clippy, cargo doc, cargo add NAME, cargo add NAME@VERSION, cargo remove NAME, cargo update"
     );
     assert!(!message.contains("T10.10"));
     assert!(!message.contains("T4.3"));

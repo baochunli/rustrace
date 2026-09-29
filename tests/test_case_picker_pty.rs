@@ -21,3 +21,23 @@ fn packaged_test_case_picker_runs_pass_and_fail_serially_in_a_real_v2_workspace(
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn format3_case_and_console_runs_use_arguments_fixtures_and_warnings_in_a_real_workspace() {
+    let test_home = test_home::TestHome::new(false);
+    let output = test_home
+        .command("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/format3_run_pty.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_rustrace"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

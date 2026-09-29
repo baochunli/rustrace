@@ -6,7 +6,10 @@ use rustrace_workspace::{
     OpenedRegularFile,
     assignment_package::{MAX_TEST_CASE_FILE_BYTES, MAX_TEST_CASE_TOTAL_BYTES, MAX_TEST_CASES},
     create_external_regular_file_in, external_regular_file_exists_in,
-    fixture_tree::{FIXTURE_ROOT, FixtureTree, read_deployed_fixture_tree},
+    fixture_tree::{
+        FIXTURE_ROOT, FixtureTree, PinnedFixtureRoot, open_deployed_fixture_root,
+        read_deployed_fixture_tree,
+    },
     list_external_regular_files_in_with_filter, open_external_regular_file_read_in,
     open_external_regular_file_write_in,
 };
@@ -252,7 +255,6 @@ pub(crate) fn case_folder_owner(workspace_root: &Path) -> Result<String> {
 
 /// How a deployed fixture tree compares with the one the package declared.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // Checked before each format 3 launch in T10.50.
 pub(crate) enum FixtureTreeCheck {
     /// The package has no fixture tree, so the program runs in the workspace.
     /// `deployed` reports whether a `files/` folder exists anyway.
@@ -264,6 +266,91 @@ pub(crate) enum FixtureTreeCheck {
         packaged: Hash,
         deployed: Option<Hash>,
     },
+}
+
+impl FixtureTreeCheck {
+    fn classify(packaged: Option<Hash>, deployed: Option<Hash>) -> Self {
+        match (packaged, deployed) {
+            (None, deployed) => Self::NotPackaged {
+                deployed: deployed.is_some(),
+            },
+            (Some(packaged), Some(deployed)) if packaged == deployed => Self::Matches {
+                fixtures_blake3: deployed,
+            },
+            (Some(packaged), deployed) => Self::Differs { packaged, deployed },
+        }
+    }
+}
+
+/// The deployed fixture folder a format 3 Run starts in, held open from the
+/// moment it was hashed until the program is launched in it. Holding it open
+/// fixes which directory the program starts in, not what the directory
+/// contains by then.
+#[derive(Debug)]
+pub(crate) struct PinnedFixtures {
+    pub root: PinnedFixtureRoot,
+    /// [`FixtureTreeCheck::Matches`] or [`FixtureTreeCheck::Differs`] with the
+    /// deployed hash.
+    pub check: FixtureTreeCheck,
+    /// `NAME.test-cases/files`, for messages.
+    pub display: String,
+}
+
+impl PinnedFixtures {
+    /// The deployed tree's hash when it was pinned.
+    pub fn deployed(&self) -> Hash {
+        match self.check {
+            FixtureTreeCheck::Matches { fixtures_blake3 } => fixtures_blake3,
+            FixtureTreeCheck::Differs {
+                deployed: Some(deployed),
+                ..
+            } => deployed,
+            _ => unreachable!("a pinned fixture tree was hashed"),
+        }
+    }
+
+    /// The student-facing warning for a deployed tree that differs from the
+    /// package, or `None` when it matches. A packaged case run then records
+    /// the deployed hash and no longer verifies against the package.
+    pub fn warning(&self, test_case: bool) -> Option<String> {
+        matches!(self.check, FixtureTreeCheck::Differs { .. })
+            .then(|| fixtures_changed_warning(&self.display, test_case))
+    }
+}
+
+const FIXTURES_CHANGED_PREFIX: &str = "warning: the files in ";
+const FIXTURES_CHANGED_DIFFER: &str = " differ from the assignment package; ";
+
+/// Warns that a Run uses fixture files that differ from the package. The text
+/// keeps "warning" and none of the words that make a toast an error.
+pub(crate) fn fixtures_changed_warning(folder: &str, test_case: bool) -> String {
+    let consequence = if test_case {
+        "the case runs with them as they are and will not verify against the package"
+    } else {
+        "your program runs with them as they are"
+    };
+    crate::display::label(
+        &format!(
+            "{FIXTURES_CHANGED_PREFIX}{folder}{FIXTURES_CHANGED_DIFFER}{consequence}. To restore them, remove the files you changed or added, then quit and resume the workspace"
+        ),
+        512,
+    )
+}
+
+/// Whether a status is a [`fixtures_changed_warning`], which the editor keeps
+/// showing after the short run it warned about finishes.
+pub(crate) fn is_fixtures_changed_warning(status: &str) -> bool {
+    status.starts_with(FIXTURES_CHANGED_PREFIX) && status.contains(FIXTURES_CHANGED_DIFFER)
+}
+
+/// The files of one format 3 case, read fresh from the case folder just
+/// before a Run rather than taken from an earlier listing.
+#[derive(Debug)]
+pub(crate) struct ExtendedCaseFiles {
+    /// Parsed `NAME.args`; empty when the case has no such file.
+    pub args: Vec<String>,
+    /// The `NAME.in` bytes and their BLAKE3, or `None` for closed stdin.
+    pub input: Option<(Vec<u8>, Hash)>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -489,9 +576,63 @@ impl TestCaseDirectory {
     }
 
     /// The deployed fixture root that a format 3 case runs from.
-    #[allow(dead_code)] // The fixture working directory is launched in T10.50.
+    #[allow(dead_code)] // Shown with each case's fixture files in T10.51.
     pub(crate) fn fixtures_path(&self) -> PathBuf {
         self.root.path().join(FIXTURE_ROOT)
+    }
+
+    /// Opens the deployed `files/` folder by descriptor, or `None` when it is
+    /// absent.
+    pub(crate) fn open_fixture_root(&self) -> Result<Option<PinnedFixtureRoot>> {
+        let root = open_deployed_fixture_root(&self.root)?;
+        self.root.verify_binding()?;
+        Ok(root)
+    }
+
+    /// Prepares the fixture folder a Run of a session whose package has the
+    /// fixture tree `packaged` starts in. Cargo configuration in the case
+    /// folder or `files/` is refused, a missing `files/` is refused because
+    /// the Run has nowhere to start, and otherwise the folder is pinned and
+    /// hashed. A tree that differs from the package still runs; the caller
+    /// warns and records the deployed hash.
+    pub(crate) fn pin_fixtures(&self, packaged: Hash) -> Result<PinnedFixtures> {
+        self.reject_cargo_configuration()?;
+        let folder = self
+            .root
+            .path()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let display = crate::display::label(&format!("{folder}/{FIXTURE_ROOT}"), 300);
+        let root = self.open_fixture_root()?.ok_or_else(|| {
+            format!(
+                "the fixture folder {display} is missing; quit and resume the workspace to deploy it again"
+            )
+        })?;
+        let deployed = root.hash()?;
+        root.verify_binding()?;
+        Ok(PinnedFixtures {
+            root,
+            check: FixtureTreeCheck::classify(Some(packaged), Some(deployed)),
+            display,
+        })
+    }
+
+    /// Reads a format 3 case's optional `NAME.args` and `NAME.in` as they are
+    /// on disk now. `NAME.in` is read into memory (at most the 1 MiB case-file
+    /// limit) so the program receives exactly the bytes that were hashed.
+    pub(crate) fn read_extended_case(&self, case: &TestCase) -> Result<ExtendedCaseFiles> {
+        let args = if external_regular_file_exists_in(&self.root, &case.args_path())? {
+            self.read_args(case)?
+        } else {
+            Vec::new()
+        };
+        let input = if external_regular_file_exists_in(&self.root, &case.input_path())? {
+            Some(self.read_input_with_blake3(case)?)
+        } else {
+            None
+        };
+        Ok(ExtendedCaseFiles { args, input })
     }
 
     /// Reads the deployed `files/` tree without following links, or `None`
@@ -500,9 +641,8 @@ impl TestCaseDirectory {
         Ok(read_deployed_fixture_tree(&self.root)?)
     }
 
-    /// The hash to record for a fixture working directory, computed from the
-    /// deployed bytes immediately before launch.
-    #[allow(dead_code)] // Verified before launch in T10.50.
+    /// The deployed tree's hash, or `None` when `files/` is absent.
+    #[allow(dead_code)] // Shown by the picker in T10.51.
     pub(crate) fn fixture_tree_hash(&self) -> Result<Option<Hash>> {
         Ok(self.fixture_tree()?.map(|tree| tree.hash()))
     }
@@ -510,26 +650,20 @@ impl TestCaseDirectory {
     /// Compares the deployed `files/` tree with the packaged fixture-tree
     /// hash that the session recorded at startup, so a run can warn when a
     /// student's copy differs. An unreadable tree (for example one holding a
-    /// symlink) is an error rather than a difference.
-    #[allow(dead_code)] // Checked before each format 3 launch in T10.50.
+    /// symlink) is an error rather than a difference. Runs use
+    /// [`Self::pin_fixtures`], which also keeps the folder open.
+    #[allow(dead_code)] // Shown by the picker in T10.51.
     pub(crate) fn check_fixture_tree(&self, packaged: Option<Hash>) -> Result<FixtureTreeCheck> {
-        let deployed = self.fixture_tree_hash()?;
-        Ok(match (packaged, deployed) {
-            (None, deployed) => FixtureTreeCheck::NotPackaged {
-                deployed: deployed.is_some(),
-            },
-            (Some(packaged), Some(deployed)) if packaged == deployed => FixtureTreeCheck::Matches {
-                fixtures_blake3: deployed,
-            },
-            (Some(packaged), deployed) => FixtureTreeCheck::Differs { packaged, deployed },
-        })
+        Ok(FixtureTreeCheck::classify(
+            packaged,
+            self.fixture_tree_hash()?,
+        ))
     }
 
     /// Refuses a `.cargo` entry in the case folder or its `files/`. Cargo
     /// reads `.cargo/config.toml` from the directory a command runs in and
     /// from every parent, so a Run from `files/` must not start while one is
     /// there. Parents above the case folder are shared with the workspace.
-    #[allow(dead_code)] // Called before each fixture-directory launch in T10.50.
     pub(crate) fn reject_cargo_configuration(&self) -> Result<()> {
         for relative in [".cargo".to_owned(), format!("{FIXTURE_ROOT}/.cargo")] {
             match fs::symlink_metadata(self.root.path().join(&relative)) {
@@ -647,27 +781,16 @@ impl TestCaseDirectory {
         Ok(open_external_regular_file_read_in(&self.root, path)?)
     }
 
-    /// Opens a format 3 case's `NAME.in`, hashes its bytes (at most the 1 MiB
-    /// case-file limit), and rewinds it so the program reads from the start.
-    /// The hash is the `stdin.blake3` a comparison's invocation records.
-    #[allow(dead_code)] // Launched by the format 3 runner in T10.50.
-    pub(crate) fn open_input_with_blake3(
-        &self,
-        case: &TestCase,
-    ) -> Result<(OpenedRegularFile, Hash)> {
-        use std::io::{Seek, SeekFrom};
-
-        let mut opened = self.open_input(&case.input_path())?;
-        let mut bytes = Vec::new();
-        (&mut opened.file_mut())
-            .take(MAX_TEST_CASE_FILE_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_TEST_CASE_FILE_BYTES {
-            return Err("test input exceeds the 1048576-byte limit".into());
-        }
-        opened.file_mut().seek(SeekFrom::Start(0))?;
-        self.root.verify_binding()?;
-        Ok((opened, hash_bytes(&bytes)))
+    /// Reads a format 3 case's `NAME.in` (at most the 1 MiB case-file limit)
+    /// and hashes it. The program receives exactly these bytes, and the hash
+    /// is the `stdin.blake3` its comparison's invocation records.
+    pub(crate) fn read_input_with_blake3(&self, case: &TestCase) -> Result<(Vec<u8>, Hash)> {
+        let bytes = self.read_bounded_case_file(
+            &case.input_path(),
+            "test input exceeds the 1048576-byte limit",
+        )?;
+        let blake3 = hash_bytes(&bytes);
+        Ok((bytes, blake3))
     }
 
     pub(crate) fn read_expected(&self, case: &TestCase) -> Result<Vec<u8>> {
@@ -1387,7 +1510,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn format3_input_is_hashed_then_rewound_for_the_program() {
+    fn format3_input_is_read_into_memory_and_hashed_within_its_limit() {
         let parent = fixture("input-hash");
         let cases_root = own_case_folder(&parent);
         fs::write(cases_root.join("case.in"), b"alpha\nbeta\n").unwrap();
@@ -1406,14 +1529,12 @@ mod tests {
         .unwrap();
         let cases = directory.list_cases_for(TestCaseLayout::Extended).unwrap();
 
-        let (mut input, blake3) = directory.open_input_with_blake3(&cases[0]).unwrap();
+        let (read, blake3) = directory.read_input_with_blake3(&cases[0]).unwrap();
         assert_eq!(blake3, hash_bytes(b"alpha\nbeta\n"));
-        let mut read = Vec::new();
-        input.file_mut().read_to_end(&mut read).unwrap();
         assert_eq!(read, b"alpha\nbeta\n");
         assert!(
             directory
-                .open_input_with_blake3(&cases[1])
+                .read_input_with_blake3(&cases[1])
                 .unwrap_err()
                 .to_string()
                 .contains("1048576-byte limit")
@@ -1485,6 +1606,130 @@ mod tests {
         symlink("../../outside", cases_root.join("files/src/escape")).unwrap();
         assert!(directory.fixture_tree_hash().is_err());
         assert!(directory.check_fixture_tree(Some(expected)).is_err());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_fixtures_hash_the_deployed_tree_and_warn_when_it_differs() {
+        let parent = fixture("pin-fixtures");
+        let cases_root = own_case_folder(&parent);
+        fs::write(cases_root.join("case.expected"), b"").unwrap();
+        let directory = TestCaseDirectory::open(
+            &parent.join("assignment.work"),
+            TestCaseLayout::Extended,
+            None,
+        )
+        .unwrap();
+        let packaged = FixtureTree::from_parts(
+            [],
+            [(WorkspacePath::new("data.txt").unwrap(), b"data\n".to_vec())],
+        )
+        .unwrap()
+        .hash();
+        let missing = directory.pin_fixtures(packaged).unwrap_err().to_string();
+        assert_eq!(
+            missing,
+            "the fixture folder assignment.test-cases/files is missing; quit and resume the workspace to deploy it again"
+        );
+
+        fs::create_dir(cases_root.join("files")).unwrap();
+        fs::write(cases_root.join("files/data.txt"), b"data\n").unwrap();
+        let pinned = directory.pin_fixtures(packaged).unwrap();
+        assert_eq!(
+            pinned.check,
+            FixtureTreeCheck::Matches {
+                fixtures_blake3: packaged
+            }
+        );
+        assert_eq!(pinned.deployed(), packaged);
+        assert_eq!(pinned.warning(true), None);
+        assert_eq!(pinned.display, "assignment.test-cases/files");
+        assert_eq!(pinned.root.path(), cases_root.join("files"));
+
+        fs::write(cases_root.join("files/extra.txt"), b"added\n").unwrap();
+        let changed = directory.pin_fixtures(packaged).unwrap();
+        assert_ne!(changed.deployed(), packaged);
+        assert_eq!(
+            changed.check,
+            FixtureTreeCheck::Differs {
+                packaged,
+                deployed: Some(changed.deployed())
+            }
+        );
+        let warning = changed.warning(true).unwrap();
+        assert_eq!(
+            warning,
+            "warning: the files in assignment.test-cases/files differ from the assignment package; the case runs with them as they are and will not verify against the package. To restore them, remove the files you changed or added, then quit and resume the workspace"
+        );
+        assert!(
+            changed
+                .warning(false)
+                .unwrap()
+                .contains("; your program runs with them as they are. To restore")
+        );
+        for word in ["failed", "error", "rejected", "unavailable", "stopped"] {
+            assert!(!warning.to_ascii_lowercase().contains(word), "{word}");
+        }
+
+        fs::create_dir(cases_root.join("files/.cargo")).unwrap();
+        assert!(
+            directory
+                .pin_fixtures(packaged)
+                .unwrap_err()
+                .to_string()
+                .contains("files/.cargo")
+        );
+        fs::remove_dir(cases_root.join("files/.cargo")).unwrap();
+        symlink("../outside", cases_root.join("files/link")).unwrap();
+        assert!(directory.pin_fixtures(packaged).is_err());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extended_case_files_are_read_fresh_from_the_case_folder() {
+        let parent = fixture("extended-case-files");
+        let cases_root = own_case_folder(&parent);
+        fs::write(cases_root.join("plain.expected"), b"").unwrap();
+        fs::write(cases_root.join("full.expected"), b"").unwrap();
+        fs::write(cases_root.join("full.args"), b"-n\nfn main\n").unwrap();
+        fs::write(cases_root.join("full.in"), b"input\n").unwrap();
+        let directory = TestCaseDirectory::open(
+            &parent.join("assignment.work"),
+            TestCaseLayout::Extended,
+            None,
+        )
+        .unwrap();
+        // Defaults such as TestCase::new's are never trusted for format 3.
+        let plain = directory
+            .read_extended_case(&TestCase::new("plain").unwrap())
+            .unwrap();
+        assert!(plain.args.is_empty());
+        assert!(plain.input.is_none());
+        let full = directory
+            .read_extended_case(&TestCase::new("full").unwrap())
+            .unwrap();
+        assert_eq!(full.args, ["-n", "fn main"]);
+        assert_eq!(
+            full.input,
+            Some((b"input\n".to_vec(), hash_bytes(b"input\n")))
+        );
+        fs::write(cases_root.join("full.args"), b"no final newline").unwrap();
+        assert!(
+            directory
+                .read_extended_case(&TestCase::new("full").unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("test-case arguments")
+        );
+        fs::remove_file(cases_root.join("full.args")).unwrap();
+        symlink("plain.expected", cases_root.join("full.args")).unwrap();
+        assert!(
+            directory
+                .read_extended_case(&TestCase::new("full").unwrap())
+                .is_err()
+        );
         fs::remove_dir_all(parent).unwrap();
     }
 

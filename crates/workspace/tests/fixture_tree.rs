@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustrace_workspace::assignment_package::{ExtractionLimits, extract_assignment_package};
 use rustrace_workspace::fixture_tree::{
-    FixtureTreeError, hash_deployed_fixture_tree, read_deployed_fixture_tree,
+    FixtureTreeError, hash_deployed_fixture_tree, open_deployed_fixture_root,
+    read_deployed_fixture_tree,
 };
 use rustrace_workspace::hash::PinnedWorkspaceRoot;
 
@@ -218,6 +219,53 @@ fn absent_fixture_root_is_none_and_unsafe_entries_are_errors() {
         fs::read(temp.path().join("outside.txt")).unwrap(),
         b"outside\n"
     );
+}
+
+#[test]
+fn pinned_fixture_root_reads_the_directory_it_opened_and_detects_rebinding() {
+    let temp = TempRoot::new();
+    let cases = deploy(temp.path());
+    let root = PinnedWorkspaceRoot::open(&cases).unwrap();
+    let pinned = open_deployed_fixture_root(&root).unwrap().unwrap();
+    assert_eq!(
+        pinned.path(),
+        fs::canonicalize(cases.join("files")).unwrap()
+    );
+    let packaged = packaged_hash(temp.path());
+    assert_eq!(pinned.hash().unwrap(), packaged);
+    assert_eq!(
+        pinned.read().unwrap(),
+        read_deployed_fixture_tree(&root).unwrap().unwrap()
+    );
+    pinned.verify_binding().unwrap();
+    // Repeated reads through one descriptor see current contents.
+    fs::write(cases.join("files/notes.txt"), "changed\n").unwrap();
+    assert_ne!(pinned.hash().unwrap(), packaged);
+    fs::write(cases.join("files/notes.txt"), "fn\n").unwrap();
+    assert_eq!(pinned.hash().unwrap(), packaged);
+
+    // Replacing `files/` leaves the descriptor on the hashed directory, and
+    // the binding check reports that its path now names another one.
+    fs::rename(cases.join("files"), cases.join("moved")).unwrap();
+    fs::create_dir(cases.join("files")).unwrap();
+    assert_eq!(pinned.hash().unwrap(), packaged);
+    assert!(pinned.verify_binding().is_err());
+    let replacement = open_deployed_fixture_root(&root).unwrap().unwrap();
+    assert_ne!(replacement.hash().unwrap(), packaged);
+    replacement.verify_binding().unwrap();
+    fs::remove_dir(cases.join("files")).unwrap();
+    assert!(pinned.verify_binding().is_err());
+
+    // Absent is None; a symlink or a file named `files` is an error.
+    assert!(open_deployed_fixture_root(&root).unwrap().is_none());
+    symlink("moved", cases.join("files")).unwrap();
+    assert!(matches!(
+        open_deployed_fixture_root(&root),
+        Err(FixtureTreeError::UnsupportedEntry { .. })
+    ));
+    fs::remove_file(cases.join("files")).unwrap();
+    fs::write(cases.join("files"), "not a directory").unwrap();
+    assert!(open_deployed_fixture_root(&root).is_err());
 }
 
 #[test]

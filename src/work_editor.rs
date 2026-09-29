@@ -303,12 +303,20 @@ fn test_case_result_summary(result: &crate::session::TestCaseComparison) -> Stri
 fn start_test_case_sequence(
     session: &mut crate::session::ProductionSession,
     picker: &mut TestCasePicker,
+    status: &mut StatusMessage,
     mut case: crate::session::TestCase,
 ) {
     loop {
         match session.start_test_case(case.clone()) {
             Ok(()) => {
                 picker.note_started(case);
+                // A format 3 case whose fixture files differ still runs.
+                // Without a new warning, an earlier one no longer applies.
+                if let Some(warning) = session.take_run_warning() {
+                    status.replace(warning);
+                } else if crate::console::is_fixtures_changed_warning(status) {
+                    status.clear();
+                }
                 return;
             }
             Err(error) => {
@@ -533,7 +541,7 @@ fn handle_console_key(
             *status = match session.start_console_command(console_line.text()) {
                 Ok(ConsoleStart::Started) => {
                     console_line.take();
-                    "console command preparation started".into()
+                    console_started_status(session).into()
                 }
                 Ok(ConsoleStart::OverwriteConfirmation { .. }) => {
                     console_line.take();
@@ -567,6 +575,14 @@ fn handle_console_key(
         }
         _ => {}
     }
+}
+
+/// The status after a console command starts: silent, unless the Run
+/// starts with fixture files that differ from the assignment package.
+fn console_started_status(session: &mut crate::session::ProductionSession) -> String {
+    session
+        .take_run_warning()
+        .unwrap_or_else(|| String::from("console command preparation started"))
 }
 
 /// Esc or Ctrl-C cancels a running menu command or test-case run.
@@ -819,9 +835,12 @@ where
         let completed_test_case = if let Some(result) = session.take_test_case_result() {
             let next = test_cases.record_completed(result);
             output_scroll = usize::MAX;
-            status.clear();
+            // A changed-fixtures warning outlives its short run.
+            if !crate::console::is_fixtures_changed_warning(&status) {
+                status.clear();
+            }
             if let Some(next) = next {
-                start_test_case_sequence(session, &mut test_cases, next);
+                start_test_case_sequence(session, &mut test_cases, &mut status, next);
             }
             session.set_command_modal(test_cases.is_open());
             true
@@ -836,7 +855,9 @@ where
             session.completed_format_rejection(),
             &session.command_status(),
             &mut save_triggered_check,
-        ) {
+        ) && (toast_for_status(&next_status).is_some()
+            || !crate::console::is_fixtures_changed_warning(&status))
+        {
             status = next_status.into();
         }
         if non_test_command_owned_tick(
@@ -1549,7 +1570,7 @@ where
                     if let Some(case) = test_cases.begin_selected() {
                         view = WorkView::Workspace;
                         focus = WorkspaceFocus::Editor;
-                        start_test_case_sequence(session, &mut test_cases, case);
+                        start_test_case_sequence(session, &mut test_cases, &mut status, case);
                     }
                     draw_gate.request_change(true);
                 }
@@ -1878,7 +1899,7 @@ where
                 Some(ShellInput::ConfirmModal) => {
                     draw_gate.request_change(true);
                     status = match session.confirm_console_overwrite() {
-                        Ok(()) => "console command preparation started".into(),
+                        Ok(()) => console_started_status(session).into(),
                         Err(error) => format!("console command rejected: {error}").into(),
                     };
                 }
@@ -2021,7 +2042,7 @@ where
                     if let Some(case) = test_cases.begin_selected() {
                         view = WorkView::Workspace;
                         focus = WorkspaceFocus::Editor;
-                        start_test_case_sequence(session, &mut test_cases, case);
+                        start_test_case_sequence(session, &mut test_cases, &mut status, case);
                     }
                 }
                 TestCasePickerKeyAction::Refresh => {
@@ -2094,7 +2115,7 @@ where
                 match key.code {
                     KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
                         status = match session.confirm_console_overwrite() {
-                            Ok(()) => "console command preparation started".into(),
+                            Ok(()) => console_started_status(session).into(),
                             Err(error) => format!("console command rejected: {error}").into(),
                         };
                     }
@@ -2783,15 +2804,18 @@ fn activate_command_menu_entry(
             status.replace(match session.start_console_command("cargo run") {
                 Ok(ConsoleStart::Started) => {
                     console_line.take();
-                    String::from("console command preparation started")
+                    console_started_status(session)
                 }
                 Ok(ConsoleStart::OverwriteConfirmation { .. }) => {
                     console_line.take();
                     String::from("confirm overwrite; output remains untouched")
                 }
-                Err(_) => String::from(
+                // A busy runner or pending decision keeps the generic notice;
+                // a refusal of the Run itself says why, as typed Runs do.
+                Err(error) if error.is::<crate::session::CommandUnavailable>() => String::from(
                     "Command unavailable; finish recovery/modal or check configured tools",
                 ),
+                Err(error) => format!("console command rejected: {error}"),
             });
         }
         CommandMenuAction::Check
@@ -2946,7 +2970,7 @@ fn command_completion_status(status: &str, save_triggered_check: &mut bool) -> S
 
 #[allow(clippy::too_many_arguments)]
 fn command_tick_status(
-    tick_error: Option<&dyn Error>,
+    tick_error: Option<&(dyn Error + 'static)>,
     completed_test_case: bool,
     was_command_active: bool,
     command_active: bool,
@@ -2955,6 +2979,10 @@ fn command_tick_status(
     save_triggered_check: &mut bool,
 ) -> Option<String> {
     if let Some(error) = tick_error {
+        // Nothing started, so say why rather than pointing at evidence.
+        if error.is::<crate::session::RunRefused>() {
+            return Some(format!("Run rejected before it started: {error}"));
+        }
         return Some(if was_command_active && *save_triggered_check {
             *save_triggered_check = false;
             String::new()
@@ -4281,6 +4309,29 @@ format = ["cargo", "fmt"]
     }
 
     #[test]
+    fn changed_fixture_warnings_are_warning_toasts_that_outlive_their_run() {
+        for test_case in [true, false] {
+            let warning =
+                crate::console::fixtures_changed_warning("lab2.test-cases/files", test_case);
+            assert!(crate::console::is_fixtures_changed_warning(&warning));
+            assert_eq!(
+                toast_for_status(&warning),
+                Some(ToastState::new(
+                    ToastKind::Warning,
+                    "warning",
+                    warning.clone()
+                ))
+            );
+        }
+        assert!(!crate::console::is_fixtures_changed_warning(
+            "warning: the files in the editor"
+        ));
+        assert!(!crate::console::is_fixtures_changed_warning(
+            "console command preparation started"
+        ));
+    }
+
+    #[test]
     fn explicit_save_has_one_toast_and_successful_command_completions_are_silent() {
         let save_toast = toast_for_status(EXPLICIT_SAVE_SUCCESS);
         assert_eq!(
@@ -4940,6 +4991,37 @@ format = ["cargo", "fmt"]
     }
 
     #[test]
+    fn a_run_refused_before_launch_says_why_as_an_error_toast() {
+        let refused = crate::session::RunRefused(
+            "the files in lab2.test-cases/files changed while the run was starting; run it again"
+                .into(),
+        );
+        let mut save_triggered_check = false;
+        let status = command_tick_status(
+            Some(&refused),
+            true,
+            true,
+            false,
+            false,
+            "test case finished",
+            &mut save_triggered_check,
+        )
+        .unwrap();
+        assert_eq!(
+            status,
+            "Run rejected before it started: the files in lab2.test-cases/files changed while the run was starting; run it again"
+        );
+        assert_eq!(
+            toast_for_status(&status),
+            Some(ToastState::new(
+                ToastKind::Error,
+                "action failed",
+                status.clone()
+            ))
+        );
+    }
+
+    #[test]
     fn update_menu_information_action_leaves_assignment_and_runner_unchanged() {
         let (fixture, mut session) = ClipboardFixture::new("A");
         let before = fixture.recorded_events();
@@ -5109,9 +5191,11 @@ format = ["cargo", "fmt"]
         let case = picker.begin_selected().unwrap();
         fs::remove_file(parent.join("test-cases/sample.in")).unwrap();
 
-        start_test_case_sequence(&mut session, &mut picker, case);
+        let mut status: StatusMessage = "".into();
+        start_test_case_sequence(&mut session, &mut picker, &mut status, case);
 
         assert!(!session.command_active());
+        assert_eq!(status.as_str(), "");
         assert!(picker.is_open());
         assert_eq!(picker.rows()[0].status(), "ERROR");
         let rows = test_case_output(
@@ -5129,6 +5213,62 @@ format = ["cargo", "fmt"]
             "{}",
             rows[0].text()
         );
+        session.quit().unwrap();
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_case_started_without_a_warning_clears_an_earlier_fixtures_warning() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = std::env::temp_dir().join(format!(
+            "rustrace-picker-stale-warning-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        let root = parent.join("assignment.work");
+        fs::create_dir_all(parent.join("test-cases")).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(parent.join("test-cases/sample.in"), b"input\n").unwrap();
+        fs::write(parent.join("test-cases/sample.expected"), b"output\n").unwrap();
+        let manifest = br#"format_version = 1
+course_id = "course"
+assignment_id = "stale-warning"
+assignment_version = "v1"
+title = "Stale warning"
+toolchain = "1.98.1"
+edition = "2024"
+allowed_paths = ["*.rs"]
+[commands]
+check = ["cargo", "check"]
+test = ["cargo", "test"]
+run = ["cargo", "run"]
+clippy = ["cargo", "clippy"]
+format = ["cargo", "fmt"]
+"#;
+        let mut session = ProductionSession::start(&root, manifest).unwrap();
+        let mut picker = TestCasePicker::default();
+        picker
+            .refresh(&root, crate::console::TestCaseLayout::Paired, None)
+            .unwrap();
+        let case = picker.begin_selected().unwrap();
+        let mut status: StatusMessage =
+            crate::console::fixtures_changed_warning("lab2.test-cases/files", true)
+                .as_str()
+                .into();
+
+        start_test_case_sequence(&mut session, &mut picker, &mut status, case);
+
+        assert!(session.command_active());
+        assert_eq!(status.as_str(), "", "the earlier warning no longer applies");
+        session.cancel_command();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while session.command_active() && std::time::Instant::now() < until {
+            let _ = session.poll_command();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!session.command_active());
         session.quit().unwrap();
         fs::remove_dir_all(parent).unwrap();
     }
