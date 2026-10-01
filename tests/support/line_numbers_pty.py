@@ -10,6 +10,7 @@ import os
 import pathlib
 import pty
 import select
+import sqlite3
 import signal
 import struct
 import subprocess
@@ -46,6 +47,7 @@ format = ["cargo", "fmt"]
 '''
 SOURCE = b'fn main() {\n    let first = 1;\n    let second = 2;\n}\n'
 CTRL_L = b"\x0c"
+EMPTY_CONSOLE_LINE = "> ▏"  # Prompt and line cursor.
 CTRL_Q = b"\x11"
 F9 = b"\x1b[20~"
 ESC = b"\x1b"
@@ -101,6 +103,8 @@ class Session:
             cwd=root,
         )
         self.transcript = bytearray()
+        self.root = root
+        self.last_toggle = 0.0
 
     def drain(self, seconds):
         deadline = time.monotonic() + seconds
@@ -126,6 +130,26 @@ class Session:
     def send(self, data, seconds=0.4):
         os.write(self.master, data)
         self.drain(seconds)
+
+    def journal(self):
+        """Every recorded event payload, in order."""
+        databases = list((self.root / "assignment.work/.rustrace").glob("*.sqlite"))
+        assert len(databases) == 1, databases
+        with sqlite3.connect(f"file:{databases[0]}?mode=ro", uri=True) as connection:
+            return [row[0] for row in
+                    connection.execute("SELECT payload FROM events ORDER BY sequence")]
+
+    def toggle(self, rows, choice, presses=1):
+        """Ctrl-L (held for `presses` repeats) flips the gutter once and records nothing."""
+        # Presses closer than Rustrace's repeat window count as one held key.
+        time.sleep(max(0.0, self.last_toggle + 0.7 - time.monotonic()))
+        before = self.journal()
+        self.send(CTRL_L * presses, 0.1)
+        self.last_toggle = time.monotonic()
+        self.expect_rows(rows, f"line numbers {'shown' if rows is NUMBERED else 'hidden'}")
+        self.expect_choice(choice)
+        self.drain(0.3)
+        assert self.journal() == before, "a line-number toggle entered the journal"
 
     def editor_rows(self, count=5, screen=None):
         screen = screen or self.screen()
@@ -186,26 +210,31 @@ with tempfile.TemporaryDirectory(prefix="rustrace-line-numbers-") as root_text:
         first.send(click(EDITOR_X + 3 + 4, 2))
         first.expect_caret("Ln 2, Col 5")
 
-        first.send(CTRL_L)
-        first.expect_rows(PLAIN, "plain rows")
-        first.expect_choice(False)
+        first.toggle(PLAIN, False)
         first.send(click(EDITOR_X + 4, 3))
         first.expect_caret("Ln 3, Col 5")
 
         # The console keeps Ctrl-L: it neither toggles nor types into the line.
         first.send(F9)
-        first.wait_for(lambda screen: any("> " in line for line in screen[10:]), "the console")
-        first.send(CTRL_L)
-        first.expect_choice(False)
+        first.wait_for(
+            lambda screen: any(line[EDITOR_X:].rstrip() == EMPTY_CONSOLE_LINE for line in screen[10:]),
+            "the empty console line",
+        )
+        time.sleep(max(0.0, first.last_toggle + 0.7 - time.monotonic()))
+        first.send(CTRL_L, 1.0)
+        console = first.screen()
+        assert stored_choice() is False, "Ctrl-L in the console toggled line numbers"
+        assert first.editor_rows(screen=console) == PLAIN, console
+        assert any(line[EDITOR_X:].rstrip() == EMPTY_CONSOLE_LINE for line in console[10:]), \
+            "Ctrl-L reached the console line:\n" + "\n".join(console)
         first.send(ESC)
         first.expect_rows(PLAIN, "plain rows")
 
-        first.send(CTRL_L)
-        first.expect_rows(NUMBERED, "numbered rows")
-        first.expect_choice(True)
-        first.send(CTRL_L)
-        first.expect_rows(PLAIN, "plain rows")
-        first.expect_choice(False)
+        first.toggle(NUMBERED, True)
+        first.toggle(PLAIN, False)
+        # A held Ctrl-L arrives as repeated presses and still toggles once.
+        first.toggle(NUMBERED, True, presses=6)
+        first.toggle(PLAIN, False, presses=6)
         first.quit()
     finally:
         first.close()
@@ -218,9 +247,7 @@ with tempfile.TemporaryDirectory(prefix="rustrace-line-numbers-") as root_text:
     try:
         open_source(second)
         second.expect_rows(PLAIN, "plain rows")
-        second.send(CTRL_L)
-        second.expect_rows(NUMBERED, "numbered rows")
-        second.expect_choice(True)
+        second.toggle(NUMBERED, True)
         second.quit()
     finally:
         second.close()
