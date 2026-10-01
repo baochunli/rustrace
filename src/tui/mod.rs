@@ -350,7 +350,7 @@ pub const OBVIOUS_EDITOR_KEYBIND_ROWS: [&str; 7] = [
     "Tab / Shift-Tab        indent / outdent",
 ];
 
-pub const KEYBIND_ROWS: [&str; 66] = [
+pub const KEYBIND_ROWS: [&str; 67] = [
     "EDITOR",
     "{line-navigation}",
     "{document-navigation}",
@@ -365,6 +365,7 @@ pub const KEYBIND_ROWS: [&str; 66] = [
     "Typing pause / Ctrl-Space  open completion",
     "Ctrl-F / F3            find panel / next match",
     "Ctrl-S                 save all, then Check",
+    "Ctrl-L                 show / hide line numbers",
     "Alt-Up / Alt-Down      Cargo or live diagnostic previous / next",
     "FILES",
     "Right-click file        file menu",

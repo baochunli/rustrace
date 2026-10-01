@@ -1644,6 +1644,7 @@ fn keybinds_overlay_inventory_is_complete_and_fully_rendered() {
         "Typing pause / Ctrl-Space  open completion",
         "Ctrl-F / F3            find panel / next match",
         "Ctrl-S                 save all, then Check",
+        "Ctrl-L                 show / hide line numbers",
         "Alt-Up / Alt-Down      Cargo or live diagnostic previous / next",
         "FILES",
         "Right-click file        file menu",
@@ -1724,7 +1725,7 @@ fn keybinds_overlay_inventory_is_complete_and_fully_rendered() {
         KEYBIND_ROWS.as_slice(),
     ]
     .concat();
-    assert_eq!(reachable.len(), 73);
+    assert_eq!(reachable.len(), 74);
     let editor_rows = &KEYBIND_ROWS[..KEYBIND_ROWS
         .iter()
         .position(|row| *row == "FILES")
@@ -6711,5 +6712,37 @@ fn completion_popup_anchors_at_the_caret_beside_the_gutter() {
             );
             assert_eq!(hits.completion_popup.y, layout.editor.y + 2);
         }
+    }
+}
+
+#[test]
+fn keybinds_panel_lists_the_line_number_toggle_under_editor() {
+    let row = "Ctrl-L                 show / hide line numbers";
+    let index = KEYBIND_ROWS.iter().position(|entry| *entry == row).unwrap();
+    let files = KEYBIND_ROWS
+        .iter()
+        .position(|entry| *entry == "FILES")
+        .unwrap();
+    assert!(index < files, "the toggle belongs to the EDITOR group");
+    assert_eq!(
+        KEYBIND_ROWS[index - 1],
+        "Ctrl-S                 save all, then Check"
+    );
+    let save = KEYBIND_ROWS[index - 1];
+    assert_eq!(row.find("show"), save.find("save"), "description column");
+
+    for (modifier, binding) in [
+        (PrimaryModifier::Control, "Control-L"),
+        (PrimaryModifier::Command, "⌘L"),
+    ] {
+        let state = view_state(RecordingState::Active, JournalHealth::Healthy)
+            .with_primary_modifier(modifier)
+            .with_keybinds_overlay(0);
+        let output = rendered_lines(&render(80, 24, &state)).join("\n");
+        let line = output
+            .lines()
+            .find(|line| line.contains("show / hide line numbers"))
+            .unwrap_or_else(|| panic!("{modifier:?}: toggle row not visible\n{output}"));
+        assert!(line.contains(binding), "{modifier:?}: {line:?}");
     }
 }

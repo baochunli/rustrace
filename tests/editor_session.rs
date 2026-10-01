@@ -1183,6 +1183,7 @@ fn crossterm_events_map_to_explicit_session_commands_without_duplicate_editing_l
         "Tab indent",
         "Shift-Tab",
         "Ctrl-S",
+        "Ctrl-L",
         "Ctrl-F",
         "F3",
         "Ctrl-C",

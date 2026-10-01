@@ -22,7 +22,7 @@ const INDENT_WIDTH: usize = 4;
 
 pub const EDITOR_KEY_HINTS: &str = "Arrows Home End PageUp PageDown | Shift+movement select | Backspace/Delete | F5 previous F6 next\n\
 Edit: Tab indent | Shift-Tab outdent | Ctrl-/ comment | {select-all} | Ctrl-C Ctrl-X Ctrl-V | Ctrl-Z undo Ctrl-Y redo\n\
-Cmd: Ctrl-Space complete | Ctrl-F/F3 find | Ctrl-S save | Ctrl-Tab/Ctrl-BackTab switch | Ctrl-Q quit";
+Cmd: Ctrl-Space complete | Ctrl-F/F3 find | Ctrl-S save | Ctrl-L line numbers | Ctrl-Tab/Ctrl-BackTab switch | Ctrl-Q quit";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EditorCommand {
