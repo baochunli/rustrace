@@ -8,12 +8,14 @@
 //! Compatibility contract: fields are only ever added. A reader takes the
 //! fields it knows and ignores the rest; a writer keeps fields it does not
 //! know. A missing, unreadable or invalid file, or a missing or non-boolean
-//! field, means the default: line numbers on.
+//! field, means the default: line numbers on. A file that exists but cannot
+//! be read as a JSON object is never overwritten: saving reports an error and
+//! leaves it, and whatever it holds, alone.
 
 use std::{
     env,
     ffi::OsStr,
-    io,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -73,7 +75,19 @@ pub fn set_line_numbers(enabled: bool) -> io::Result<()> {
 
 /// Persists the line-number choice at an explicit path, keeping unknown fields.
 pub fn set_line_numbers_at(path: &Path, enabled: bool) -> io::Result<()> {
-    let mut fields = read_fields(path);
+    let mut fields = match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Map::new(),
+        Err(error) => return Err(error),
+        Ok(_) => match crate::update::read_cached_json::<Value>(path) {
+            Some(Value::Object(fields)) => fields,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is not a readable preferences file", path.display()),
+                ));
+            }
+        },
+    };
     fields
         .entry("schema_version")
         .or_insert_with(|| Value::from(1));
@@ -213,13 +227,40 @@ mod tests {
     }
 
     #[test]
-    fn an_unusable_file_is_replaced_when_the_choice_is_saved() {
+    fn an_unreadable_file_is_left_alone_and_the_choice_is_not_kept() {
         let root = scratch();
         let path = root.join(FILE_NAME);
         fs::create_dir_all(&root).unwrap();
-        fs::write(&path, "not json").unwrap();
-        set_line_numbers_at(&path, false).unwrap();
-        assert!(!EditorPreferences::load(&path).line_numbers);
+        let oversize = format!(
+            r#"{{"line_numbers":false,"padding":"{}"}}"#,
+            "x".repeat(70_000)
+        );
+        for contents in ["not json", "[true]", oversize.as_str()] {
+            fs::write(&path, contents).unwrap();
+            assert!(set_line_numbers_at(&path, true).is_err(), "{contents:.20}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+            assert!(EditorPreferences::load(&path).line_numbers);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let contents = r#"{"line_numbers":true,"other":1}"#;
+            fs::write(&path, contents).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+            // Root can read a mode-000 file; the rule only matters when the read fails.
+            if fs::read(&path).is_err() {
+                assert!(set_line_numbers_at(&path, false).is_err());
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let leftovers = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
         fs::remove_dir_all(root).unwrap();
     }
 

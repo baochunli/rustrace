@@ -320,7 +320,7 @@ fn line_number_toggle_is_documented_where_students_and_privacy_readers_look() {
     }
     let privacy = unwrapped(&read_doc("privacy.md"));
     assert!(privacy.contains(
-        "The same directory holds `editor-preferences.json`, which keeps only whether the editor shows line numbers (Ctrl-L)."
+        "## Editor preferences The same state directory holds `editor-preferences.json`, which keeps only whether the editor shows line numbers (Ctrl-L)."
     ));
     let configuration = unwrapped(&read_doc("configuration.md"));
     assert!(configuration.contains("`$XDG_STATE_HOME/rustrace/editor-preferences.json`"));
