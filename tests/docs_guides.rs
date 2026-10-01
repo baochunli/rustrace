@@ -304,6 +304,30 @@ machine under the retained Cargo configuration and may have local side effects."
 }
 
 #[test]
+fn line_number_toggle_is_documented_where_students_and_privacy_readers_look() {
+    assert!(
+        rustrace::tui::KEYBIND_ROWS.contains(&"Ctrl-L                 show / hide line numbers"),
+        "the keybinds panel must list the line-number toggle"
+    );
+    let guide = unwrapped(&read_doc("student-guide.md"));
+    for wording in [
+        "| ⌘L or Ctrl-L | Show or hide line numbers; the choice is remembered for the next launch |",
+        "Press ⌘L or Ctrl-L while the editor has focus to hide or show them",
+        "starts with line numbers on",
+        "showing or hiding them is not recorded, and replay always shows them",
+    ] {
+        assert!(guide.contains(wording), "student guide must say: {wording}");
+    }
+    let privacy = unwrapped(&read_doc("privacy.md"));
+    assert!(privacy.contains(
+        "The same directory holds `editor-preferences.json`, which keeps only whether the editor shows line numbers (Ctrl-L)."
+    ));
+    let configuration = unwrapped(&read_doc("configuration.md"));
+    assert!(configuration.contains("`$XDG_STATE_HOME/rustrace/editor-preferences.json`"));
+    assert!(configuration.contains("A missing or unreadable file means line numbers on."));
+}
+
+#[test]
 fn student_guide_explains_editing_conveniences_and_their_limits() {
     let guide = unwrapped(&read_doc("student-guide.md"));
     for wording in [

@@ -84,6 +84,7 @@ blocked.
 | Ctrl-Q | Quit; macOS reserves ⌘Q for the application |
 | ⌘S or Ctrl-S | Save all buffers, then run Check |
 | ⌘F or Ctrl-F | Open the find and replace panel |
+| ⌘L or Ctrl-L | Show or hide line numbers; the choice is remembered for the next launch |
 | F3 | Repeat the last find while the panel is closed |
 | Ctrl-Space | Request completion (needs rust-analyzer) |
 | Ctrl-C/X/V | Copy, cut, paste text from inside this workspace; Ghostty reserves ⌘C and ⌘V, and the Ctrl-X form keeps the clipboard hints consistent |
@@ -498,6 +499,15 @@ or error replaces that hint with its controls. This row is not a status line:
 short results and warnings appear as a toast for 10 seconds or until your next
 key press, whichever comes first. Press F1 for the curated non-obvious keybind
 reference.
+
+Line numbers appear in a dim column at the left edge of the editor, wide enough
+for the file's last line number, and the caret's line number is brighter.
+Press ⌘L or Ctrl-L while the editor has focus to hide or show them. Rustrace
+remembers the choice for the next launch and starts with line numbers on.
+Ctrl-L does nothing while a panel, menu, picker, or confirmation is open, or
+while the console has focus. Clicking a line number puts the caret at the start
+of the visible text on that line. Line numbers are only a view setting: showing
+or hiding them is not recorded, and replay always shows them.
 
 Right-click a file row to open, rename, delete, or create a file. Right-click
 the ` files` header or empty space to open a menu with only `new file…` enabled.

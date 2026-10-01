@@ -72,6 +72,11 @@ and validated release identity in
 Keep this state directory outside your assignments. Update state is separate
 from `config.toml`; it does not enter provenance, the journal or submission.
 
+The same directory holds `editor-preferences.json`, which keeps only whether
+the editor shows line numbers (Ctrl-L). Like scrolling, showing or hiding line
+numbers is a view setting: it is not recorded and never enters provenance, the
+journal or submission.
+
 Choose Automatic checks: On/Off in the F7 menu to persist the preference for
 the next launch. It is saved immediately; update settings are not in
 `config.toml`.
