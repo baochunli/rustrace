@@ -13,7 +13,7 @@ use rustrace::editor::{
 use rustrace::tui::{
     DestructiveAction, EDITOR_KEY_HINTS, EditorCommand, EditorOutcome, EditorSession,
     EditorStorage, FileSystemStorage, SearchOutcome, SearchSummary, SessionInput,
-    session_input_for_event as session_input_for_event_with_modifier,
+    is_line_numbers_toggle, session_input_for_event as session_input_for_event_with_modifier,
 };
 use rustrace_model::{DocumentId, MAX_VECTOR_ITEMS};
 
@@ -1183,6 +1183,7 @@ fn crossterm_events_map_to_explicit_session_commands_without_duplicate_editing_l
         "Tab indent",
         "Shift-Tab",
         "Ctrl-S",
+        "Ctrl-L",
         "Ctrl-F",
         "F3",
         "Ctrl-C",
@@ -1314,6 +1315,74 @@ fn find_panel_shortcut_requires_the_exact_effective_primary_modifier() {
             );
         }
     }
+}
+
+#[test]
+fn line_number_toggle_requires_the_exact_effective_primary_modifier_and_inserts_nothing() {
+    for (primary_modifier, accepted) in [
+        (PrimaryModifier::Control, KeyModifiers::CONTROL),
+        (PrimaryModifier::Command, KeyModifiers::CONTROL),
+        (PrimaryModifier::Command, KeyModifiers::SUPER),
+    ] {
+        for code in [KeyCode::Char('l'), KeyCode::Char('L')] {
+            assert!(
+                is_line_numbers_toggle(&key(code, accepted), primary_modifier),
+                "{primary_modifier:?} {accepted:?} {code:?}"
+            );
+            // The toggle is view state: as a buffer input it maps to nothing.
+            assert_eq!(
+                session_input_for_event_with_modifier(
+                    key(code, accepted),
+                    12,
+                    false,
+                    primary_modifier,
+                ),
+                None
+            );
+        }
+        for extra in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+            let chord = key(KeyCode::Char('l'), accepted | extra);
+            assert!(!is_line_numbers_toggle(&chord, primary_modifier));
+            assert_eq!(
+                session_input_for_event_with_modifier(chord, 12, false, primary_modifier),
+                None
+            );
+        }
+        // A release is not a press; held-key repeats are debounced by the loop.
+        let mut release = KeyEvent::new(KeyCode::Char('l'), accepted);
+        release.kind = KeyEventKind::Release;
+        assert!(!is_line_numbers_toggle(
+            &Event::Key(release),
+            primary_modifier
+        ));
+    }
+    // Command is not the primary modifier in Control mode, and a plain l is text.
+    assert!(!is_line_numbers_toggle(
+        &key(KeyCode::Char('l'), KeyModifiers::SUPER),
+        PrimaryModifier::Control
+    ));
+    assert!(!is_line_numbers_toggle(
+        &key(KeyCode::Char('l'), KeyModifiers::NONE),
+        PrimaryModifier::Control
+    ));
+    assert_eq!(
+        session_input_for_event(key(KeyCode::Char('l'), KeyModifiers::NONE), 12, false),
+        Some(SessionInput::Command(EditorCommand::Insert('l')))
+    );
+    // A pending confirmation never takes Ctrl-L as an answer.
+    assert_eq!(
+        session_input_for_event(key(KeyCode::Char('l'), KeyModifiers::CONTROL), 12, true),
+        None
+    );
+
+    let (mut session, observed) = session("text");
+    if let Some(SessionInput::Command(command)) =
+        session_input_for_event(key(KeyCode::Char('l'), KeyModifiers::CONTROL), 12, false)
+    {
+        execute(&mut session, command);
+    }
+    assert_eq!(session.active_buffer().text(), "text");
+    assert!(observed.transactions().is_empty());
 }
 
 #[test]

@@ -19,7 +19,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     display,
-    editor::{EditorWidget, Viewport, highlight_path},
+    editor::{EditorWidget, Viewport, highlight_path, split_line_number_gutter},
     process_indicators::{
         INDICATOR_EXPLANATION, ProcessRuleOutcome, display_factual_indicators,
         display_process_attempt_details,
@@ -214,6 +214,9 @@ struct ReplayWheelRun {
     last_admitted: Instant,
 }
 
+/// Replay shows the recorded source with line numbers, independent of the
+/// viewer's own editor preference, so a review reads the same everywhere.
+const REPLAY_LINE_NUMBERS: bool = true;
 const REPLAY_INPUT_BATCH_REPORTS: usize = 128;
 const REPLAY_INPUT_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
 const REPLAY_WHEEL_ADMISSION_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -1023,8 +1026,11 @@ impl SourceView {
     }
 
     fn prepare_for_render(&mut self, source_area: Rect) {
-        let width = usize::from(source_area.width);
-        let height = usize::from(source_area.height);
+        // Replay always numbers lines; the caret follows within the text columns.
+        let (_, text) =
+            split_line_number_gutter(source_area, self.editor.line_count(), REPLAY_LINE_NUMBERS);
+        let width = usize::from(text.width);
+        let height = usize::from(text.height);
         self.viewport
             .set_top_line(self.viewport.top_line(), self.editor.line_count(), height);
         if self.following && self.recorded_selection {
@@ -1506,6 +1512,7 @@ impl ReplayView<'_> {
         EditorWidget::new(self.editor, self.viewport, self.highlights)
             .with_palette(palette)
             .with_cursor_visible(self.recorded_selection)
+            .with_line_numbers(REPLAY_LINE_NUMBERS)
             .render(area, buffer);
     }
 
@@ -4493,8 +4500,8 @@ format = ["cargo", "fmt"]
         let rendered = render_controller(&controller, 80, 24);
         let rows = rendered.lines().collect::<Vec<_>>();
         assert!(rows[0].contains(" source "), "{rendered}");
-        assert!(rows[1].contains("│a"), "{rendered}");
-        assert!(rows[8].contains("│7"), "{rendered}");
+        assert!(rows[1].contains("│ 1 a"), "{rendered}");
+        assert!(rows[8].contains("│ 8 7"), "{rendered}");
         assert!(rows[12].contains("A1 t="), "{rendered}");
         assert!(rows[13].contains(" validation"), "{rendered}");
         for path in ["a.rs", "b.rs", "c.rs"] {
@@ -4502,6 +4509,79 @@ format = ["cargo", "fmt"]
         }
         assert!(rendered.contains("> 1:1 paste blocked"), "{rendered}");
         assert!(rendered.contains("  1:2 paste blocked"), "{rendered}");
+    }
+
+    #[test]
+    fn replay_source_numbers_lines_and_follows_the_caret_beside_the_gutter() {
+        let layout = match crate::tui::shell::replay_shell_layout(Rect::new(0, 0, 80, 24)) {
+            crate::tui::shell::ReplayShellLayoutResult::Full(layout) => layout,
+            crate::tui::shell::ReplayShellLayoutResult::TooSmall(_) => unreachable!(),
+        };
+        // 100 lines need a three-digit gutter; line 100 ends far past the text width.
+        let mut lines = (1..=99)
+            .map(|line| format!("line {line:03}"))
+            .collect::<Vec<_>>();
+        lines.push(format!(
+            "{}END",
+            "x".repeat(usize::from(layout.source.width))
+        ));
+        let source_text = lines.join("\n");
+        let caret = source_text.len() as u64;
+        let mut controller = synthetic_controller(2, 1_000);
+        set_selected_text(
+            &mut controller,
+            "main.rs",
+            source_text,
+            Some(SelectionState::caret(caret)),
+        );
+        let mut source = build_source_view(&controller, None);
+        source.prepare_for_render(layout.source);
+
+        let gutter = crate::editor::line_number_gutter_width(100);
+        assert_eq!(gutter, 4);
+        let text_width = usize::from(layout.source.width - gutter);
+        let line_width = usize::from(layout.source.width) + 3;
+        assert_eq!(source.viewport.left_column(), line_width - text_width + 1);
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        ReplayView {
+            controller: &controller,
+            editor: &source.editor,
+            viewport: &source.viewport,
+            highlights: &source.highlights,
+            files: &source.files,
+            file_index: source.file_index,
+            following: source.following,
+            recorded_selection: source.recorded_selection,
+            diff_offset: source.diff_pane.offset,
+            details_offset: 0,
+            status: "",
+            show_flags: false,
+            flag_scroll: 0,
+        }
+        .render(area, &mut buffer);
+        let last_row = layout.source.bottom() - 1;
+        let row = (layout.source.x..layout.source.right())
+            .map(|x| buffer[(x, last_row)].symbol())
+            .collect::<String>();
+        assert!(row.starts_with("100 "), "{row:?}");
+        assert!(row.trim_end().ends_with("END"), "{row:?}");
+        let previous = (layout.source.x..layout.source.x + gutter)
+            .map(|x| buffer[(x, last_row - 1)].symbol())
+            .collect::<String>();
+        assert_eq!(previous, " 99 ");
+        let palette = Palette::selected();
+        assert_eq!(buffer[(layout.source.x, last_row)].fg, palette.text);
+        assert_eq!(
+            buffer[(layout.source.x + 1, last_row - 1)].fg,
+            palette.overlay0
+        );
+        // The caret sits just past END, inside the text columns.
+        let caret_x = (layout.source.x + gutter..layout.source.right())
+            .find(|x| buffer[(*x, last_row)].modifier.contains(Modifier::REVERSED))
+            .expect("replay caret is visible");
+        assert_eq!(buffer[(caret_x - 1, last_row)].symbol(), "D");
     }
 
     #[test]

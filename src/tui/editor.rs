@@ -22,7 +22,7 @@ const INDENT_WIDTH: usize = 4;
 
 pub const EDITOR_KEY_HINTS: &str = "Arrows Home End PageUp PageDown | Shift+movement select | Backspace/Delete | F5 previous F6 next\n\
 Edit: Tab indent | Shift-Tab outdent | Ctrl-/ comment | {select-all} | Ctrl-C Ctrl-X Ctrl-V | Ctrl-Z undo Ctrl-Y redo\n\
-Cmd: Ctrl-Space complete | Ctrl-F/F3 find | Ctrl-S save | Ctrl-Tab/Ctrl-BackTab switch | Ctrl-Q quit";
+Cmd: Ctrl-Space complete | Ctrl-F/F3 find | Ctrl-S save | Ctrl-L line numbers | Ctrl-Tab/Ctrl-BackTab switch | Ctrl-Q quit";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EditorCommand {
@@ -600,6 +600,13 @@ where
     pub fn follow_cursor(&mut self, width: usize, height: usize) {
         let active = self.active_mut();
         active.viewport.follow_cursor(&active.editor, width, height);
+    }
+
+    pub fn keep_cursor_column_visible(&mut self, width: usize, height: usize) {
+        let active = self.active_mut();
+        active
+            .viewport
+            .keep_cursor_column_visible(&active.editor, width, height);
     }
 
     pub fn scroll_active_viewport(&mut self, delta: isize, height: usize) -> bool {
@@ -1377,6 +1384,20 @@ fn modified_navigation_command(
         movement,
         selecting,
     })
+}
+
+/// Ctrl-L, or ⌘L when Command is effective, shows or hides line numbers.
+///
+/// It needs the exact effective primary modifier, like Ctrl-F. Rustrace does
+/// not request key event types, so a held key arrives as repeated presses;
+/// the editor loop treats a press soon after the previous one as repeat. It is
+/// view state, not an editor command: [`session_input_for_event`] maps it to
+/// nothing, so it never reaches the buffer.
+pub fn is_line_numbers_toggle(event: &Event, primary_modifier: PrimaryModifier) -> bool {
+    matches!(event, Event::Key(key)
+        if key.kind != KeyEventKind::Release
+            && matches!(key.code, KeyCode::Char('l' | 'L'))
+            && has_exact_primary_modifier(key.modifiers, primary_modifier))
 }
 
 pub fn has_primary_modifier(modifiers: KeyModifiers, primary_modifier: PrimaryModifier) -> bool {

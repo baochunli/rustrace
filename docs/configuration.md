@@ -16,6 +16,16 @@ Keep this directory outside assignments. See [Privacy](privacy.md#update-checks)
 for what is sent and [Updating Rustrace](installation.md#updating-rustrace)
 for terminal commands and restart instructions.
 
+## Line numbers
+
+Line numbers are not in `config.toml` either. They are on by default; ⌘L or
+Ctrl-L in the editor hides or shows them, and the choice is kept for the next
+launch in `$XDG_STATE_HOME/rustrace/editor-preferences.json`, or
+`~/.local/state/rustrace/editor-preferences.json` when `XDG_STATE_HOME` is
+unset. A missing or unreadable file means line numbers on. Rustrace never
+overwrites a file it cannot read; it shows a warning that the choice was not
+kept instead.
+
 ## Primary modifier
 
 ```toml

@@ -34,6 +34,28 @@ impl Viewport {
         }
     }
 
+    /// Scrolls horizontally just enough to keep the caret's column inside
+    /// `width` when the caret's line is on screen. It never moves `top_line`,
+    /// so a view change such as the line-number gutter cannot undo a scroll.
+    pub fn keep_cursor_column_visible<S>(
+        &mut self,
+        editor: &EditorBuffer<S>,
+        width: usize,
+        height: usize,
+    ) where
+        S: EditorEffects,
+    {
+        let cursor = editor.cursor();
+        if cursor.line < self.top_line || cursor.line >= self.top_line.saturating_add(height) {
+            return;
+        }
+        if cursor.display_column < self.left_column {
+            self.left_column = cursor.display_column;
+        } else if width > 0 && cursor.display_column >= self.left_column + width {
+            self.left_column = cursor.display_column - width + 1;
+        }
+    }
+
     pub fn scroll_vertical(&mut self, delta: isize, line_count: usize, height: usize) {
         let max_top = line_count.saturating_sub(height);
         self.top_line = self.top_line.saturating_add_signed(delta).min(max_top);

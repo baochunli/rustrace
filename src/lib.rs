@@ -13,6 +13,7 @@ mod environment;
 pub mod ghostty;
 mod language_service;
 pub mod milestone_a;
+pub mod preferences;
 pub mod process_indicators;
 pub mod replay_tui;
 pub mod review_flags;

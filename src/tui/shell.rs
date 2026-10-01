@@ -33,19 +33,32 @@ pub struct ShellLayout {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EditorSourceLayout {
+    /// Gutter and text together: everything left of the scrollbar.
+    pub view: Rect,
+    /// Line-number gutter; empty when line numbers are off or do not fit.
+    pub gutter: Rect,
+    /// Text columns. Screen-to-buffer mappings start here.
     pub area: Rect,
     pub show_scrollbar: bool,
 }
 
-pub fn editor_source_layout(editor: Rect, line_count: usize) -> EditorSourceLayout {
+pub fn editor_source_layout(
+    editor: Rect,
+    line_count: usize,
+    line_numbers: bool,
+) -> EditorSourceLayout {
     let show_scrollbar = line_count > usize::from(editor.height);
+    let view = Rect::new(
+        editor.x,
+        editor.y,
+        editor.width.saturating_sub(u16::from(show_scrollbar)),
+        editor.height,
+    );
+    let (gutter, area) = crate::editor::split_line_number_gutter(view, line_count, line_numbers);
     EditorSourceLayout {
-        area: Rect::new(
-            editor.x,
-            editor.y,
-            editor.width.saturating_sub(u16::from(show_scrollbar)),
-            editor.height,
-        ),
+        view,
+        gutter,
+        area,
         show_scrollbar,
     }
 }
@@ -238,9 +251,21 @@ pub enum SidebarTarget {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EditorHit {
+    /// Text columns; a screen column maps to `left_column + (x - rect.x)`.
     pub rect: Rect,
+    /// Line-number gutter left of `rect`; a click there acts on the first
+    /// visible text column of its line.
+    pub gutter: Rect,
     pub top_line: usize,
     pub left_column: usize,
+}
+
+impl EditorHit {
+    pub fn contains(&self, position: ratatui::layout::Position) -> bool {
+        [self.gutter, self.rect]
+            .into_iter()
+            .any(|rect| !rect.is_empty() && rect.contains(position))
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

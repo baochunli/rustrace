@@ -82,6 +82,13 @@ during a session.
 Help, `--version`, replay, status, submit, verify, scan, privacy, and ordinary
 `doctor` make no update request; `doctor` reports only cached release status.
 
+## Editor preferences
+
+The same state directory holds `editor-preferences.json`, which keeps only whether
+the editor shows line numbers (Ctrl-L). Like scrolling, showing or hiding line
+numbers is a view setting: it is not recorded and never enters provenance, the
+journal or submission.
+
 ## What is recorded
 
 Every event envelope carries a format version, session ID, one-based sequence,

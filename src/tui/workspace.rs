@@ -752,9 +752,20 @@ where
         self.editor.follow_cursor(width, height);
     }
 
-    pub fn follow_cursor_in_editor_area(&mut self, editor: Rect) {
-        let source = editor_source_layout(editor, self.active_buffer().line_count()).area;
+    pub fn follow_cursor_in_editor_area(&mut self, editor: Rect, line_numbers: bool) {
+        let source =
+            editor_source_layout(editor, self.active_buffer().line_count(), line_numbers).area;
         self.follow_cursor(usize::from(source.width), usize::from(source.height));
+    }
+
+    /// After the gutter appears or disappears, keeps a visible caret inside
+    /// the new text width. Only `left_column` may change, and only now: the
+    /// vertical scroll position is never touched, even while a command runs.
+    pub fn keep_cursor_column_visible_in_editor_area(&mut self, editor: Rect, line_numbers: bool) {
+        let source =
+            editor_source_layout(editor, self.active_buffer().line_count(), line_numbers).area;
+        self.editor
+            .keep_cursor_column_visible(usize::from(source.width), usize::from(source.height));
     }
 
     pub fn scroll_active_viewport(&mut self, delta: isize, height: usize) -> bool {

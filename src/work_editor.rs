@@ -810,6 +810,27 @@ fn should_follow_cursor_for_frame(
     resize_follow_cursor || (follow_cursor && focus == WorkspaceFocus::Editor)
 }
 
+/// Without the kitty event-type flag a held key arrives as repeated presses.
+/// A Ctrl-L within this window of the previous one counts as key repeat, so
+/// holding the key toggles (and writes the preference) once.
+const LINE_NUMBERS_REPEAT_MILLIS: u64 = 500;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LineNumbersToggle {
+    last_press_ms: Option<u64>,
+}
+
+impl LineNumbersToggle {
+    /// Whether this Ctrl-L press toggles; every press restarts the window.
+    fn accept(&mut self, now_ms: u64) -> bool {
+        let repeat = self
+            .last_press_ms
+            .is_some_and(|last| now_ms.saturating_sub(last) < LINE_NUMBERS_REPEAT_MILLIS);
+        self.last_press_ms = Some(now_ms);
+        !repeat
+    }
+}
+
 #[derive(Clone, Copy)]
 struct EditorKeyConfig {
     primary_modifier: crate::config::PrimaryModifier,
@@ -937,6 +958,7 @@ fn run_editor_loop<O>(
     palette: &crate::tui::theme::Palette,
     operations: &mut O,
     initial_update: crate::update::UpdateState,
+    line_numbers: &mut bool,
 ) -> Result<(), Box<dyn Error>>
 where
     O: TerminalOperations,
@@ -968,6 +990,7 @@ where
     let mut focus = WorkspaceFocus::Editor;
     let mut follow_cursor = true;
     let mut resize_follow_cursor = false;
+    let mut line_numbers_toggle = LineNumbersToggle::default();
     let mut output_scroll = 0;
     let mut console_scroll = ConsoleScroll::default();
     let mut mouse_state = MouseState::default();
@@ -1197,7 +1220,9 @@ where
         let workspace = session.workspace_mut();
         if should_follow_cursor_for_frame(follow_cursor, resize_follow_cursor, view, focus) {
             match layout {
-                MainLayout::Full(panes) => workspace.follow_cursor_in_editor_area(panes.editor),
+                MainLayout::Full(panes) => {
+                    workspace.follow_cursor_in_editor_area(panes.editor, *line_numbers)
+                }
                 MainLayout::TooSmall(_) => workspace.follow_cursor(0, 0),
             }
         }
@@ -1280,6 +1305,7 @@ where
         )
         .with_primary_modifier(primary_modifier)
         .with_ghostty_key_bindings(hint_ghostty_key_bindings)
+        .with_line_numbers(*line_numbers)
         .with_output_rows(output)
         .with_output_scroll(output_scroll)
         .with_file_tree(files)
@@ -2304,7 +2330,7 @@ where
             }
             continue;
         }
-        let modal_keyboard_active = find_panel.is_some()
+        let panel_keyboard_active = find_panel.is_some()
             || path_prompt.is_some()
             || command_picker.is_some()
             || editor_context_menu.is_some()
@@ -2312,8 +2338,8 @@ where
             || update_menu.open
             || keybinds_scroll.is_some()
             || test_cases.is_open()
-            || selected_completion.is_some()
             || session.workspace().confirmation_pending();
+        let modal_keyboard_active = panel_keyboard_active || selected_completion.is_some();
         // Ctrl-C stops any running command wherever focus is; the console keeps
         // its pane open, and a test-case queue stops with its active run.
         if command_active
@@ -2354,6 +2380,27 @@ where
                     &mut focus,
                     &mut status,
                 );
+            }
+            continue;
+        }
+        // Ctrl-L is view state: it works whenever the editor has focus and no
+        // panel, menu, picker or confirmation owns the keyboard, including
+        // while a command runs or completion is open. The console keeps it
+        // free, and it is never journaled.
+        if focus == WorkspaceFocus::Editor
+            && !panel_keyboard_active
+            && is_line_numbers_toggle(&event, primary_modifier)
+        {
+            if line_numbers_toggle.accept(event_read_ms) {
+                *line_numbers = !*line_numbers;
+                if let MainLayout::Full(panes) = layout {
+                    session
+                        .workspace_mut()
+                        .keep_cursor_column_visible_in_editor_area(panes.editor, *line_numbers);
+                }
+                if crate::preferences::set_line_numbers(*line_numbers).is_err() {
+                    status = line_numbers_unsaved_warning(*line_numbers).into();
+                }
             }
             continue;
         }
@@ -3303,6 +3350,7 @@ pub(crate) fn run_editor(
         },
     );
     let ghostty_key_bindings = crate::ghostty::startup_key_bindings();
+    let mut line_numbers = crate::preferences::current().line_numbers;
     install_termination_handlers();
     run_editor_with(
         session,
@@ -3320,6 +3368,7 @@ pub(crate) fn run_editor(
                 palette,
                 operations,
                 update_state.clone(),
+                &mut line_numbers,
             )
         },
     )
@@ -3349,6 +3398,15 @@ where
         move |session, title, quit_pending, _key_config, _notice, _palette, _operations| {
             editor_loop(session, title, quit_pending)
         },
+    )
+}
+
+/// The view still changes when the choice cannot be stored, for example on a
+/// read-only home directory; only the next launch falls back to its default.
+fn line_numbers_unsaved_warning(shown: bool) -> String {
+    format!(
+        "Warning: line numbers {} for this session only; Rustrace could not keep the choice for the next launch",
+        if shown { "shown" } else { "hidden" }
     )
 }
 
@@ -3706,20 +3764,22 @@ fn diagnostic_output_text(rows: &[crate::tui::OutputRow]) -> String {
 mod tests {
     use super::{
         ConsoleScroll, EXPLICIT_SAVE_SUCCESS, FindPanel, FindPanelAction, FindPanelField,
-        LiveSnapshot, PasteEventRoute, PathOperation, PathPrompt, PathPromptAction, StatusMessage,
-        TestCasePicker, TestCasePickerKeyAction, ToastTimer, WorkView, activate_command_menu_entry,
+        LINE_NUMBERS_REPEAT_MILLIS, LineNumbersToggle, LiveSnapshot, PasteEventRoute,
+        PathOperation, PathPrompt, PathPromptAction, StatusMessage, TestCasePicker,
+        TestCasePickerKeyAction, ToastTimer, WorkView, activate_command_menu_entry,
         activate_editor_context_menu_entry, activate_files_context_menu_entry,
         apply_path_prompt_action, apply_workspace_outcome, begin_path_prompt,
         command_completion_status, command_status_for_output, command_tick_status,
         completion_input_now_ms, console_body, diagnostic_navigation_status, diagnostic_output,
         diagnostic_output_scroll, diagnostic_output_text, dismiss_toast_on_key,
         execute_editor_command, handle_console_key, is_cancel_key, journal_warning_message,
-        keybinds_scroll_delta, maximum_keybinds_scroll, non_test_command_owned_tick,
-        open_files_context_menu, paste_event_route, paste_rejection_for_event,
-        persistent_error_message, reduce_keybinds_scroll, retire_paste_warning,
-        route_find_panel_event, should_follow_cursor_for_frame, start_test_case_sequence,
-        submitted_path, test_case_output, test_case_picker_key_action, test_case_result_summary,
-        test_case_view_switch_available, toast_for_frame, toast_for_status,
+        keybinds_scroll_delta, line_numbers_unsaved_warning, maximum_keybinds_scroll,
+        non_test_command_owned_tick, open_files_context_menu, paste_event_route,
+        paste_rejection_for_event, persistent_error_message, reduce_keybinds_scroll,
+        retire_paste_warning, route_find_panel_event, should_follow_cursor_for_frame,
+        start_test_case_sequence, submitted_path, test_case_output, test_case_picker_key_action,
+        test_case_result_summary, test_case_view_switch_available, toast_for_frame,
+        toast_for_status,
     };
     use crate::config::PrimaryModifier;
     use crate::console::{ConsoleLine, TestCaseDirectory};
@@ -5522,6 +5582,38 @@ format = ["cargo", "fmt"]
         assert_eq!(focus, WorkspaceFocus::Console);
         assert_eq!(status.as_str(), "existing status");
         assert_eq!(fixture.recorded_events(), before);
+    }
+
+    #[test]
+    fn a_held_ctrl_l_toggles_once_and_separate_presses_each_toggle() {
+        let mut toggle = LineNumbersToggle::default();
+        assert!(toggle.accept(1_000));
+        // Auto-repeat presses keep restarting the window.
+        let mut last = 1_000;
+        for now in (1_030..3_000).step_by(30) {
+            assert!(!toggle.accept(now), "{now}");
+            last = now;
+        }
+        let released = last + LINE_NUMBERS_REPEAT_MILLIS;
+        assert!(toggle.accept(released));
+        assert!(!toggle.accept(released + 1));
+        assert!(toggle.accept(released + 1 + LINE_NUMBERS_REPEAT_MILLIS));
+    }
+
+    #[test]
+    fn an_unsaved_line_number_choice_is_a_warning_toast() {
+        for (shown, word) in [(true, "shown"), (false, "hidden")] {
+            let warning = line_numbers_unsaved_warning(shown);
+            assert!(warning.contains(word), "{warning}");
+            assert_eq!(
+                toast_for_status(&warning),
+                Some(ToastState::new(
+                    ToastKind::Warning,
+                    "warning",
+                    warning.clone()
+                ))
+            );
+        }
     }
 
     #[test]

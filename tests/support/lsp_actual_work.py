@@ -401,7 +401,8 @@ try:
         diagnostic_screen = screen_text()
         diagnostic_row = next(line for line in diagnostic_screen.splitlines()
                               if 'println!("actual LSP")' in line)
-        assert "│fn main()" in diagnostic_row, \
+        # Line numbers are on by default; the source follows line 2's gutter.
+        assert "│ 2 fn main()" in diagnostic_row, \
             "real native diagnostic shifted the source column"
         (evidence / "native-diagnostic-screen.txt").write_text(diagnostic_screen)
         send(b"\x7f")

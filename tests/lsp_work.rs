@@ -260,7 +260,8 @@ fn production_live_diagnostics_render_and_clear_without_recorded_provenance() {
             .any(|frame| frame["method"] == "textDocument/didChange")
     );
     let shown = fs::read_to_string(root.join("tools/diagnostic-screen.txt")).unwrap();
-    assert!(shown.contains("│X// naïve"));
+    // Line numbers are on by default; the source follows line 1's gutter.
+    assert!(shown.contains("│ 1 X// naïve"));
     assert!(shown.contains("live problem"));
     let cleared = fs::read_to_string(root.join("tools/diagnostic-cleared-screen.txt")).unwrap();
     assert!(!cleared.contains("live problem"));

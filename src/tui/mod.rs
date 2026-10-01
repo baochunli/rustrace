@@ -41,7 +41,8 @@ pub(crate) use editor::session_input_for_event_with_keyboard_enhancement;
 pub use editor::{
     DestructiveAction, EDITOR_KEY_HINTS, EditorCommand, EditorOutcome, EditorSession,
     EditorStorage, FileSystemStorage, SearchOutcome, SearchSummary, SessionInput,
-    has_exact_primary_modifier, has_primary_modifier, session_input_for_event,
+    has_exact_primary_modifier, has_primary_modifier, is_line_numbers_toggle,
+    session_input_for_event,
 };
 pub use mouse::{
     DrawGate, MouseEventBatch, MouseState, PaneResizeOutcome, PaneResizeState, ShellInput,
@@ -349,7 +350,7 @@ pub const OBVIOUS_EDITOR_KEYBIND_ROWS: [&str; 7] = [
     "Tab / Shift-Tab        indent / outdent",
 ];
 
-pub const KEYBIND_ROWS: [&str; 66] = [
+pub const KEYBIND_ROWS: [&str; 67] = [
     "EDITOR",
     "{line-navigation}",
     "{document-navigation}",
@@ -364,6 +365,7 @@ pub const KEYBIND_ROWS: [&str; 66] = [
     "Typing pause / Ctrl-Space  open completion",
     "Ctrl-F / F3            find panel / next match",
     "Ctrl-S                 save all, then Check",
+    "Ctrl-L                 show / hide line numbers",
     "Alt-Up / Alt-Down      Cargo or live diagnostic previous / next",
     "FILES",
     "Right-click file        file menu",
@@ -910,6 +912,7 @@ pub struct MainViewState {
     completion: Option<completion::CompletionPopupState>,
     primary_modifier: PrimaryModifier,
     ghostty_key_bindings: GhosttyKeyBindings,
+    line_numbers: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -989,7 +992,14 @@ impl MainViewState {
             completion: None,
             primary_modifier: PrimaryModifier::Control,
             ghostty_key_bindings: GhosttyKeyBindings::passed(),
+            line_numbers: true,
         }
+    }
+
+    /// Line numbers are on unless the student turned them off (Ctrl-L).
+    pub fn with_line_numbers(mut self, line_numbers: bool) -> Self {
+        self.line_numbers = line_numbers;
+        self
     }
 
     pub fn with_file_tree(mut self, entries: Vec<FileTreeViewEntry>) -> Self {
@@ -1310,8 +1320,12 @@ where
                     self.render_output(layout.bottom, buffer, &mut hits);
                 }
                 if let Some(completion) = &self.state.completion {
-                    let source =
-                        shell::editor_source_layout(layout.editor, self.editor.line_count()).area;
+                    let source = shell::editor_source_layout(
+                        layout.editor,
+                        self.editor.line_count(),
+                        self.state.line_numbers,
+                    )
+                    .area;
                     completion::render_completion_popup(
                         completion,
                         self.editor,
@@ -1770,13 +1784,19 @@ where
     }
 
     fn render_editor(&self, layout: ShellLayout, buffer: &mut Buffer, hits: &mut HitMap) {
-        let source_layout = shell::editor_source_layout(layout.editor, self.editor.line_count());
+        let source_layout = shell::editor_source_layout(
+            layout.editor,
+            self.editor.line_count(),
+            self.state.line_numbers,
+        );
         let source = source_layout.area;
+        let view = source_layout.view;
         let source_clickable =
             self.editor.len_bytes() <= rustrace_workspace::hash::MAX_WORKSPACE_FILE_BYTES as usize;
         if source_clickable {
             hits.editor = shell::EditorHit {
                 rect: source,
+                gutter: source_layout.gutter,
                 top_line: self.viewport.top_line(),
                 left_column: self.viewport.left_column(),
             };
@@ -1790,8 +1810,8 @@ where
                     }
                     let diagnostic_index = marker.diagnostic_index()?;
                     let row = marker.line.checked_sub(self.viewport.top_line())?;
-                    (row < usize::from(source.height)).then_some((
-                        Rect::new(source.x, source.y + row as u16, source.width, 1),
+                    (row < usize::from(view.height)).then_some((
+                        Rect::new(view.x, view.y + row as u16, view.width, 1),
                         diagnostic_index,
                     ))
                 }));
@@ -1801,7 +1821,8 @@ where
             .with_live_diagnostics(&self.state.live_diagnostics)
             .with_palette(&self.palette)
             .with_cursor_visible(self.state.editor_focused)
-            .render(source, buffer);
+            .with_line_numbers(self.state.line_numbers)
+            .render(view, buffer);
         if source_clickable && source_layout.show_scrollbar {
             self.render_scrollbar(layout.editor_scrollbar, buffer, hits);
         }
