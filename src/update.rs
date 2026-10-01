@@ -170,14 +170,20 @@ impl Default for UpdateState {
     }
 }
 
-pub fn state_file_path(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+/// Rustrace's per-user state directory: `$XDG_STATE_HOME/rustrace`, or
+/// `~/.local/state/rustrace` when `XDG_STATE_HOME` is unset or empty.
+pub fn state_directory(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
     xdg.filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
             home.filter(|path| !path.is_empty())
                 .map(|path| PathBuf::from(path).join(".local/state"))
         })
-        .map(|path| path.join("rustrace/update-state.json"))
+        .map(|path| path.join("rustrace"))
+}
+
+pub fn state_file_path(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    state_directory(xdg, home).map(|path| path.join("update-state.json"))
 }
 
 pub fn state_path() -> Option<PathBuf> {
@@ -188,7 +194,7 @@ pub fn state_path() -> Option<PathBuf> {
 }
 
 // Menu reads are capped, and nonblocking opens cannot wait on a FIFO.
-fn read_cached_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+pub(crate) fn read_cached_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -241,14 +247,16 @@ impl UpdateState {
     }
 }
 
-fn save_json(value: &impl Serialize, path: &Path) -> io::Result<()> {
+/// Atomically replaces a small per-user state file (owner-only, synced).
+pub(crate) fn save_json(value: &impl Serialize, path: &Path) -> io::Result<()> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("state path has no parent"))?;
+    let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or("state");
     fs::create_dir_all(parent)?;
     let temporary = parent.join(format!(
-        ".update-state-{}-{}.tmp",
+        ".{stem}-{}-{}.tmp",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
