@@ -127,8 +127,23 @@ class Session:
         os.write(self.master, data)
         self.drain(seconds)
 
-    def editor_rows(self, count=5):
-        return [line[EDITOR_X:].rstrip() for line in self.screen()[1:1 + count]]
+    def editor_rows(self, count=5, screen=None):
+        screen = screen or self.screen()
+        return [line[EDITOR_X:].rstrip() for line in screen[1:1 + count]]
+
+    def expect_rows(self, rows, what):
+        self.wait_for(lambda screen: self.editor_rows(len(rows), screen) == rows, what, 10)
+
+    def expect_caret(self, position):
+        self.wait_for(
+            lambda screen: position in screen[0], f"caret at {position}", 10
+        )
+
+    def expect_choice(self, choice):
+        deadline = time.monotonic() + 10
+        while stored_choice() is not choice and time.monotonic() < deadline:
+            self.drain(0.05)
+        assert stored_choice() is choice, (stored_choice(), choice)
 
     def quit(self):
         os.write(self.master, CTRL_Q)
@@ -155,13 +170,6 @@ def open_source(session):
     )
 
 
-def caret_position(session):
-    return next(
-        (line[line.rfind("Ln "):].strip() for line in session.screen()[:1] if "Ln " in line),
-        None,
-    )
-
-
 with tempfile.TemporaryDirectory(prefix="rustrace-line-numbers-") as root_text:
     root = pathlib.Path(root_text)
     package = package_at(root)
@@ -170,34 +178,34 @@ with tempfile.TemporaryDirectory(prefix="rustrace-line-numbers-") as root_text:
     try:
         open_source(first)
         assert stored_choice() is None, "a new install wrote a preference before any toggle"
-        assert first.editor_rows() == NUMBERED, first.editor_rows()
+        first.expect_rows(NUMBERED, "the default gutter")
 
         # A gutter click lands at the start of that line; a text click maps past the gutter.
         first.send(click(EDITOR_X + 1, 3))
-        assert caret_position(first) == "Ln 3, Col 1", first.screen()[0]
+        first.expect_caret("Ln 3, Col 1")
         first.send(click(EDITOR_X + 3 + 4, 2))
-        assert caret_position(first) == "Ln 2, Col 5", first.screen()[0]
+        first.expect_caret("Ln 2, Col 5")
 
         first.send(CTRL_L)
-        assert first.editor_rows() == PLAIN, first.editor_rows()
-        assert stored_choice() is False
+        first.expect_rows(PLAIN, "plain rows")
+        first.expect_choice(False)
         first.send(click(EDITOR_X + 4, 3))
-        assert caret_position(first) == "Ln 3, Col 5", first.screen()[0]
+        first.expect_caret("Ln 3, Col 5")
 
         # The console keeps Ctrl-L: it neither toggles nor types into the line.
         first.send(F9)
         first.wait_for(lambda screen: any("> " in line for line in screen[10:]), "the console")
         first.send(CTRL_L)
-        assert stored_choice() is False
+        first.expect_choice(False)
         first.send(ESC)
-        assert first.editor_rows() == PLAIN, first.editor_rows()
+        first.expect_rows(PLAIN, "plain rows")
 
         first.send(CTRL_L)
-        assert first.editor_rows() == NUMBERED, first.editor_rows()
-        assert stored_choice() is True
+        first.expect_rows(NUMBERED, "numbered rows")
+        first.expect_choice(True)
         first.send(CTRL_L)
-        assert first.editor_rows() == PLAIN, first.editor_rows()
-        assert stored_choice() is False
+        first.expect_rows(PLAIN, "plain rows")
+        first.expect_choice(False)
         first.quit()
     finally:
         first.close()
@@ -209,10 +217,10 @@ with tempfile.TemporaryDirectory(prefix="rustrace-line-numbers-") as root_text:
     second = Session(root, package)
     try:
         open_source(second)
-        assert second.editor_rows() == PLAIN, "the hidden gutter did not survive a restart"
+        second.expect_rows(PLAIN, "plain rows")
         second.send(CTRL_L)
-        assert second.editor_rows() == NUMBERED, second.editor_rows()
-        assert stored_choice() is True
+        second.expect_rows(NUMBERED, "numbered rows")
+        second.expect_choice(True)
         second.quit()
     finally:
         second.close()
@@ -220,7 +228,7 @@ with tempfile.TemporaryDirectory(prefix="rustrace-line-numbers-") as root_text:
     third = Session(root, package)
     try:
         open_source(third)
-        assert third.editor_rows() == NUMBERED, "the shown gutter did not survive a restart"
+        third.expect_rows(NUMBERED, "numbered rows")
         third.quit()
     finally:
         third.close()
