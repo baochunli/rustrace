@@ -325,7 +325,8 @@ try:
         diagnostic_screen = screen_text()
         diagnostic_row = next(line for line in diagnostic_screen.splitlines()
                               if "X// naïve" in line)
-        assert "│X// naïve" in diagnostic_row, "live diagnostic shifted the source column"
+        # Line numbers are on by default; the source follows line 1's gutter.
+        assert "│ 1 X// naïve" in diagnostic_row, "live diagnostic shifted the source column"
         assert "live problem" in diagnostic_row, "live inline message was not rendered"
         assert "│output · live problem" in diagnostic_screen, \
             "caret diagnostic was not rendered in the output header"
