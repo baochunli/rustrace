@@ -937,6 +937,7 @@ fn run_editor_loop<O>(
     palette: &crate::tui::theme::Palette,
     operations: &mut O,
     initial_update: crate::update::UpdateState,
+    line_numbers: &mut bool,
 ) -> Result<(), Box<dyn Error>>
 where
     O: TerminalOperations,
@@ -968,6 +969,8 @@ where
     let mut focus = WorkspaceFocus::Editor;
     let mut follow_cursor = true;
     let mut resize_follow_cursor = false;
+    // A gutter toggle re-follows the caret once the editor may scroll again.
+    let mut gutter_follow_pending = false;
     let mut output_scroll = 0;
     let mut console_scroll = ConsoleScroll::default();
     let mut mouse_state = MouseState::default();
@@ -1195,11 +1198,21 @@ where
         let test_case_console_output = (test_case_active || test_cases.has_visible_results())
             .then(|| session.console_output());
         let workspace = session.workspace_mut();
-        if should_follow_cursor_for_frame(follow_cursor, resize_follow_cursor, view, focus) {
+        if should_follow_cursor_for_frame(
+            follow_cursor,
+            resize_follow_cursor || gutter_follow_pending,
+            view,
+            focus,
+        ) {
             match layout {
-                MainLayout::Full(panes) => workspace.follow_cursor_in_editor_area(panes.editor),
+                MainLayout::Full(panes) => {
+                    workspace.follow_cursor_in_editor_area(panes.editor, *line_numbers)
+                }
                 MainLayout::TooSmall(_) => workspace.follow_cursor(0, 0),
             }
+        }
+        if !command_active {
+            gutter_follow_pending = false;
         }
         let editor_height = match layout {
             MainLayout::Full(panes) => usize::from(panes.editor.height),
@@ -1280,6 +1293,7 @@ where
         )
         .with_primary_modifier(primary_modifier)
         .with_ghostty_key_bindings(hint_ghostty_key_bindings)
+        .with_line_numbers(*line_numbers)
         .with_output_rows(output)
         .with_output_scroll(output_scroll)
         .with_file_tree(files)
@@ -2304,7 +2318,7 @@ where
             }
             continue;
         }
-        let modal_keyboard_active = find_panel.is_some()
+        let panel_keyboard_active = find_panel.is_some()
             || path_prompt.is_some()
             || command_picker.is_some()
             || editor_context_menu.is_some()
@@ -2312,8 +2326,8 @@ where
             || update_menu.open
             || keybinds_scroll.is_some()
             || test_cases.is_open()
-            || selected_completion.is_some()
             || session.workspace().confirmation_pending();
+        let modal_keyboard_active = panel_keyboard_active || selected_completion.is_some();
         // Ctrl-C stops any running command wherever focus is; the console keeps
         // its pane open, and a test-case queue stops with its active run.
         if command_active
@@ -2354,6 +2368,21 @@ where
                     &mut focus,
                     &mut status,
                 );
+            }
+            continue;
+        }
+        // Ctrl-L is view state: it works whenever the editor has focus and no
+        // panel, menu, picker or confirmation owns the keyboard, including
+        // while a command runs or completion is open. The console keeps it
+        // free, and it is never journaled.
+        if focus == WorkspaceFocus::Editor
+            && !panel_keyboard_active
+            && is_line_numbers_toggle(&event, primary_modifier)
+        {
+            *line_numbers = !*line_numbers;
+            gutter_follow_pending = true;
+            if let Err(error) = crate::preferences::set_line_numbers(*line_numbers) {
+                status = line_numbers_unsaved_warning(*line_numbers, &error).into();
             }
             continue;
         }
@@ -3303,6 +3332,7 @@ pub(crate) fn run_editor(
         },
     );
     let ghostty_key_bindings = crate::ghostty::startup_key_bindings();
+    let mut line_numbers = crate::preferences::current().line_numbers;
     install_termination_handlers();
     run_editor_with(
         session,
@@ -3320,6 +3350,7 @@ pub(crate) fn run_editor(
                 palette,
                 operations,
                 update_state.clone(),
+                &mut line_numbers,
             )
         },
     )
@@ -3349,6 +3380,13 @@ where
         move |session, title, quit_pending, _key_config, _notice, _palette, _operations| {
             editor_loop(session, title, quit_pending)
         },
+    )
+}
+
+fn line_numbers_unsaved_warning(shown: bool, error: &io::Error) -> String {
+    format!(
+        "Warning: line numbers {} for this session only; the choice was not kept for the next launch ({error})",
+        if shown { "shown" } else { "hidden" }
     )
 }
 

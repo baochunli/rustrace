@@ -503,7 +503,7 @@ pub fn mouse_input_for_event(
     }
 
     if let Some(delta) = wheel {
-        if contains(hits.editor.rect, position) || contains(hits.editor_scrollbar_track, position) {
+        if hits.editor.contains(position) || contains(hits.editor_scrollbar_track, position) {
             return Some(ShellInput::ScrollEditor(delta));
         }
         return bottom_wheel(delta, hits, position);
@@ -529,7 +529,8 @@ pub fn mouse_input_for_event(
             if contains(hits.sidebar_files, position) {
                 return Some(ShellInput::OpenFilesContextMenu(position, None));
             }
-            contains(hits.editor.rect, position)
+            hits.editor
+                .contains(position)
                 .then_some(ShellInput::OpenEditorContextMenu(position))
         }
         MouseEventKind::Down(MouseButton::Left) => {
@@ -551,7 +552,7 @@ pub fn mouse_input_for_event(
                     },
                 ));
             }
-            if contains(hits.editor.rect, position) {
+            if hits.editor.contains(position) {
                 if state.double_click {
                     return Some(ShellInput::Workspace(WorkspaceInput::Editor(
                         SessionInput::Command(EditorCommand::SelectWord),
@@ -654,9 +655,10 @@ fn editor_move(event: &MouseEvent, hits: &HitMap, drag: bool) -> Option<ShellInp
 
 fn editor_line_column(event: &MouseEvent, hits: &HitMap) -> Option<(usize, usize)> {
     let position = Position::new(event.column, event.row);
-    if !contains(hits.editor.rect, position) {
+    if !hits.editor.contains(position) {
         return None;
     }
+    // A gutter column saturates to the first visible text column.
     let screen_column = usize::from(event.column.saturating_sub(hits.editor.rect.x));
     let column = hits.editor.left_column + screen_column;
     let line = hits.editor.top_line + usize::from(event.row.saturating_sub(hits.editor.rect.y));

@@ -102,6 +102,11 @@ fn render_with_editor_palette(
     terminal
 }
 
+/// Columns of the default line-number gutter for a document of `line_count` lines.
+fn gutter(line_count: usize) -> u16 {
+    rustrace::editor::line_number_gutter_width(line_count)
+}
+
 fn rendered_lines(terminal: &Terminal<TestBackend>) -> Vec<String> {
     let width = terminal.backend().buffer().area.width as usize;
     terminal
@@ -832,7 +837,32 @@ fn main_view_renders_every_region_and_composes_the_editor_widget() {
     let MainLayout::Full(panes) = main_layout(Rect::new(0, 0, 100, 24)) else {
         unreachable!();
     };
-    let editor_cursor = terminal
+    // Line numbers are on by default: a right-aligned two-digit gutter and a
+    // blank column, with the caret's line in the text colour.
+    let buffer = terminal.backend().buffer();
+    let row = |y: u16| {
+        (panes.editor.x..panes.editor.x + 6)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>()
+    };
+    assert_eq!(row(panes.editor.y), " 1 fn ");
+    assert_eq!(row(panes.editor.y + 1), " 2   l");
+    assert_eq!(row(panes.editor.y + 3), " 4    ");
+    assert_eq!(row(panes.editor.y + 4), "      ");
+    assert_eq!(
+        buffer[(panes.editor.x + 1, panes.editor.y)].fg,
+        Palette::terminal().text
+    );
+    assert_eq!(
+        buffer[(panes.editor.x + 1, panes.editor.y + 1)].fg,
+        Palette::terminal().overlay0
+    );
+    let editor_cursor = &buffer[(panes.editor.x + 3, panes.editor.y)];
+    assert_eq!(editor_cursor.symbol(), "f");
+    assert!(editor_cursor.modifier.contains(Modifier::REVERSED));
+
+    let off = render(100, 24, &state.with_line_numbers(false));
+    let editor_cursor = off
         .backend()
         .buffer()
         .cell((panes.editor.x, panes.editor.y))
@@ -1018,20 +1048,22 @@ fn every_builtin_and_a_custom_palette_reach_editor_tabs_output_tints_and_overlay
         let MainLayout::Full(layout) = main_layout(area) else {
             unreachable!();
         };
+        let text_x = layout.editor.x + gutter(editor.line_count());
+        assert_eq!(buffer[(text_x, layout.editor.y)].fg, keyword, "{label}");
+        for x in [layout.editor.x, text_x] {
+            assert_eq!(buffer[(x, layout.editor.y)].bg, warning, "{label}");
+            assert_eq!(buffer[(x, layout.editor.y + 1)].bg, error, "{label}");
+        }
+        assert_eq!(buffer[(layout.editor.x + 1, layout.editor.y)].symbol(), "1");
         assert_eq!(
-            buffer[(layout.editor.x, layout.editor.y)].fg,
-            keyword,
-            "{label}"
+            buffer[(layout.editor.x + 1, layout.editor.y)].fg,
+            palette.text,
+            "{label}: caret line number"
         );
         assert_eq!(
-            buffer[(layout.editor.x, layout.editor.y)].bg,
-            warning,
-            "{label}"
-        );
-        assert_eq!(
-            buffer[(layout.editor.x, layout.editor.y + 1)].bg,
-            error,
-            "{label}"
+            buffer[(layout.editor.x + 1, layout.editor.y + 1)].fg,
+            palette.overlay0,
+            "{label}: other line number"
         );
         assert_eq!(
             buffer[(layout.bottom.x, layout.bottom.y)].fg,
@@ -1078,7 +1110,19 @@ fn diagnostic_lines_start_at_column_zero_and_tint_the_full_row_in_both_themes() 
             DiagnosticLineMarker::new(1, DiagnosticMarkerKind::Error, false),
         ]);
 
-    for (width, height) in [(80, 24), (120, 40)] {
+    for (width, height, line_numbers) in [
+        (80, 24, true),
+        (120, 40, true),
+        (80, 24, false),
+        (120, 40, false),
+    ] {
+        let state = state.clone().with_line_numbers(line_numbers);
+        // Source starts in the first column after the gutter, if any.
+        let text_offset = if line_numbers {
+            gutter(editor.line_count())
+        } else {
+            0
+        };
         for (palette, warning_bg, error_bg) in [
             (Palette::terminal(), Color::Yellow, Color::Red),
             (
@@ -1093,10 +1137,14 @@ fn diagnostic_lines_start_at_column_zero_and_tint_the_full_row_in_both_themes() 
                 unreachable!();
             };
             let buffer = terminal.backend().buffer();
-            assert_eq!(buffer[(panes.editor.x, panes.editor.y)].symbol(), "w");
-            assert_eq!(buffer[(panes.editor.x, panes.editor.y + 1)].symbol(), "e");
+            let text_x = panes.editor.x + text_offset;
+            assert_eq!(buffer[(text_x, panes.editor.y)].symbol(), "w");
+            assert_eq!(buffer[(text_x, panes.editor.y + 1)].symbol(), "e");
+            if line_numbers {
+                assert_eq!(buffer[(text_x - 2, panes.editor.y + 1)].symbol(), "2");
+            }
             assert_eq!(
-                buffer[(panes.editor.x, panes.editor.y)].fg,
+                buffer[(text_x, panes.editor.y)].fg,
                 palette.text,
                 "warning tint changed the source foreground"
             );
@@ -1156,11 +1204,12 @@ fn diagnostic_error_wins_over_warning_and_overlays_compose_in_order() {
         unreachable!();
     };
     let buffer = terminal.backend().buffer();
-    let selected_token = &buffer[(panes.editor.x, panes.editor.y)];
+    let text_x = panes.editor.x + gutter(editor.line_count());
+    let selected_token = &buffer[(text_x, panes.editor.y)];
     assert_eq!(selected_token.fg, Palette::terminal().mauve);
     assert_eq!(selected_token.bg, Palette::terminal().active_row_bg);
 
-    let matched_live = &buffer[(panes.editor.x + closing as u16, panes.editor.y)];
+    let matched_live = &buffer[(text_x + closing as u16, panes.editor.y)];
     assert_eq!(matched_live.bg, Color::Red);
     assert_eq!(matched_live.fg, Palette::terminal().accent);
     assert!(matched_live.modifier.contains(Modifier::BOLD));
@@ -1201,7 +1250,7 @@ fn live_diagnostic_ascii_golden_has_underline_inline_and_header() {
         unreachable!();
     };
     let row = panes.editor.y + 1;
-    let source_x = panes.editor.x;
+    let source_x = panes.editor.x + gutter(editor.line_count());
 
     let lines = rendered_lines(&terminal);
     assert!(
@@ -1209,7 +1258,7 @@ fn live_diagnostic_ascii_golden_has_underline_inline_and_header() {
             .iter()
             .any(|line| line.contains("output · unknown name"))
     );
-    assert!(lines[usize::from(row)].contains("  let crab = 1;  unknown name"));
+    assert!(lines[usize::from(row)].contains(" 2   let crab = 1;  unknown name"));
     for x in source_x + 6..source_x + 10 {
         let cell = terminal.backend().buffer().cell((x, row)).unwrap();
         assert!(
@@ -1451,11 +1500,11 @@ fn live_diagnostic_wide_golden_preserves_source_cells_and_uses_display_columns()
         unreachable!();
     };
     let row = panes.editor.y;
-    let source_x = panes.editor.x;
+    let source_x = panes.editor.x + gutter(editor.line_count());
 
     let lines = rendered_lines(&terminal);
     assert!(
-        lines[usize::from(row)].contains("let 名 称  = 東 京 ;  wide warning"),
+        lines[usize::from(row)].contains(" 1 let 名 称  = 東 京 ;  wide warning"),
         "{:?}",
         lines[usize::from(row)]
     );
@@ -1525,7 +1574,8 @@ fn diagnostic_navigation_keeps_far_right_selection_and_caret_visible_at_80_by_24
         unreachable!();
     };
     let editor_inner_width = panes.editor.width as usize;
-    let source_width = editor_inner_width;
+    // The one-line document's gutter takes three columns from the text.
+    let source_width = editor_inner_width - usize::from(gutter(1));
     let text = "x".repeat(editor_inner_width.saturating_sub(1));
     let mut editor = EditorBuffer::new(
         DocumentId::new("tint-far-right").unwrap(),
@@ -1555,9 +1605,13 @@ fn diagnostic_navigation_keeps_far_right_selection_and_caret_visible_at_80_by_24
         })
         .unwrap();
 
-    let source_start = panes.editor.x;
+    let source_start = panes.editor.x + gutter(1);
     let source_end = panes.editor.right();
     let row = panes.editor.y;
+    assert!(
+        viewport.left_column() > 0,
+        "the caret needed a horizontal scroll"
+    );
     let visible = (source_start..source_end)
         .filter_map(|x| terminal.backend().buffer().cell((x, row)))
         .collect::<Vec<_>>();
@@ -1565,7 +1619,7 @@ fn diagnostic_navigation_keeps_far_right_selection_and_caret_visible_at_80_by_24
         visible
             .iter()
             .any(|cell| cell.modifier.contains(Modifier::REVERSED)),
-        "navigated caret is outside the full-width source area"
+        "navigated caret is outside the text columns beside the gutter"
     );
     assert!(
         visible.iter().any(|cell| cell.bg == Color::DarkGray),
@@ -3625,7 +3679,36 @@ fn editor_scrollbar_hit_map_matches_track_and_thumb_geometry_above_the_threshold
         .render_with_hit_map(area, &mut exact_buffer);
     assert!(exact_hits.editor_scrollbar_track.is_empty());
     assert!(exact_hits.editor_scrollbar_thumb.is_empty());
-    assert_eq!(exact_hits.editor.rect, layout.editor);
+    let exact_gutter = gutter(exact_editor.line_count());
+    assert_eq!(
+        exact_hits.editor.gutter,
+        Rect::new(
+            layout.editor.x,
+            layout.editor.y,
+            exact_gutter,
+            layout.editor.height
+        )
+    );
+    assert_eq!(
+        exact_hits.editor.rect,
+        Rect::new(
+            layout.editor.x + exact_gutter,
+            layout.editor.y,
+            layout.editor.width - exact_gutter,
+            layout.editor.height
+        )
+    );
+    let mut off_buffer = Buffer::empty(area);
+    let off_hits = MainView::new(
+        &state.clone().with_line_numbers(false),
+        &exact_editor,
+        &Viewport::default(),
+        &[],
+    )
+    .with_palette(Palette::terminal())
+    .render_with_hit_map(area, &mut off_buffer);
+    assert_eq!(off_hits.editor.rect, layout.editor);
+    assert!(off_hits.editor.gutter.is_empty());
 
     let overflow_text = (0..usize::from(layout.editor.height) * 3)
         .map(|line| line.to_string())
@@ -3648,7 +3731,12 @@ fn editor_scrollbar_hit_map_matches_track_and_thumb_geometry_above_the_threshold
         .render_with_hit_map(area, &mut overflow_buffer);
 
     assert_eq!(hits.editor_scrollbar_track, layout.editor_scrollbar);
-    assert_eq!(hits.editor.rect.width, layout.editor.width - 1);
+    assert_eq!(
+        hits.editor.rect.width,
+        layout.editor.width - 1 - gutter(overflow_editor.line_count())
+    );
+    assert_eq!(hits.editor.gutter.x, layout.editor.x);
+    assert_eq!(hits.editor.gutter.right(), hits.editor.rect.x);
     assert_eq!(hits.editor.rect.right(), hits.editor_scrollbar_track.x);
     assert_eq!(hits.editor_scrollbar_thumb.width, 1);
     assert!(hits.editor_scrollbar_thumb.height > 0);
@@ -4079,7 +4167,8 @@ fn rendered_sidebar_reflow_registers_split_editor_scrollbar_output_and_console()
                 Some(sidebar_width),
             );
             assert_eq!(output_hits.sidebar_split, output_layout.sidebar_divider);
-            assert_eq!(output_hits.editor.rect.x, sidebar_width);
+            assert_eq!(output_hits.editor.gutter.x, sidebar_width);
+            assert_eq!(output_hits.editor.rect.x, sidebar_width + gutter(80));
             assert_eq!(
                 output_hits.editor_scrollbar_track,
                 output_layout.editor_scrollbar
@@ -4112,7 +4201,8 @@ fn rendered_sidebar_reflow_registers_split_editor_scrollbar_output_and_console()
                 Some(sidebar_width),
             );
             assert_eq!(console_hits.sidebar_split, console_layout.sidebar_divider);
-            assert_eq!(console_hits.editor.rect.x, sidebar_width);
+            assert_eq!(console_hits.editor.gutter.x, sidebar_width);
+            assert_eq!(console_hits.editor.rect.x, sidebar_width + gutter(80));
             assert_eq!(
                 console_hits.editor_scrollbar_track,
                 console_layout.editor_scrollbar
@@ -4480,7 +4570,7 @@ fn running_command_keeps_the_console_wheel_and_divider_live() {
 }
 
 #[test]
-fn editor_mouse_mapping_covers_ascii_tab_wide_combining_past_end_and_no_gutter() {
+fn editor_mouse_mapping_covers_ascii_tab_wide_combining_past_end_and_no_diagnostic_gutter() {
     let text = "a\t界e\u{301}";
     let normal = view_state(RecordingState::Active, JournalHealth::Healthy);
     let viewport = Viewport::default();
@@ -4512,6 +4602,7 @@ fn editor_mouse_mapping_covers_ascii_tab_wide_combining_past_end_and_no_gutter()
         );
     }
 
+    let normal_state = normal.clone();
     let tint_state = normal.with_diagnostic_markers(vec![DiagnosticLineMarker::new(
         0,
         DiagnosticMarkerKind::Error,
@@ -4521,9 +4612,15 @@ fn editor_mouse_mapping_covers_ascii_tab_wide_combining_past_end_and_no_gutter()
         let hits = render_hits_at(width, height, text, &tint_state, &viewport);
         let rustrace::tui::shell::EditorHit {
             rect: _,
+            gutter: _,
             top_line: _,
             left_column: _,
         } = hits.editor;
+        // A tint adds no marker column: only the line-number gutter precedes the text.
+        let untinted = render_hits_at(width, height, text, &normal_state, &viewport);
+        assert_eq!(hits.editor.gutter, untinted.editor.gutter);
+        assert_eq!(hits.editor.rect, untinted.editor.rect);
+        assert_eq!(hits.editor.gutter.width, gutter(1));
         let mut mouse_state = MouseState::default();
         assert_eq!(
             reduce_and_map(
@@ -6152,5 +6249,467 @@ fn keybinds_overlay_lists_update_menu_rows() {
             output.contains(label),
             "missing {label} in keybinds overlay"
         );
+    }
+}
+
+fn render_editor_view(
+    width: u16,
+    height: u16,
+    state: &MainViewState,
+    editor: &EditorBuffer<NoopEditorEffects>,
+    viewport: &Viewport,
+) -> (Buffer, rustrace::tui::shell::HitMap) {
+    let area = Rect::new(0, 0, width, height);
+    let mut buffer = Buffer::empty(area);
+    let hits = MainView::new(state, editor, viewport, &[])
+        .with_palette(Palette::terminal())
+        .render_with_hit_map(area, &mut buffer);
+    (buffer, hits)
+}
+
+fn editor_rows(buffer: &Buffer, editor: Rect, rows: u16) -> Vec<String> {
+    (editor.y..editor.y + rows)
+        .map(|y| {
+            (editor.x..editor.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect()
+}
+
+fn full_editor_layout(width: u16, height: u16) -> ShellLayout {
+    let MainLayout::Full(layout) = main_layout(Rect::new(0, 0, width, height)) else {
+        unreachable!();
+    };
+    layout
+}
+
+#[test]
+fn line_number_gutter_golden_on_and_off_at_80x24_and_120x40() {
+    let source = "fn main() {\n    println!(\"hi\");\n}\n";
+    let mut editor = EditorBuffer::new(
+        DocumentId::new("gutter-golden").unwrap(),
+        source,
+        NoopEditorEffects,
+    );
+    let caret = source.find("println").unwrap() as u64;
+    editor.set_selection(SelectionState::caret(caret)).unwrap();
+    let on = view_state(RecordingState::Active, JournalHealth::Healthy);
+    let off = on.clone().with_line_numbers(false);
+    let palette = Palette::terminal();
+
+    for (width, height) in [(80, 24), (120, 40)] {
+        let layout = full_editor_layout(width, height);
+        let (buffer, hits) = render_editor_view(width, height, &on, &editor, &Viewport::default());
+        assert_eq!(
+            editor_rows(&buffer, layout.editor, 6),
+            [
+                " 1 fn main() {",
+                " 2     println!(\"hi\");",
+                " 3 }",
+                " 4",
+                "",
+                "",
+            ],
+            "{width}x{height}"
+        );
+        assert_eq!(hits.editor.gutter.width, 3);
+        assert_eq!(hits.editor.rect.x, layout.editor.x + 3);
+        // The caret's line number is in the text colour; the rest are dim.
+        for (row, colour) in [
+            (0, palette.overlay0),
+            (1, palette.text),
+            (2, palette.overlay0),
+            (3, palette.overlay0),
+        ] {
+            let cell = &buffer[(layout.editor.x + 1, layout.editor.y + row)];
+            assert_eq!(cell.fg, colour, "{width}x{height} row {row}");
+            assert!(!cell.modifier.contains(Modifier::REVERSED));
+            assert_eq!(
+                buffer[(layout.editor.x + 2, layout.editor.y + row)].symbol(),
+                " "
+            );
+        }
+        let caret_cell = &buffer[(layout.editor.x + 7, layout.editor.y + 1)];
+        assert_eq!(caret_cell.symbol(), "p");
+        assert!(caret_cell.modifier.contains(Modifier::REVERSED));
+
+        let (buffer, hits) = render_editor_view(width, height, &off, &editor, &Viewport::default());
+        assert_eq!(
+            editor_rows(&buffer, layout.editor, 5),
+            ["fn main() {", "    println!(\"hi\");", "}", "", ""],
+            "{width}x{height}"
+        );
+        assert!(hits.editor.gutter.is_empty());
+        assert_eq!(hits.editor.rect, layout.editor);
+        assert!(
+            buffer[(layout.editor.x + 4, layout.editor.y + 1)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+}
+
+#[test]
+fn line_number_gutter_marks_no_current_line_without_a_visible_caret() {
+    let source = "a\nb\n";
+    let editor = EditorBuffer::new(
+        DocumentId::new("gutter-unfocused").unwrap(),
+        source,
+        NoopEditorEffects,
+    );
+    let state = view_state(RecordingState::Active, JournalHealth::Healthy).with_console_body_view(
+        "Embedded Cargo console",
+        b"output\n".to_vec(),
+        b"> ".to_vec(),
+        Some(2),
+        true,
+    );
+    let layout = full_resized_shell_layout(
+        Rect::new(0, 0, 80, 24),
+        BottomPane::Console,
+        true,
+        None,
+        None,
+    );
+    let (buffer, _) = render_editor_view(80, 24, &state, &editor, &Viewport::default());
+    assert_eq!(
+        editor_rows(&buffer, layout.editor, 3),
+        [" 1 a", " 2 b", " 3"]
+    );
+    for row in 0..3 {
+        assert_eq!(
+            buffer[(layout.editor.x + 1, layout.editor.y + row)].fg,
+            Palette::terminal().overlay0,
+            "row {row}"
+        );
+    }
+}
+
+#[test]
+fn line_number_gutter_widens_from_99_to_100_lines() {
+    for (width, height) in [(80, 24), (120, 40)] {
+        let layout = full_editor_layout(width, height);
+        // 98 newlines make 99 lines; 99 newlines make 100.
+        for (newlines, expected_gutter) in [(98, 3), (99, 4)] {
+            let source = "x\n".repeat(newlines);
+            let mut editor = EditorBuffer::new(
+                DocumentId::new("gutter-growth").unwrap(),
+                &source,
+                NoopEditorEffects,
+            );
+            editor
+                .set_selection(SelectionState::caret(source.len() as u64))
+                .unwrap();
+            assert_eq!(editor.line_count(), newlines + 1);
+            let mut viewport = Viewport::default();
+            let (_, text) = rustrace::editor::split_line_number_gutter(
+                rustrace::tui::shell::editor_source_layout(
+                    layout.editor,
+                    editor.line_count(),
+                    true,
+                )
+                .view,
+                editor.line_count(),
+                true,
+            );
+            viewport.follow_cursor(&editor, usize::from(text.width), usize::from(text.height));
+            let state = view_state(RecordingState::Active, JournalHealth::Healthy);
+            let (buffer, hits) = render_editor_view(width, height, &state, &editor, &viewport);
+            assert_eq!(gutter(editor.line_count()), expected_gutter);
+            assert_eq!(hits.editor.gutter.width, expected_gutter);
+            assert_eq!(hits.editor.rect.x, layout.editor.x + expected_gutter);
+            // A scrollbar takes the last column of an overflowing document.
+            assert_eq!(hits.editor.rect.right(), layout.editor.right() - 1);
+            let last = layout.editor.y + layout.editor.height - 1;
+            let view = Rect::new(
+                layout.editor.x,
+                layout.editor.y,
+                layout.editor.width - 1,
+                layout.editor.height,
+            );
+            let rows = editor_rows(&buffer, view, layout.editor.height);
+            let last_number = newlines + 1;
+            assert_eq!(
+                rows[usize::from(last - layout.editor.y)],
+                format!(
+                    "{last_number:>width$}",
+                    width = usize::from(expected_gutter - 1)
+                ),
+                "{width}x{height}"
+            );
+            let previous = format!(
+                "{:>width$} x",
+                last_number - 1,
+                width = usize::from(expected_gutter - 1)
+            );
+            assert_eq!(
+                rows[usize::from(last - layout.editor.y - 1)],
+                previous,
+                "{width}x{height}"
+            );
+            assert_eq!(
+                buffer[(layout.editor.x + expected_gutter - 2, last)].fg,
+                Palette::terminal().text
+            );
+        }
+    }
+}
+
+#[test]
+fn line_number_gutter_stays_put_while_text_scrolls_horizontally() {
+    for (width, height) in [(80, 24), (120, 40)] {
+        let layout = full_editor_layout(width, height);
+        let long = format!("{}TAIL", "abcdefghij".repeat(20));
+        let source = format!("short\n{long}\n");
+        let mut editor = EditorBuffer::new(
+            DocumentId::new("gutter-horizontal").unwrap(),
+            &source,
+            NoopEditorEffects,
+        );
+        editor
+            .set_selection(SelectionState::caret((6 + long.len()) as u64))
+            .unwrap();
+        for line_numbers in [true, false] {
+            let state = view_state(RecordingState::Active, JournalHealth::Healthy)
+                .with_line_numbers(line_numbers);
+            let source_layout = rustrace::tui::shell::editor_source_layout(
+                layout.editor,
+                editor.line_count(),
+                line_numbers,
+            );
+            let text = source_layout.area;
+            let mut viewport = Viewport::default();
+            viewport.follow_cursor(&editor, usize::from(text.width), usize::from(text.height));
+            assert_eq!(
+                viewport.left_column(),
+                long.len() - usize::from(text.width) + 1,
+                "{width}x{height} line numbers {line_numbers}"
+            );
+            let (buffer, hits) = render_editor_view(width, height, &state, &editor, &viewport);
+            assert_eq!(hits.editor.left_column, viewport.left_column());
+            let rows = editor_rows(&buffer, layout.editor, 3);
+            if line_numbers {
+                // Numbers never scroll; line 1 is shorter than the scroll offset.
+                assert_eq!(rows[0], " 1");
+                assert!(rows[1].starts_with(" 2 "), "{:?}", rows[1]);
+                assert!(rows[1].ends_with("TAIL"), "{:?}", rows[1]);
+                assert_eq!(rows[2], " 3");
+            } else {
+                assert_eq!(rows[0], "");
+                assert!(rows[1].ends_with("TAIL"), "{:?}", rows[1]);
+            }
+            let caret_x = text.right() - 1;
+            assert!(
+                buffer[(caret_x, layout.editor.y + 1)]
+                    .modifier
+                    .contains(Modifier::REVERSED),
+                "{width}x{height} line numbers {line_numbers}"
+            );
+            assert_eq!(buffer[(caret_x - 1, layout.editor.y + 1)].symbol(), "L");
+        }
+    }
+}
+
+#[test]
+fn mouse_maps_through_the_gutter_with_line_numbers_on_and_off() {
+    let shell = ShellState::default();
+    let text = "first line\nsecond line here\nthird\n";
+    let mut viewport = Viewport::default();
+    viewport.scroll_horizontal(2);
+    for (width, height) in [(80, 24), (120, 40)] {
+        for line_numbers in [true, false] {
+            let state = view_state(RecordingState::Active, JournalHealth::Healthy)
+                .with_line_numbers(line_numbers);
+            let hits = render_hits_at(width, height, text, &state, &viewport);
+            let layout = full_editor_layout(width, height);
+            let gutter_width = if line_numbers { gutter(4) } else { 0 };
+            assert_eq!(hits.editor.gutter.width, gutter_width);
+            assert_eq!(hits.editor.rect.x, layout.editor.x + gutter_width);
+            let move_to = |line, column, selecting| {
+                Some(ShellInput::Workspace(WorkspaceInput::Editor(
+                    rustrace::tui::SessionInput::Command(rustrace::tui::EditorCommand::MoveTo {
+                        line,
+                        column,
+                        selecting,
+                    }),
+                )))
+            };
+
+            // A text click maps to buffer columns after the scroll offset, never
+            // to screen columns that include the gutter.
+            let mut mouse_state = MouseState::default();
+            assert_eq!(
+                reduce_and_map(
+                    &mut mouse_state,
+                    mouse(
+                        MouseEventKind::Down(MouseButton::Left),
+                        hits.editor.rect.x + 4,
+                        hits.editor.rect.y + 1,
+                    ),
+                    10,
+                    &hits,
+                    shell,
+                ),
+                move_to(1, 6, false),
+                "{width}x{height} line numbers {line_numbers}"
+            );
+            // Dragging into the gutter extends to the first visible column.
+            if line_numbers {
+                assert_eq!(
+                    reduce_and_map(
+                        &mut mouse_state,
+                        mouse(
+                            MouseEventKind::Drag(MouseButton::Left),
+                            hits.editor.gutter.x,
+                            hits.editor.rect.y + 2,
+                        ),
+                        20,
+                        &hits,
+                        shell,
+                    ),
+                    move_to(2, 2, true)
+                );
+                // A gutter click acts on that line's first visible column.
+                let mut fresh = MouseState::default();
+                assert_eq!(
+                    reduce_and_map(
+                        &mut fresh,
+                        mouse(
+                            MouseEventKind::Down(MouseButton::Left),
+                            hits.editor.gutter.x + 1,
+                            hits.editor.rect.y,
+                        ),
+                        1_000,
+                        &hits,
+                        shell,
+                    ),
+                    move_to(0, 2, false)
+                );
+                assert_eq!(
+                    reduce_and_map(
+                        &mut fresh,
+                        mouse(
+                            MouseEventKind::Down(MouseButton::Left),
+                            hits.editor.gutter.x + 1,
+                            hits.editor.rect.y,
+                        ),
+                        1_100,
+                        &hits,
+                        shell,
+                    ),
+                    Some(ShellInput::Workspace(WorkspaceInput::Editor(
+                        rustrace::tui::SessionInput::Command(
+                            rustrace::tui::EditorCommand::SelectWord
+                        )
+                    )))
+                );
+                let gutter_cell = Position::new(hits.editor.gutter.x, hits.editor.rect.y);
+                assert_eq!(
+                    reduce_and_map(
+                        &mut MouseState::default(),
+                        mouse(MouseEventKind::ScrollDown, gutter_cell.x, gutter_cell.y),
+                        2_000,
+                        &hits,
+                        shell,
+                    ),
+                    Some(ShellInput::ScrollEditor(3))
+                );
+                assert_eq!(
+                    reduce_and_map(
+                        &mut MouseState::default(),
+                        mouse(
+                            MouseEventKind::Down(MouseButton::Right),
+                            gutter_cell.x,
+                            gutter_cell.y
+                        ),
+                        3_000,
+                        &hits,
+                        shell,
+                    ),
+                    Some(ShellInput::OpenEditorContextMenu(gutter_cell))
+                );
+            } else {
+                // Without a gutter, the sidebar divider left of the text is not editor.
+                assert_eq!(
+                    reduce_and_map(
+                        &mut MouseState::default(),
+                        mouse(
+                            MouseEventKind::Down(MouseButton::Left),
+                            hits.editor.rect.x - 1,
+                            hits.editor.rect.y,
+                        ),
+                        1_000,
+                        &hits,
+                        shell,
+                    ),
+                    None
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_compiler_tint_click_in_the_gutter_selects_its_diagnostic() {
+    let state =
+        view_state(RecordingState::Active, JournalHealth::Healthy).with_diagnostic_markers(vec![
+            DiagnosticLineMarker::compiler(1, DiagnosticMarkerKind::Error, false, 4),
+        ]);
+    for (width, height) in [(80, 24), (120, 40)] {
+        let hits = render_hits_at(width, height, "a\nbb\n", &state, &Viewport::default());
+        let row = hits
+            .editor_diagnostic_rows
+            .iter()
+            .find(|(_, index)| *index == 4)
+            .unwrap()
+            .0;
+        assert_eq!(row.x, hits.editor.gutter.x);
+        assert_eq!(row.right(), hits.editor.rect.right());
+        assert_eq!(
+            reduce_and_map(
+                &mut MouseState::default(),
+                mouse(MouseEventKind::Down(MouseButton::Left), row.x, row.y),
+                10,
+                &hits,
+                ShellState::default(),
+            ),
+            Some(ShellInput::SelectEditorDiagnostic {
+                line: 1,
+                column: 0,
+                diagnostic_index: 4,
+            })
+        );
+    }
+}
+
+#[test]
+fn completion_popup_anchors_at_the_caret_beside_the_gutter() {
+    let source = "fn main() {\n    va\n}\n";
+    let mut editor = EditorBuffer::new(
+        DocumentId::new("gutter-completion").unwrap(),
+        source,
+        NoopEditorEffects,
+    );
+    let caret = (source.find("va").unwrap() + 2) as u64;
+    editor.set_selection(SelectionState::caret(caret)).unwrap();
+    for (width, height) in [(80, 24), (120, 40)] {
+        let layout = full_editor_layout(width, height);
+        for line_numbers in [true, false] {
+            let state = view_state(RecordingState::Active, JournalHealth::Healthy)
+                .with_line_numbers(line_numbers)
+                .with_completion_popup(completion_items(), 0);
+            let (_, hits) =
+                render_editor_view(width, height, &state, &editor, &Viewport::default());
+            let offset = if line_numbers { gutter(3) } else { 0 };
+            assert_eq!(
+                hits.completion_popup.x,
+                layout.editor.x + offset + 6,
+                "{width}x{height} line numbers {line_numbers}"
+            );
+            assert_eq!(hits.completion_popup.y, layout.editor.y + 2);
+        }
     }
 }

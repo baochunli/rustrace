@@ -12,6 +12,34 @@ use super::{EditorEffects, HighlightKind, HighlightSpan, Viewport};
 
 const MAX_HIGHLIGHT_SPANS: usize = 262_144;
 const MAX_OVERLAPPING_SPANS: usize = 128;
+const MIN_GUTTER_DIGITS: u16 = 2;
+const GUTTER_SEPARATION: u16 = 1;
+/// The gutter steps aside rather than leave fewer text columns than this.
+const MIN_TEXT_WIDTH_BESIDE_GUTTER: u16 = 8;
+
+/// Columns of a line-number gutter: the digits of the last line number (at
+/// least two), right-aligned, then one blank column before the text.
+pub fn line_number_gutter_width(line_count: usize) -> u16 {
+    let digits = line_count.max(1).ilog10() as u16 + 1;
+    digits.max(MIN_GUTTER_DIGITS) + GUTTER_SEPARATION
+}
+
+/// Splits an editor area into its line-number gutter and its text columns.
+///
+/// Every screen-to-buffer mapping (caret following, mouse hits, completion
+/// anchoring) must use the text rectangle returned here, so the gutter never
+/// shifts a recorded buffer position. A disabled or unaffordable gutter is
+/// empty and the text keeps the whole area.
+pub fn split_line_number_gutter(area: Rect, line_count: usize, enabled: bool) -> (Rect, Rect) {
+    let width = line_number_gutter_width(line_count);
+    if !enabled || area.width < width.saturating_add(MIN_TEXT_WIDTH_BESIDE_GUTTER) {
+        return (Rect::new(area.x, area.y, 0, area.height), area);
+    }
+    (
+        Rect::new(area.x, area.y, width, area.height),
+        Rect::new(area.x + width, area.y, area.width - width, area.height),
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiagnosticMarkerKind {
@@ -91,6 +119,7 @@ where
     live_diagnostics: &'a [LiveDiagnosticSpan],
     palette: Option<&'a Palette>,
     cursor_visible: bool,
+    line_numbers: bool,
 }
 
 impl<'a, S> EditorWidget<'a, S>
@@ -110,6 +139,7 @@ where
             live_diagnostics: &[],
             palette: None,
             cursor_visible: true,
+            line_numbers: false,
         }
     }
 
@@ -130,6 +160,12 @@ where
 
     pub fn with_cursor_visible(mut self, visible: bool) -> Self {
         self.cursor_visible = visible;
+        self
+    }
+
+    /// Draws a line-number gutter left of the text; see [`split_line_number_gutter`].
+    pub fn with_line_numbers(mut self, line_numbers: bool) -> Self {
+        self.line_numbers = line_numbers;
         self
     }
 }
@@ -157,9 +193,11 @@ where
             }
             return;
         }
-        let source_area = area;
+        let (gutter, source_area) =
+            split_line_number_gutter(area, self.editor.line_count(), self.line_numbers);
         let selection = self.editor.selection();
-        let cursor = self.editor.cursor().char_index;
+        let cursor_position = self.editor.cursor();
+        let cursor = cursor_position.char_index;
         let matching_bracket = self
             .editor
             .matching_bracket_byte()
@@ -186,15 +224,18 @@ where
                 diagnostic_line_background(self.diagnostic_markers, line_index, self.palette)
             {
                 buffer.set_style(
-                    Rect::new(
-                        source_area.x,
-                        source_area.y + screen_row as u16,
-                        source_area.width,
-                        1,
-                    ),
+                    Rect::new(area.x, area.y + screen_row as u16, area.width, 1),
                     Style::default().bg(background),
                 );
             }
+            render_line_number(
+                gutter,
+                buffer,
+                screen_row,
+                line_index,
+                self.cursor_visible && line_index == cursor_position.line,
+                self.palette,
+            );
 
             let line = self.editor.line_text(line_index);
             let line_char_start = self.editor.line_start_char(line_index);
@@ -310,6 +351,37 @@ where
             );
         }
     }
+}
+
+fn render_line_number(
+    gutter: Rect,
+    buffer: &mut Buffer,
+    screen_row: usize,
+    line_index: usize,
+    current: bool,
+    palette: Option<&Palette>,
+) {
+    let digits_width = gutter.width.saturating_sub(GUTTER_SEPARATION);
+    if digits_width == 0 {
+        return;
+    }
+    let number = format!(
+        "{:>width$}",
+        line_index.saturating_add(1),
+        width = usize::from(digits_width)
+    );
+    let color = if current {
+        palette.map_or(Color::White, |palette| palette.text)
+    } else {
+        palette.map_or(Color::DarkGray, |palette| palette.overlay0)
+    };
+    buffer.set_stringn(
+        gutter.x,
+        gutter.y + screen_row as u16,
+        number,
+        usize::from(digits_width),
+        Style::default().fg(color),
+    );
 }
 
 fn live_diagnostic_kind(

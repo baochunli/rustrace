@@ -1379,6 +1379,19 @@ fn modified_navigation_command(
     })
 }
 
+/// Ctrl-L, or ⌘L when Command is effective, shows or hides line numbers.
+///
+/// It needs the exact effective primary modifier, like Ctrl-F, and only a key
+/// press counts so a held key cannot flicker the gutter. It is view state, not
+/// an editor command: [`session_input_for_event`] maps it to nothing, so it
+/// never reaches the buffer.
+pub fn is_line_numbers_toggle(event: &Event, primary_modifier: PrimaryModifier) -> bool {
+    matches!(event, Event::Key(key)
+        if key.kind == KeyEventKind::Press
+            && matches!(key.code, KeyCode::Char('l' | 'L'))
+            && has_exact_primary_modifier(key.modifiers, primary_modifier))
+}
+
 pub fn has_primary_modifier(modifiers: KeyModifiers, primary_modifier: PrimaryModifier) -> bool {
     modifiers.contains(KeyModifiers::CONTROL)
         || (primary_modifier == PrimaryModifier::Command && modifiers.contains(KeyModifiers::SUPER))

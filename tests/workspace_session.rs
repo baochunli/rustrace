@@ -338,7 +338,8 @@ fn actual_diagnostic_navigation_renders_far_right_selection_at_80_by_24() {
     workspace
         .navigate_to_diagnostic_span(&path("main.rs"), &span)
         .unwrap();
-    workspace.follow_cursor(editor_inner_width, usize::from(panes.editor.height));
+    // The default view numbers lines, so the caret follows within the text columns.
+    workspace.follow_cursor_in_editor_area(panes.editor, true);
     let state = MainViewState::new(
         "diagnostic navigation",
         vec![BufferTabViewEntry::new("main.rs", true, false)],
@@ -391,35 +392,45 @@ fn production_cursor_follow_uses_the_full_width_for_a_short_document() {
     let MainLayout::Full(panes) = main_layout(area) else {
         unreachable!();
     };
-    let source = "x".repeat(usize::from(panes.editor.width).saturating_sub(1));
-    let temp = TempDir::new();
-    fs::write(temp.path().join("main.rs"), source).unwrap();
-    let mut workspace = WorkspaceSession::open(
-        temp.path(),
-        &manifest(&["*.rs"]),
-        Some(path("main.rs")),
-        RecordingEffects::default(),
-    )
-    .unwrap();
-
-    workspace
-        .execute_editor(EditorCommand::Move {
-            movement: Movement::LineEnd,
-            selecting: false,
-        })
+    // A one-line document numbers its line in a three-column gutter.
+    for (line_numbers, text_width) in [
+        (false, usize::from(panes.editor.width)),
+        (true, usize::from(panes.editor.width) - 3),
+    ] {
+        let source = "x".repeat(text_width.saturating_sub(1));
+        let temp = TempDir::new();
+        fs::write(temp.path().join("main.rs"), source).unwrap();
+        let mut workspace = WorkspaceSession::open(
+            temp.path(),
+            &manifest(&["*.rs"]),
+            Some(path("main.rs")),
+            RecordingEffects::default(),
+        )
         .unwrap();
-    workspace.follow_cursor_in_editor_area(panes.editor);
-    assert_eq!(
-        workspace.active_viewport().left_column(),
-        0,
-        "a short document scrolled before the caret crossed the true right edge"
-    );
 
-    workspace
-        .execute_editor(EditorCommand::Insert('x'))
-        .unwrap();
-    workspace.follow_cursor_in_editor_area(panes.editor);
-    assert_eq!(workspace.active_viewport().left_column(), 1);
+        workspace
+            .execute_editor(EditorCommand::Move {
+                movement: Movement::LineEnd,
+                selecting: false,
+            })
+            .unwrap();
+        workspace.follow_cursor_in_editor_area(panes.editor, line_numbers);
+        assert_eq!(
+            workspace.active_viewport().left_column(),
+            0,
+            "line numbers {line_numbers}: a short document scrolled before the caret crossed the true right edge"
+        );
+
+        workspace
+            .execute_editor(EditorCommand::Insert('x'))
+            .unwrap();
+        workspace.follow_cursor_in_editor_area(panes.editor, line_numbers);
+        assert_eq!(
+            workspace.active_viewport().left_column(),
+            1,
+            "line numbers {line_numbers}"
+        );
+    }
 }
 
 fn snapshot(workspace: &WorkspaceSession<RecordingEffects>) -> CheckpointSnapshot {
