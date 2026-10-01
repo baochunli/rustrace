@@ -50,6 +50,10 @@ clippy = ["cargo", "clippy"]
 format = ["cargo", "fmt"]
 '''
 source = b"warning\nerror\n"
+# Line numbers are on by default: the three-line file takes a three-column
+# gutter, so source text starts at screen column TEXT and tints span the gutter.
+EDITOR = 26
+TEXT = EDITOR + 3
 package = root / "assignment.rta"
 with tarfile.open(package, "w", format=tarfile.USTAR_FORMAT) as archive:
     for name, content in [
@@ -250,17 +254,17 @@ try:
     database = next((work / ".rustrace").glob("*.sqlite"))
     cells = terminal_screen()
     rows = text_rows(cells)
-    warning_row = next(index for index, row in enumerate(rows) if row[26:].startswith("warning"))
-    error_row = next(index for index, row in enumerate(rows) if row[26:].startswith("error"))
-    assert rows[warning_row][26:33] == "warning", rows[warning_row]
-    assert rows[error_row][26:31] == "error", rows[error_row]
+    warning_row = next(index for index, row in enumerate(rows) if row[TEXT:].startswith("warning"))
+    error_row = next(index for index, row in enumerate(rows) if row[TEXT:].startswith("error"))
+    assert rows[warning_row][EDITOR:TEXT + 7] == " 1 warning", rows[warning_row]
+    assert rows[error_row][EDITOR:TEXT + 5] == " 2 error", rows[error_row]
     assert all(cells[warning_row][x]["bg"] == ("indexed", 3)
-               for x in range(26, WIDTH))
+               for x in range(EDITOR, WIDTH))
     assert all(cells[error_row][x]["bg"] == ("indexed", 1)
-               for x in range(26, WIDTH))
+               for x in range(EDITOR, WIDTH))
 
     baseline = event_payloads(database)
-    os.write(master, f"\x1b[<0;30;{warning_row + 1}M".encode())
+    os.write(master, f"\x1b[<0;{TEXT + 4};{warning_row + 1}M".encode())
     wait_for(
         lambda: selected_diagnostic_visible("warning[W0001]", "Ln 1, Col 4"),
         "warning click did not reveal an accent-marked output row",
@@ -268,7 +272,7 @@ try:
     after_warning = event_payloads(database)
     assert [event["type"] for event in after_warning[len(baseline):]] == ["selection_changed"]
 
-    os.write(master, f"\x1b[<0;29;{error_row + 1}M".encode())
+    os.write(master, f"\x1b[<0;{TEXT + 3};{error_row + 1}M".encode())
     wait_for(
         lambda: selected_diagnostic_visible("error[E0308]", "Ln 2, Col 3"),
         "error click did not reveal an accent-marked output row",

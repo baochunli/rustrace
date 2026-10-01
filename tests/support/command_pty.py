@@ -289,7 +289,9 @@ try:
                     assert "diagnostics " not in screen.lower(), repr(screen)
                     assert "Alt-Up/Down navigate" not in screen, repr(screen)
                     assert "valid Unicode byte span" in screen, repr(screen)
-                    assert "│Bé🦀" in screen, repr(screen)
+                    # Line numbers are on by default: a one-line file has a
+                    # three-column gutter before its text.
+                    assert "│ 1 Bé🦀" in screen, repr(screen)
                     if mode == "diagnostic_mouse":
                         # First rendered diagnostic row at zero-based x=26,y=18.
                         os.write(master, b"\x1b[<0;27;19M")
