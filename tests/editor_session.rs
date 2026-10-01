@@ -1348,15 +1348,13 @@ fn line_number_toggle_requires_the_exact_effective_primary_modifier_and_inserts_
                 None
             );
         }
-        // A key repeat or release must not flicker the gutter.
-        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
-            let mut event = KeyEvent::new(KeyCode::Char('l'), accepted);
-            event.kind = kind;
-            assert!(!is_line_numbers_toggle(
-                &Event::Key(event),
-                primary_modifier
-            ));
-        }
+        // A release is not a press; held-key repeats are debounced by the loop.
+        let mut release = KeyEvent::new(KeyCode::Char('l'), accepted);
+        release.kind = KeyEventKind::Release;
+        assert!(!is_line_numbers_toggle(
+            &Event::Key(release),
+            primary_modifier
+        ));
     }
     // Command is not the primary modifier in Control mode, and a plain l is text.
     assert!(!is_line_numbers_toggle(

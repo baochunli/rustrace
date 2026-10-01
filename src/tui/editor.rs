@@ -602,6 +602,13 @@ where
         active.viewport.follow_cursor(&active.editor, width, height);
     }
 
+    pub fn keep_cursor_column_visible(&mut self, width: usize, height: usize) {
+        let active = self.active_mut();
+        active
+            .viewport
+            .keep_cursor_column_visible(&active.editor, width, height);
+    }
+
     pub fn scroll_active_viewport(&mut self, delta: isize, height: usize) -> bool {
         let active = self.active_mut();
         let before = active.viewport.top_line();
@@ -1381,13 +1388,14 @@ fn modified_navigation_command(
 
 /// Ctrl-L, or ⌘L when Command is effective, shows or hides line numbers.
 ///
-/// It needs the exact effective primary modifier, like Ctrl-F, and only a key
-/// press counts so a held key cannot flicker the gutter. It is view state, not
-/// an editor command: [`session_input_for_event`] maps it to nothing, so it
-/// never reaches the buffer.
+/// It needs the exact effective primary modifier, like Ctrl-F. Rustrace does
+/// not request key event types, so a held key arrives as repeated presses;
+/// the editor loop treats a press soon after the previous one as repeat. It is
+/// view state, not an editor command: [`session_input_for_event`] maps it to
+/// nothing, so it never reaches the buffer.
 pub fn is_line_numbers_toggle(event: &Event, primary_modifier: PrimaryModifier) -> bool {
     matches!(event, Event::Key(key)
-        if key.kind == KeyEventKind::Press
+        if key.kind != KeyEventKind::Release
             && matches!(key.code, KeyCode::Char('l' | 'L'))
             && has_exact_primary_modifier(key.modifiers, primary_modifier))
 }

@@ -433,6 +433,110 @@ fn production_cursor_follow_uses_the_full_width_for_a_short_document() {
     }
 }
 
+/// Effects whose command authority a test can switch on and off.
+#[derive(Clone, Default)]
+struct CommandSwitchEffects(Rc<std::cell::Cell<bool>>);
+
+impl EditorEffects for CommandSwitchEffects {
+    fn record_provenance(&mut self, _: &EditorTransaction) -> Result<(), EditorEffectError> {
+        Ok(())
+    }
+}
+
+impl WorkspaceEffects for CommandSwitchEffects {
+    fn command_active(&self) -> bool {
+        self.0.get()
+    }
+
+    fn record_workspace_event(&mut self, _: Event) -> Result<(), WorkspaceEffectError> {
+        Ok(())
+    }
+
+    fn record_lifecycle(&mut self, _: Event) -> Result<(), WorkspaceEffectError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_line_number_toggle_never_moves_the_vertical_scroll_position() {
+    let area = Rect::new(0, 0, 80, 24);
+    let MainLayout::Full(panes) = main_layout(area) else {
+        unreachable!();
+    };
+    let height = usize::from(panes.editor.height);
+    let source = (1..=60)
+        .map(|line| format!("line {line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let temp = TempDir::new();
+    fs::write(temp.path().join("main.rs"), source).unwrap();
+    let effects = CommandSwitchEffects::default();
+    let mut workspace = WorkspaceSession::open(
+        temp.path(),
+        &manifest(&["*.rs"]),
+        Some(path("main.rs")),
+        effects.clone(),
+    )
+    .unwrap();
+    workspace.follow_cursor_in_editor_area(panes.editor, true);
+    // The caret stays on line 1 while the wheel shows lines 16 onward.
+    assert!(workspace.scroll_active_viewport(15, height));
+    assert_eq!(workspace.active_viewport().top_line(), 15);
+
+    for command_active in [false, true, false] {
+        effects.0.set(command_active);
+        for line_numbers in [false, true, false, true] {
+            workspace.keep_cursor_column_visible_in_editor_area(panes.editor, line_numbers);
+            assert_eq!(
+                workspace.active_viewport().top_line(),
+                15,
+                "command active {command_active}, line numbers {line_numbers}"
+            );
+            assert_eq!(workspace.active_viewport().left_column(), 0);
+        }
+    }
+}
+
+#[test]
+fn a_line_number_toggle_keeps_a_visible_caret_inside_the_narrower_text() {
+    let area = Rect::new(0, 0, 80, 24);
+    let MainLayout::Full(panes) = main_layout(area) else {
+        unreachable!();
+    };
+    let width = usize::from(panes.editor.width);
+    // Ends exactly at the right edge without a gutter, so the gutter must scroll it.
+    let source = "x".repeat(width - 1);
+    let temp = TempDir::new();
+    fs::write(temp.path().join("main.rs"), &source).unwrap();
+    let mut workspace = WorkspaceSession::open(
+        temp.path(),
+        &manifest(&["*.rs"]),
+        Some(path("main.rs")),
+        CommandSwitchEffects::default(),
+    )
+    .unwrap();
+    workspace
+        .execute_editor(EditorCommand::Move {
+            movement: Movement::LineEnd,
+            selecting: false,
+        })
+        .unwrap();
+    workspace.follow_cursor_in_editor_area(panes.editor, false);
+    assert_eq!(workspace.active_viewport().left_column(), 0);
+
+    workspace.keep_cursor_column_visible_in_editor_area(panes.editor, true);
+    let text_width = width - 3;
+    assert_eq!(
+        workspace.active_viewport().left_column(),
+        source.len() - text_width + 1
+    );
+    assert_eq!(workspace.active_viewport().top_line(), 0);
+    // Hiding the gutter again keeps the view: the caret is still visible.
+    let shifted = workspace.active_viewport().left_column();
+    workspace.keep_cursor_column_visible_in_editor_area(panes.editor, false);
+    assert_eq!(workspace.active_viewport().left_column(), shifted);
+}
+
 fn snapshot(workspace: &WorkspaceSession<RecordingEffects>) -> CheckpointSnapshot {
     let files = workspace
         .disk_files()
