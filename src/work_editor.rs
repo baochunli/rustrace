@@ -2381,8 +2381,8 @@ where
         {
             *line_numbers = !*line_numbers;
             gutter_follow_pending = true;
-            if let Err(error) = crate::preferences::set_line_numbers(*line_numbers) {
-                status = line_numbers_unsaved_warning(*line_numbers, &error).into();
+            if crate::preferences::set_line_numbers(*line_numbers).is_err() {
+                status = line_numbers_unsaved_warning(*line_numbers).into();
             }
             continue;
         }
@@ -3383,9 +3383,11 @@ where
     )
 }
 
-fn line_numbers_unsaved_warning(shown: bool, error: &io::Error) -> String {
+/// The view still changes when the choice cannot be stored, for example on a
+/// read-only home directory; only the next launch falls back to its default.
+fn line_numbers_unsaved_warning(shown: bool) -> String {
     format!(
-        "Warning: line numbers {} for this session only; the choice was not kept for the next launch ({error})",
+        "Warning: line numbers {} for this session only; Rustrace could not keep the choice for the next launch",
         if shown { "shown" } else { "hidden" }
     )
 }
@@ -3752,12 +3754,13 @@ mod tests {
         completion_input_now_ms, console_body, diagnostic_navigation_status, diagnostic_output,
         diagnostic_output_scroll, diagnostic_output_text, dismiss_toast_on_key,
         execute_editor_command, handle_console_key, is_cancel_key, journal_warning_message,
-        keybinds_scroll_delta, maximum_keybinds_scroll, non_test_command_owned_tick,
-        open_files_context_menu, paste_event_route, paste_rejection_for_event,
-        persistent_error_message, reduce_keybinds_scroll, retire_paste_warning,
-        route_find_panel_event, should_follow_cursor_for_frame, start_test_case_sequence,
-        submitted_path, test_case_output, test_case_picker_key_action, test_case_result_summary,
-        test_case_view_switch_available, toast_for_frame, toast_for_status,
+        keybinds_scroll_delta, line_numbers_unsaved_warning, maximum_keybinds_scroll,
+        non_test_command_owned_tick, open_files_context_menu, paste_event_route,
+        paste_rejection_for_event, persistent_error_message, reduce_keybinds_scroll,
+        retire_paste_warning, route_find_panel_event, should_follow_cursor_for_frame,
+        start_test_case_sequence, submitted_path, test_case_output, test_case_picker_key_action,
+        test_case_result_summary, test_case_view_switch_available, toast_for_frame,
+        toast_for_status,
     };
     use crate::config::PrimaryModifier;
     use crate::console::{ConsoleLine, TestCaseDirectory};
@@ -5560,6 +5563,22 @@ format = ["cargo", "fmt"]
         assert_eq!(focus, WorkspaceFocus::Console);
         assert_eq!(status.as_str(), "existing status");
         assert_eq!(fixture.recorded_events(), before);
+    }
+
+    #[test]
+    fn an_unsaved_line_number_choice_is_a_warning_toast() {
+        for (shown, word) in [(true, "shown"), (false, "hidden")] {
+            let warning = line_numbers_unsaved_warning(shown);
+            assert!(warning.contains(word), "{warning}");
+            assert_eq!(
+                toast_for_status(&warning),
+                Some(ToastState::new(
+                    ToastKind::Warning,
+                    "warning",
+                    warning.clone()
+                ))
+            );
+        }
     }
 
     #[test]
