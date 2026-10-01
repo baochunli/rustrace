@@ -37,6 +37,9 @@ clippy = ["cargo", "clippy"]
 format = ["cargo", "fmt"]
 '''
 source = "\n".join(f"line {line:02}" for line in range(40)).encode()
+# Line numbers are on by default: 40 lines take a three-column gutter, so the
+# first source cell is SGR column 30 (zero-based screen column 29).
+TEXT = 30
 
 
 def read_available(fd, transcript):
@@ -276,7 +279,7 @@ with tempfile.TemporaryDirectory(prefix="rustrace-mouse-pty-") as root:
         )
 
         # Click in source, then drag a bounded selection across the same row.
-        os.write(master, b"\x1b[<0;30;2M\x1b[<0;30;2m")
+        os.write(master, f"\x1b[<0;{TEXT + 3};2M\x1b[<0;{TEXT + 3};2m".encode())
         wait_for(
             lambda: len(events()) > initial_count,
             master,
@@ -285,9 +288,10 @@ with tempfile.TemporaryDirectory(prefix="rustrace-mouse-pty-") as root:
         )
         os.write(
             master,
-            b"\x1b[<0;28;2M"
-            b"\x1b[<32;29;2M\x1b[<32;30;2M\x1b[<32;31;2M\x1b[<32;32;2M"
-            b"\x1b[<0;32;2m",
+            f"\x1b[<0;{TEXT + 1};2M"
+            f"\x1b[<32;{TEXT + 2};2M\x1b[<32;{TEXT + 3};2M"
+            f"\x1b[<32;{TEXT + 4};2M\x1b[<32;{TEXT + 5};2M"
+            f"\x1b[<0;{TEXT + 5};2m".encode(),
         )
         wait_for(
             lambda: len(events()) >= initial_count + 3,
