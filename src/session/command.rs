@@ -653,20 +653,36 @@ impl ProductionSession {
             .map_or_else(Vec::new, LiveOutput::snapshot)
     }
 
-    /// The session's packaged cases as its assignment format defines them:
+    /// Packaged fixtures followed by source-discovered Cargo integration tests.
+    /// The session's packaged cases follow its assignment format:
     /// complete `.in`/`.expected` pairs for formats 1 and 2, and every case
     /// with a `.expected` for format 3.
     pub fn list_test_cases(&self) -> Result<Vec<TestCase>> {
         let layout = self.test_case_layout();
-        TestCaseDirectory::open(
+        let mut cases = match TestCaseDirectory::open(
             self.workspace.root(),
             layout,
             self.metadata.test_case_suite_hash,
-        )?
-        .list_cases_for(layout)
+        )
+        .and_then(|directory| directory.list_cases_for(layout))
+        {
+            Ok(cases) => cases,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        };
+        cases.extend(crate::cargo_tests::discover(self.workspace.root())?);
+        Ok(cases)
     }
 
-    /// Runs one packaged case and compares its standard output.
+    /// Runs a packaged stdout fixture or one exact Cargo integration test.
+    /// Cargo tests use the normal controlled Test route and libtest results;
+    /// their evidence is recorded as command output, not a fixture comparison.
     ///
     /// Formats 1 and 2 run `cargo run < NAME.in` in the workspace. Format 3
     /// rereads the case by name, ignoring what an earlier listing said about
@@ -681,6 +697,32 @@ impl ProductionSession {
         self.require_command_idle()?;
         self.command.run_warning = None;
         let manifest = self.command_manifest()?;
+        if let Some((target, filter)) = case.cargo_test() {
+            // Reread source identity before starting, as for fixture cases.
+            if !crate::cargo_tests::discover(self.workspace.root())?.contains(&case) {
+                return Err("Cargo test changed; refresh the test panel".into());
+            }
+            let request = ConsoleCommand {
+                action: CargoAction::Test,
+                argv: vec![
+                    "cargo".into(),
+                    "test".into(),
+                    "--test".into(),
+                    target.into(),
+                    filter.into(),
+                    "--".into(),
+                    "--exact".into(),
+                ],
+                args: Vec::new(),
+                stdin: None,
+                stdout: None,
+            };
+            let launch = self.prepare_console_launch(request)?;
+            let argv = launch.request.argv.clone();
+            self.begin_command(manifest.toolchain, CargoAction::Test, argv, Some(launch))?;
+            self.command.test_case = Some(case);
+            return Ok(());
+        }
         let layout = self.test_case_layout();
         let cases = TestCaseDirectory::open(
             self.workspace.root(),
@@ -1746,7 +1788,12 @@ impl ProductionSession {
 
     fn launch_ready(&mut self, mut ready: Ready) -> Result<()> {
         // A test case that hangs fails quickly so Run all moves on.
-        let deadline = if self.command.test_case.is_some() {
+        let deadline = if self
+            .command
+            .test_case
+            .as_ref()
+            .is_some_and(|case| case.cargo_test().is_none())
+        {
             self.command.deadline.min(TEST_CASE_DEADLINE)
         } else {
             self.command.deadline
@@ -1942,6 +1989,14 @@ impl ProductionSession {
         tool_run: Option<ToolRun>,
     ) -> Result<()> {
         let test_case_result = self.command.test_case.clone().map(|case| {
+            if case.cargo_test().is_some() {
+                return crate::cargo_tests::classify(
+                    case,
+                    &result.outcome,
+                    result.stdout.completeness,
+                    &result.stdout.bytes,
+                );
+            }
             classify_test_case_result(
                 case,
                 &result.outcome,
@@ -2526,7 +2581,9 @@ impl ProductionSession {
             .and_then(ReplayEngine::command_tree_link)
             .ok_or("missing post-tree")?
             .clone();
-        if let Some(comparison) = test_case_result {
+        if let Some(comparison) =
+            test_case_result.filter(|comparison| comparison.case.cargo_test().is_none())
+        {
             let comparison = test_case_event(
                 &finish,
                 comparison,

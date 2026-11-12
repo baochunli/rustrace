@@ -625,6 +625,14 @@ pub fn is_valid_console_test_tail<T: AsRef<str>>(tail: &[T]) -> bool {
     }
 
     match tail {
+        [target_option, target, filter, separator, exact] => {
+            target_option.as_ref() == "--test"
+                && is_valid_filter(target.as_ref())
+                && !target.as_ref().contains(':')
+                && is_valid_filter(filter.as_ref())
+                && separator.as_ref() == "--"
+                && exact.as_ref() == "--exact"
+        }
         [] => true,
         [filter] => is_valid_filter(filter.as_ref()),
         [separator, option] => {

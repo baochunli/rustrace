@@ -380,7 +380,8 @@ try:
         display = b" ".join(re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b" ", transcript).split())
         assert b" ERROR " in display, repr(bytes(transcript[-6000:]))
         assert b"recovery required" in transcript
-        assert b"External changes are not accepted" in transcript
+        # Terminal redraws can split a sentence across cursor-control sequences.
+        assert "External changes are not accepted" in rendered_screen(transcript)
         assert b"including unsaved" in display, repr(bytes(transcript[-6000:]))
     elif mode in ("diagnostic", "diagnostic_mouse"):
         assert capture["execution"]["outcome"] == {"kind":"exited", "code":101}

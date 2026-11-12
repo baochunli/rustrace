@@ -357,6 +357,7 @@ pub(crate) struct ExtendedCaseFiles {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct TestCase {
     name: String,
+    cargo_test: Option<(String, String)>,
     pair_blake3: Option<Hash>,
     has_input: bool,
     /// Parsed `NAME.args`; empty without the file, `None` when a present file
@@ -372,10 +373,27 @@ impl TestCase {
         }
         Ok(Self {
             name,
+            cargo_test: None,
             pair_blake3: None,
             has_input: true,
             args: Some(Vec::new()),
         })
+    }
+
+    pub(crate) fn cargo(target: &str, filter: &str, source: &[u8]) -> Self {
+        Self {
+            name: format!("cargo:{target}::{filter}"),
+            cargo_test: Some((target.to_owned(), filter.to_owned())),
+            pair_blake3: Some(hash_bytes(source)),
+            has_input: false,
+            args: Some(Vec::new()),
+        }
+    }
+
+    pub(crate) fn cargo_test(&self) -> Option<(&str, &str)> {
+        self.cargo_test
+            .as_ref()
+            .map(|(target, filter)| (target.as_str(), filter.as_str()))
     }
 
     pub fn name(&self) -> &str {
@@ -546,6 +564,7 @@ impl TestCaseDirectory {
                 continue;
             }
             let mut case = TestCase {
+                cargo_test: None,
                 pair_blake3: Some(refresh_identity(refresh_id, &name)),
                 name,
                 has_input: files.input,
@@ -780,6 +799,7 @@ impl TestCaseDirectory {
             .into_iter()
             .filter_map(|(name, pair)| {
                 (pair.input && pair.expected).then(|| TestCase {
+                    cargo_test: None,
                     pair_blake3: Some(refresh_identity(refresh_id, &name)),
                     name,
                     has_input: true,

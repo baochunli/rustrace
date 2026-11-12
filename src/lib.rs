@@ -2,6 +2,7 @@
 extern crate self as rustrace;
 
 pub mod cargo_policy;
+mod cargo_tests;
 mod command_process;
 pub mod config;
 mod console;

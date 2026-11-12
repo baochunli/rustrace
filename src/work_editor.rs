@@ -168,6 +168,8 @@ impl TestCasePicker {
             .get(self.selected)
             .map(|case| case.name().to_owned());
         self.details = None;
+        let mut listed_cases = Vec::new();
+        let mut fixture_error = None;
         match TestCaseDirectory::open(workspace_root, layout, suite).and_then(|directory| {
             let cases = directory.list_cases_for(layout)?;
             let details = (layout == crate::console::TestCaseLayout::Extended).then(|| {
@@ -176,7 +178,7 @@ impl TestCasePicker {
             Ok((cases, details))
         }) {
             Ok((cases, details)) => {
-                self.replace_cases(cases);
+                listed_cases = cases;
                 self.details = details;
                 self.notice = None;
             }
@@ -185,19 +187,38 @@ impl TestCasePicker {
                     .downcast_ref::<io::Error>()
                     .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
             {
-                self.replace_cases(Vec::new());
                 self.notice = Some(Self::missing_notice(packaged_suite_expected).to_owned());
             }
             Err(error) => {
-                self.replace_cases(Vec::new());
                 self.notice = Some("Packaged test cases are unavailable".to_owned());
-                return Err(error);
+                fixture_error = Some(error);
             }
         }
+        let cargo_cases = crate::cargo_tests::discover(workspace_root)?;
+        if !cargo_cases.is_empty() {
+            self.details.get_or_insert_with(|| TestCasePickerDetails {
+                cases: BTreeMap::new(),
+                fixtures: TestCaseFixtures::Workspace {
+                    workspace: workspace_root
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                },
+            });
+            listed_cases.extend(cargo_cases);
+            if !packaged_suite_expected && fixture_error.is_none() {
+                self.notice = None;
+            }
+        }
+        self.replace_cases(listed_cases);
         self.selected = selected
             .and_then(|name| self.cases.iter().position(|case| case.name() == name))
             .unwrap_or(0)
             .min(self.cases.len());
+        if let Some(error) = fixture_error {
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -350,6 +371,11 @@ impl TestCasePicker {
                 let status = match self.results.get(case.name()).map(|result| &result.outcome) {
                     None => "—".to_owned(),
                     Some(crate::session::TestCaseOutcome::Pass) => "PASS".to_owned(),
+                    Some(crate::session::TestCaseOutcome::Fail(_))
+                        if case.cargo_test().is_some() =>
+                    {
+                        "FAIL".to_owned()
+                    }
                     Some(crate::session::TestCaseOutcome::Fail(mismatch)) => {
                         format!("FAIL line {}", mismatch.line)
                     }
@@ -372,6 +398,13 @@ impl TestCasePicker {
     fn detail(&self) -> Option<TestCaseDetail> {
         let details = self.details.as_ref()?;
         let selection = match self.cases.get(self.selected) {
+            Some(case) if case.cargo_test().is_some() => {
+                let (target, filter) = case.cargo_test()?;
+                TestCaseSelection::Cargo {
+                    command: format!("cargo test --test {target} {filter} -- --exact"),
+                    status: self.results.get(case.name()).map(test_case_result_summary),
+                }
+            }
             Some(case) => {
                 let (arguments, input) = details.cases.get(case.name())?.clone();
                 let result = self
@@ -466,6 +499,9 @@ fn test_case_result_summary(result: &crate::session::TestCaseComparison) -> Stri
     let summary = match &result.outcome {
         crate::session::TestCaseOutcome::Pass => {
             format!("Test case {}: PASS", result.case.name())
+        }
+        crate::session::TestCaseOutcome::Fail(_) if result.case.cargo_test().is_some() => {
+            format!("Test case {}: FAIL — see Cargo output", result.case.name())
         }
         crate::session::TestCaseOutcome::Fail(mismatch) => format!(
             "Test case {}: FAIL at line {} — expected ({} bytes) \"{}\" got ({} bytes) \"{}\"",
@@ -5111,6 +5147,68 @@ format = ["cargo", "fmt"]
 
         assert_eq!(view, WorkView::Console);
         assert_eq!(focus, WorkspaceFocus::Console);
+    }
+
+    #[test]
+    fn cargo_picker_retains_results_and_survives_missing_or_invalid_fixture_folder() {
+        use crate::console::TestCaseLayout;
+        let parent =
+            std::env::temp_dir().join(format!("rustrace-cargo-picker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&parent);
+        let root = parent.join("work");
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        let source = root.join("tests/public_cli.rs");
+        std::fs::write(&source, b"#[test] fn plain() {}").unwrap();
+        let mut picker = TestCasePicker::default();
+        picker
+            .refresh(&root, TestCaseLayout::Paired, None, None)
+            .unwrap();
+        assert_eq!(picker.cases[0].name(), "cargo:public_cli::plain");
+        assert!(picker.notice.is_none());
+        picker.record_completed(crate::session::TestCaseComparison {
+            case: picker.cases[0].clone(),
+            outcome: crate::session::TestCaseOutcome::Pass,
+            expected_blake3: None,
+            actual_blake3: None,
+        });
+        picker
+            .refresh(&root, TestCaseLayout::Paired, None, None)
+            .unwrap();
+        assert_eq!(picker.results.len(), 1);
+        assert!(matches!(
+            picker.detail().unwrap().selection,
+            crate::tui::TestCaseSelection::Cargo { .. }
+        ));
+        std::fs::write(&source, b"#[test] fn plain() { assert!(true); }").unwrap();
+        picker
+            .refresh(&root, TestCaseLayout::Paired, None, None)
+            .unwrap();
+        assert!(picker.results.is_empty());
+        picker
+            .refresh(
+                &root,
+                TestCaseLayout::Paired,
+                Some(rustrace_model::Hash::from_bytes([1; 32])),
+                None,
+            )
+            .unwrap();
+        assert_eq!(picker.cases.len(), 1);
+        assert_eq!(
+            picker.notice.as_deref(),
+            Some("Packaged test cases are unavailable")
+        );
+        std::fs::write(parent.join("test-cases"), b"not a directory").unwrap();
+        assert!(
+            picker
+                .refresh(&root, TestCaseLayout::Paired, None, None)
+                .is_err()
+        );
+        assert_eq!(picker.cases.len(), 1);
+        assert_eq!(
+            picker.notice.as_deref(),
+            Some("Packaged test cases are unavailable")
+        );
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     #[test]

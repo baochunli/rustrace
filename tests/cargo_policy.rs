@@ -444,6 +444,8 @@ fn console_test_grammar_preserves_every_bounded_filter_and_output_form() {
         "cargo test tests::".to_owned(),
         "cargo test 1".to_owned(),
         "cargo test legal-moves".to_owned(),
+        "cargo test --test public_cli get_prints_plain_text -- --exact".to_owned(),
+        "cargo test --test public-cli nested::works -- --exact".to_owned(),
         "cargo test -- --nocapture".to_owned(),
         "cargo test -- --no-capture".to_owned(),
         "cargo test -- --show-output".to_owned(),
@@ -482,6 +484,12 @@ fn console_test_grammar_rejects_every_escape_and_byte_overflow() {
         "cargo test -- -- --show-output".to_owned(),
         "cargo test -- --nocapture=true".to_owned(),
         "cargo test -- --exact".to_owned(),
+        "cargo test --test public_cli works".to_owned(),
+        "cargo test --test public_cli works -- --ignored".to_owned(),
+        "cargo test --test ../public_cli works -- --exact".to_owned(),
+        "cargo test --test public::cli works -- --exact".to_owned(),
+        "cargo test --test --all works -- --exact".to_owned(),
+        "cargo test --test public_cli works -- --exact --nocapture".to_owned(),
         "cargo test -- --ignored".to_owned(),
         "cargo test -- --test-threads=1".to_owned(),
         "cargo test --locked".to_owned(),
@@ -702,6 +710,7 @@ fn console_test_forms_prepare_the_exact_literal_tail_after_controller_locking() 
         "cargo test tests::legal_moves -- --nocapture",
         "cargo test tests::legal_moves -- --no-capture",
         "cargo test tests::legal_moves -- --show-output",
+        "cargo test --test public_cli nested::works -- --exact",
     ] {
         let request = parse_console_command(input).unwrap();
         let prepared = prepare_console(&request, &tools(), &PathBuf::from("/workspace")).unwrap();
@@ -822,7 +831,7 @@ fn rejection_names_the_complete_student_allowlist_without_internal_ids() {
         .to_string();
     assert_eq!(
         message,
-        "unsupported Cargo command; allowed: cargo build, cargo check, cargo test [FILTER] [-- OUTPUT_OPTION] (OUTPUT_OPTION: --nocapture, --no-capture, or --show-output), cargo run [--release] [-- ARGS] [< IN] [> OUT], cargo clippy, cargo doc, cargo add NAME, cargo add NAME@VERSION, cargo remove NAME, cargo update"
+        "unsupported Cargo command; allowed: cargo build, cargo check, cargo test [FILTER] [-- OUTPUT_OPTION] (OUTPUT_OPTION: --nocapture, --no-capture, or --show-output), cargo test --test TARGET FILTER -- --exact, cargo run [--release] [-- ARGS] [< IN] [> OUT], cargo clippy, cargo doc, cargo add NAME, cargo add NAME@VERSION, cargo remove NAME, cargo update"
     );
     assert!(!message.contains("T10.10"));
     assert!(!message.contains("T4.3"));

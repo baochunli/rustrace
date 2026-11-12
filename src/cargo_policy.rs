@@ -290,7 +290,7 @@ impl fmt::Display for PreparationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::UnsupportedCommand => {
-                "unsupported Cargo command; allowed: cargo build, cargo check, cargo test [FILTER] [-- OUTPUT_OPTION] (OUTPUT_OPTION: --nocapture, --no-capture, or --show-output), cargo run [--release] [-- ARGS] [< IN] [> OUT], cargo clippy, cargo doc, cargo add NAME, cargo add NAME@VERSION, cargo remove NAME, cargo update"
+                "unsupported Cargo command; allowed: cargo build, cargo check, cargo test [FILTER] [-- OUTPUT_OPTION] (OUTPUT_OPTION: --nocapture, --no-capture, or --show-output), cargo test --test TARGET FILTER -- --exact, cargo run [--release] [-- ARGS] [< IN] [> OUT], cargo clippy, cargo doc, cargo add NAME, cargo add NAME@VERSION, cargo remove NAME, cargo update"
             }
             Self::InvalidToolSelection => {
                 "expected an explicitly resolved installed toolchain name"

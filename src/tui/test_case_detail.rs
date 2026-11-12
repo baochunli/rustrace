@@ -45,6 +45,10 @@ pub struct TestCaseDetail {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TestCaseSelection {
+    Cargo {
+        command: String,
+        status: Option<String>,
+    },
     /// One case, with its last result in this session.
     Case {
         arguments: TestCaseArguments,
@@ -211,6 +215,22 @@ pub(crate) fn detail_rows(detail: &TestCaseDetail, width: usize, rows: usize) ->
     let text_width = width.saturating_sub(usize::from(LABEL_WIDTH)).max(1);
     let mut sections = Vec::new();
     match &detail.selection {
+        TestCaseSelection::Cargo { command, status } => {
+            sections.push(Section::wrapped(
+                0,
+                "Cargo test",
+                command.clone(),
+                DetailTone::Plain,
+                text_width,
+            ));
+            sections.push(Section::wrapped(
+                1,
+                "Result",
+                status.clone().unwrap_or("Not run yet".into()),
+                DetailTone::Plain,
+                text_width,
+            ));
+        }
         TestCaseSelection::Case {
             arguments,
             input,

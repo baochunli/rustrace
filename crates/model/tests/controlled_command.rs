@@ -238,6 +238,8 @@ fn console_test_evidence_accepts_and_round_trips_every_canonical_tail() {
         "--locked tests::legal_moves -- --nocapture",
         "--locked tests::legal_moves -- --no-capture",
         "--locked tests::legal_moves -- --show-output",
+        "--locked --test public_cli get_prints_plain_text -- --exact",
+        "--locked --test public-cli nested::works -- --exact",
     ] {
         let tail = tail.split_ascii_whitespace().collect::<Vec<_>>();
         let original = cargo_start("test", "test", &tail, true);
@@ -306,6 +308,12 @@ fn console_test_evidence_rejects_malformed_tails_and_filter_overflow() {
         "--locked -- -- --show-output",
         "--locked -- --nocapture=true",
         "--locked -- --exact",
+        "--locked --test public_cli works",
+        "--locked --test public_cli works -- --ignored",
+        "--locked --test ../public_cli works -- --exact",
+        "--locked --test public::cli works -- --exact",
+        "--locked --test --all works -- --exact",
+        "--locked --test public_cli works -- --exact --nocapture",
         "--locked -- --ignored",
         "--locked -- --test-threads=1",
         "--locked tests/legal_moves",
