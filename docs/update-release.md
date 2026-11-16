@@ -1,8 +1,10 @@
 # How does a maintainer release a new update to Rustrace?
 
-For the bounded console Test options, complete the
-[reader-first rollout checklist](releases/test-debug-options.md) before making
-the student update available, including through release-tag publication.
+For new recorded command forms, complete a reader-first rollout before making
+the student update available, including through release-tag publication. See
+the [v0.2.0 targeted Test compatibility check](releases/v0.2.0-reader-compatibility.md)
+and the earlier [bounded Test checklist](releases/test-debug-options.md).
+A published release alone does not establish that course readers were updated.
 
 Assume that the latest release is v0.1.6, and a fix should be released as v0.1.7. The release workflow (.github/workflows/release.yml) automatically publishes when you push a v* tag.
 

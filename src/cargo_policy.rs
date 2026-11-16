@@ -93,60 +93,111 @@ fn is_shell_character(character: char) -> bool {
     )
 }
 
-/// Characters refused inside a program argument after `--`. There is no
-/// shell, so wildcards, `$`, `~`, `\`, brackets, parentheses, braces, `!`, and
-/// `#` reach the program literally; quotes, backticks, and the operators
-/// `|`, `&`, `;`, `<`, and `>` would suggest shell behaviour that does not
-/// happen, so they are refused rather than passed on.
-fn is_refused_in_argument(character: char) -> bool {
-    matches!(character, '\'' | '"' | '`' | '|' | '&' | ';' | '<' | '>')
+/// Preserve whether a token used quoting: quoted `<` and `>` are data, and
+/// quotes are allowed only in Run arguments, never command or path syntax.
+#[derive(Default)]
+struct ConsoleToken {
+    text: String,
+    quoted: bool,
+    refused_unquoted: bool,
 }
 
-/// The token positions of a Run's program arguments: after `cargo run`, an
-/// optional `--release`, and `--`, up to the first `<` or `>` token.
-fn run_argument_tokens(tokens: &[&str]) -> std::ops::Range<usize> {
-    if tokens.get(..2) != Some(&["cargo", "run"][..]) {
+impl ConsoleToken {
+    fn is_redirect(&self) -> bool {
+        !self.quoted && matches!(self.text.as_str(), "<" | ">")
+    }
+}
+
+/// A small argument lexer, not a shell. Single quotes preserve every character;
+/// double quotes also allow `\"` and `\\`. Unquoted backslashes stay literal
+/// for compatibility with existing regex/path arguments. Nothing is expanded.
+fn console_tokens(input: &str) -> Result<Vec<ConsoleToken>, PreparationError> {
+    let mut characters = input.chars().peekable();
+    let mut tokens = Vec::new();
+    while characters.peek().is_some() {
+        if characters.peek().is_some_and(|c| c.is_ascii_whitespace()) {
+            characters.next();
+            continue;
+        }
+        let mut token = ConsoleToken::default();
+        let mut quote = None;
+        while let Some(&character) = characters.peek() {
+            if quote.is_none() && character.is_ascii_whitespace() {
+                break;
+            }
+            characters.next();
+            match quote {
+                Some(delimiter) if character == delimiter => quote = None,
+                Some('"') if character == '\\' => {
+                    if characters.peek().is_some_and(|c| matches!(c, '"' | '\\')) {
+                        token.text.push(characters.next().expect("peeked escape"));
+                    } else {
+                        token.text.push(character);
+                    }
+                }
+                Some(_) => token.text.push(character),
+                None if matches!(character, '\'' | '"') => {
+                    quote = Some(character);
+                    token.quoted = true;
+                }
+                None => {
+                    token.refused_unquoted |=
+                        matches!(character, '`' | '|' | '&' | ';' | '<' | '>');
+                    token.text.push(character);
+                }
+            }
+        }
+        if quote.is_some() {
+            return Err(PreparationError::UnsupportedCommand);
+        }
+        tokens.push(token);
+    }
+    Ok(tokens)
+}
+
+/// The token positions of a Run's program arguments, ending only at an
+/// unquoted redirection. Validation below rejects quoted command syntax.
+fn run_argument_tokens(tokens: &[ConsoleToken]) -> std::ops::Range<usize> {
+    if tokens.first().map(|token| token.text.as_str()) != Some("cargo")
+        || tokens.get(1).map(|token| token.text.as_str()) != Some("run")
+    {
         return 0..0;
     }
     let mut index = 2;
-    if tokens.get(index) == Some(&"--release") {
+    if tokens.get(index).map(|token| token.text.as_str()) == Some("--release") {
         index += 1;
     }
-    if tokens.get(index) != Some(&"--") {
+    if tokens.get(index).map(|token| token.text.as_str()) != Some("--") {
         return 0..0;
     }
     let start = index + 1;
     let end = tokens[start..]
         .iter()
-        .position(|token| matches!(*token, "<" | ">"))
+        .position(ConsoleToken::is_redirect)
         .map_or(tokens.len(), |offset| start + offset);
     start..end
 }
 
-/// Parse the bounded literal console grammar before any effect.
-///
-/// A Run is `cargo run [--release] [-- ARG...] [< IN] [> OUT]`. Tokens are
-/// separated by ASCII whitespace and taken literally: nothing is expanded,
-/// and there are no quotes or escapes, so an argument cannot contain a space.
-/// Program arguments may hold characters a shell would interpret, which the
-/// program receives unchanged, except quotes, backticks, `|`, `&`, `;`, `<`,
-/// and `>`; the rest of the line refuses every shell character. `--` must be
-/// followed by at least one argument. Arguments end at the first `<` or `>`
-/// token, so redirections always follow the arguments and are never passed to
-/// the program, and a redirection before `--` is refused. The two
-/// redirections may appear in either order, each at most once. Arguments
-/// obey the packaged `NAME.args` bounds: at most 64, each 1 to 1024 bytes.
+/// Parse `cargo run [--release] [-- ARG...] [< IN] [> OUT]` and the fixed
+/// non-Run commands. Run arguments support quoting without shell expansion.
+/// Only unquoted `<`/`>` tokens start redirections, which must come last.
+/// Command words and redirect paths retain their restricted literal grammar.
+/// Arguments obey the recorded bounds: at most 64, each 1 to 1024 bytes.
 pub fn parse_console_command(input: &str) -> Result<ConsoleCommand, PreparationError> {
     if input.is_empty() || input.len() > 4096 || input.chars().any(char::is_control) {
         return Err(PreparationError::UnsupportedCommand);
     }
-    let tokens = input.split_ascii_whitespace().collect::<Vec<_>>();
-    let arguments = run_argument_tokens(&tokens);
-    for (index, token) in tokens.iter().enumerate() {
+    let lexed = console_tokens(input)?;
+    let arguments = run_argument_tokens(&lexed);
+    let tokens = lexed
+        .iter()
+        .map(|token| token.text.as_str())
+        .collect::<Vec<_>>();
+    for (index, token) in lexed.iter().enumerate() {
         let refused = if arguments.contains(&index) {
-            token.chars().any(is_refused_in_argument)
+            token.refused_unquoted
         } else {
-            token.chars().any(is_shell_character)
+            token.quoted || token.text.chars().any(is_shell_character)
         };
         if refused {
             return Err(PreparationError::UnsupportedCommand);
@@ -184,13 +235,12 @@ pub fn parse_console_command(input: &str) -> Result<ConsoleCommand, PreparationE
     let mut args = Vec::new();
     if tokens.get(index) == Some(&"--") {
         index += 1;
-        while let Some(argument) = tokens.get(index)
-            && !matches!(*argument, "<" | ">")
-        {
-            if argument.contains(['<', '>']) || !is_valid_test_case_arg(argument) {
+        while arguments.contains(&index) {
+            let argument = tokens[index];
+            if !is_valid_test_case_arg(argument) {
                 return Err(PreparationError::UnsupportedCommand);
             }
-            args.push((*argument).to_owned());
+            args.push(argument.to_owned());
             index += 1;
         }
         if args.is_empty() || !are_valid_test_case_args(&args) {
@@ -342,7 +392,7 @@ pub fn prepare_console(
 /// otherwise it runs in the workspace. A Run's program arguments end the
 /// argument vector as `-- ARG...`, after every Cargo option. They need only
 /// the recorded-argument bounds: a packaged `NAME.args` may hold spaces,
-/// quotes, `<`, or `>`, which only the typed console grammar excludes.
+/// quotes, `<`, or `>`; console quoting produces the same literal arguments.
 pub fn prepare_console_in(
     request: &ConsoleCommand,
     tools: &ResolvedTools,
