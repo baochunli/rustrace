@@ -378,21 +378,21 @@ try:
     send(b"\x1b[20~")
     wait_for(lambda: " CONSOLE " in rendered_screen(), "console")
     # Nothing expands arguments: `*` and `$` reach the program as typed.
-    type_console("cargo run -- --console a*b $HOME")
+    type_console("cargo run -- --console a*b $HOME --json '{\"name\": \"Alice\"}'")
     wait_for(
         lambda: len(runs()) == 5
         and "cwd=lab.test-cases/files" in rendered_screen()
-        and "args=--console|a*b|$HOME" in rendered_screen(),
+        and 'args=--console|a*b|$HOME|--json|{"name": "Alice"}' in rendered_screen(),
         "console Run output",
     )
     assert runs()[4] == {
-        "cwd": str(files), "args": ["--console", "a*b", "$HOME"], "stdin": "console"
+        "cwd": str(files), "args": ["--console", "a*b", "$HOME", "--json", '{"name": "Alice"}'], "stdin": "console"
     }, runs()
     wait_console_idle("first console Run finished")
-    type_console("cargo run -- 'quoted'")
-    wait_for(lambda: "console command rejected" in normalized_since(0), "quoted refusal")
+    type_console("cargo run -- 'unfinished")
+    wait_for(lambda: "console command rejected" in normalized_since(0), "unmatched quote refusal")
     # A rejected line stays at the prompt for editing; clear it.
-    send(b"\x7f" * len("cargo run -- 'quoted'"))
+    send(b"\x7f" * len("cargo run -- 'unfinished"))
     wait_for(lambda: "> ▏" in rendered_screen(), "empty prompt")
     send(b"\x1b")
     wait_for(lambda: " CONSOLE " not in rendered_screen(), "console closed")
@@ -545,7 +545,7 @@ try:
     assert starts[4]["console"] == {
         "stdin": {"kind": "submitted"},
         "stdout": {"kind": "console"},
-        "args": ["--console", "a*b", "$HOME"],
+        "args": ["--console", "a*b", "$HOME", "--json", '{"name": "Alice"}'],
         "working_directory": fixtures,
     }, starts[4]
     changed = starts[5]["console"]["working_directory"]["fixtures_blake3"]

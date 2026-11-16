@@ -129,10 +129,7 @@ fn console_literal_grammar_rejects_shell_syntax_flags_and_malformed_routes() {
         "cargo run -- >out",
         "cargo run -- 2>err",
         "cargo run -- x <in",
-        // Quotes, backticks, and shell operators stay refused in arguments,
-        // and a control character anywhere.
-        "cargo run -- 'quoted arg'",
-        "cargo run -- \"quoted\"",
+        // Unmatched quotes, unquoted shell operators, and controls are refused.
         "cargo run -- it's",
         "cargo run -- `date`",
         "cargo run -- a|b",
@@ -313,6 +310,103 @@ fn console_run_arguments_pass_shell_characters_literally() {
 }
 
 #[test]
+fn console_run_quoted_arguments_preserve_json_and_literal_data() {
+    for (input, args) in [
+        (
+            r#"cargo run -- https://example.com --json '{"name": "Alice", "role": "admin"}'"#,
+            vec![
+                "https://example.com",
+                "--json",
+                r#"{"name": "Alice", "role": "admin"}"#,
+            ],
+        ),
+        (
+            r#"cargo run -- "Alice Smith" 'café 🦀'"#,
+            vec!["Alice Smith", "café 🦀"],
+        ),
+        (
+            r#"cargo run -- --json="{\"name\": \"Alice\"}""#,
+            vec![r#"--json={"name": "Alice"}"#],
+        ),
+        (
+            r#"cargo run -- 'a\nb' "a\\b" "a\nb" "it's""#,
+            vec![r"a\nb", r"a\b", r"a\nb", "it's"],
+        ),
+        (
+            r#"cargo run -- '$HOME; $(touch injected) | `date` & *'"#,
+            vec!["$HOME; $(touch injected) | `date` & *"],
+        ),
+        (r#"cargo run -- '<' ">" 'a>b'"#, vec!["<", ">", "a>b"]),
+        (
+            r#"cargo run -- pre' two 'post "--release" '--'"#,
+            vec!["pre two post", "--release", "--"],
+        ),
+    ] {
+        let parsed =
+            parse_console_command(input).unwrap_or_else(|error| panic!("{input}: {error}"));
+        assert_eq!(parsed.args, args, "{input}");
+        assert!(parsed.stdin.is_none() && parsed.stdout.is_none());
+        let prepared = prepare_console(&parsed, &tools(), &PathBuf::from("/workspace")).unwrap();
+        let passed = prepared
+            .command
+            .get_args()
+            .skip_while(|arg| *arg != "--")
+            .skip(1)
+            .map(|arg| arg.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            passed, args,
+            "{input}: exact argv without shell interpretation"
+        );
+    }
+    let parsed =
+        parse_console_command(r#"cargo run --release -- '>' '{"x": "< >"}' < in.txt > out.txt"#)
+            .unwrap();
+    assert_eq!(parsed.args, [">", r#"{"x": "< >"}"#]);
+    assert_eq!(parsed.stdin.unwrap().as_str(), "in.txt");
+    assert_eq!(parsed.stdout.unwrap().as_str(), "out.txt");
+}
+
+#[test]
+fn console_run_quoting_preserves_bounds_and_command_restrictions() {
+    for input in [
+        "cargo run -- 'unfinished",
+        "cargo run -- \"unfinished",
+        r#"cargo run -- "escaped closing quote\""#,
+        r#"cargo run -- "trailing backslash\"#,
+        "cargo run -- ''",
+        "cargo run -- \"\"",
+        "cargo run -- 'ok'|cat",
+        "cargo run -- 'ok';check",
+        "'cargo' run -- x",
+        "cargo 'run' -- x",
+        "cargo run '--' x",
+        "cargo run '--release' -- x",
+        "cargo test 'filter'",
+        "cargo run -- x > 'out.txt'",
+        "cargo run -- x < in.txt '>' out.txt",
+        "cargo run -- 'a\nb'",
+    ] {
+        assert!(parse_console_command(input).is_err(), "accepted {input:?}");
+    }
+    let longest = "é".repeat(512);
+    assert_eq!(
+        parse_console_command(&format!("cargo run -- '{longest}'"))
+            .unwrap()
+            .args,
+        std::slice::from_ref(&longest)
+    );
+    assert!(parse_console_command(&format!("cargo run -- '{longest}a'")).is_err());
+    assert!(
+        parse_console_command(&format!("cargo run -- {}", vec!["'x y'"; 64].join(" "))).is_ok()
+    );
+    assert!(
+        parse_console_command(&format!("cargo run -- {}", vec!["'x y'"; 65].join(" "))).is_err()
+    );
+    assert!(parse_console_command(&format!("cargo run -- '{}'", "x".repeat(4096))).is_err());
+}
+
+#[test]
 fn console_run_arguments_end_the_prepared_argument_vector() {
     let workspace = PathBuf::from("/course/lab2.work");
     let fixtures = PathBuf::from("/course/lab2.test-cases/files");
@@ -410,7 +504,7 @@ fn console_run_arguments_end_the_prepared_argument_vector() {
             "{request:?}"
         );
     }
-    // Packaged `NAME.args` arguments may hold what the console cannot type.
+    // Packaged `NAME.args` arguments need no console quoting.
     let packaged = run(argv(&["a b", "<tag>", "'q'", "*.txt", "$HOME;|&"]));
     let prepared =
         rustrace::cargo_policy::prepare_console_in(&packaged, &tools(), &workspace, None).unwrap();

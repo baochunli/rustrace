@@ -130,7 +130,7 @@ fn student_guide_explains_what_the_picker_shows_for_version_3_cases() {
         "Do not edit, add, or remove files in the fixture folder",
         "The console's `cargo run` already starts in the same folder as the case.",
         "`cargo run -- -n fn tests/grep.md < grep_n.in`",
-        "A backslash does not escape a space either: `cargo run -- a\\ b` passes the two arguments `a\\` and `b`.",
+        "Unquoted backslashes remain literal too: `a\\ b` is two arguments, `a\\` and `b`.",
         "An argument shown with an escape such as `\\u{a0}` cannot be typed that way either",
         "A red `cannot start:` row, with the reason, marks a case that a run would refuse",
     ] {

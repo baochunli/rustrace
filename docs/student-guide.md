@@ -855,27 +855,44 @@ older recordings.
 
 The complete `cargo run` form is
 `cargo run [--release] [-- ARG...] [< IN] [> OUT]`; brackets mark optional
-parts. Everything after `--` is passed to your program as its arguments, one
-argument per space-separated word, exactly as typed: `cargo run -- -n fn main`
-gives your program the three arguments `-n`, `fn`, and `main`. Words such as
-`--release` or a second `--` after the separator are arguments too. Give at
-least one argument after `--`; at most 64 are allowed, each up to 1024 bytes.
+parts. Everything after `--` is passed to your program as its arguments.
+Separate arguments with spaces; enclose an argument in single or double quotes
+to include spaces or JSON. For example:
 
-The console is not a shell, so nothing in an argument is expanded or
-interpreted: characters such as `*`, `?`, `$`, `~`, `\`, `!`, `#`, brackets,
-parentheses, and braces reach your program unchanged. `cargo run -- a*b file`
-passes `a*b`, not a list of matching files; `cargo run -- $HOME` passes the
-five characters `$HOME`; and `cargo run -- fn(x) tests/grep.md` passes
-`fn(x)` and `tests/grep.md`. Quoting and pipes are not supported: an argument
-may not contain `'`, `"`, or a backtick, nor `|`, `&`, `;`, `<`, or `>`, and
-because there is no quoting, one argument cannot contain a space. A backslash
-does not escape a space either: `cargo run -- a\ b` passes the two arguments
-`a\` and `b`. The first word that is exactly `<` or `>` ends the arguments and starts the
-redirections, which therefore always come last: `cargo run -- a < in.txt`
-works, and `cargo run < in.txt -- a` is rejected. A version 3 case's
-`NAME.args` file can hold any of these characters, and spaces, which the
-console cannot type. Your program's arguments are recorded with the command;
-the lines you type as its standard input are not.
+```console
+cargo run -- https://example.com --json '{"name": "Alice", "role": "admin"}'
+```
+
+The program receives three arguments: `https://example.com`, `--json`, and
+`{"name": "Alice", "role": "admin"}`. The outer single quotes are removed;
+the double quotes inside are preserved. Single quotes preserve all enclosed
+characters. Inside double quotes, `\"` produces a literal double quote and
+`\\` produces a single backslash; other backslashes remain literal. Quoted
+and unquoted parts of a word join into one argument, so `--json='{"name":"Alice"}'`
+is also accepted. Close every quote; empty arguments are not supported.
+
+The console does not invoke a shell. It never expands variables, wildcards,
+or command substitutions: `'$HOME'`, `'$(date)'`, and `*.txt` reach the program
+as literal text. Unquoted backslashes remain literal too: `a\ b` is two
+arguments, `a\` and `b`. Quote arguments containing backticks, `|`, `&`, `;`,
+`<`, or `>`; those characters are data inside quotes, never shell operators.
+Words such as `--release` or a second `--` after the separator are arguments
+too. Give at least one argument after `--`; at most 64 are allowed, each up
+to 1024 bytes after removing quotes and decoding the two supported escapes.
+The whole console line is limited to 4096 bytes and cannot contain control
+characters.
+
+Only an unquoted word exactly equal to `<` or `>` starts redirection, which
+must come last: `cargo run -- '>' < in.txt` passes `>` as an argument and
+reads `in.txt`. `cargo run < in.txt -- a` is rejected. Command words and
+redirection paths do not support quoting. A version 3 case's `NAME.args`
+file still holds one literal argument per line, without surrounding shell
+quotes. Your program's arguments are recorded with the command; the lines
+you type as its standard input are not.
+
+Quoted console arguments are supported from Rustrace v0.2.1; v0.2.0
+and earlier reject them. This change uses the existing Run argument format
+and does not introduce a new recording format or require repacking `.rta` files.
 
 Redirections are allowed only for `cargo run`. Their paths are relative to a
 directory named `test-cases` that sits next to your workspace directory, or to
@@ -921,9 +938,11 @@ limit stops the command. The existing deadline (at most five minutes) and Esc
 or Ctrl-C cancellation also apply to filtered tests and every output option. Esc returns
 to the workspace view.
 
-F4 or the Test cases menu entry opens a modal test-case picker. For a version 1
-or 2 assignment, it lists complete `.in`/`.expected` paired cases; for a
-version 3 assignment, it lists every case that has a `NAME.expected`, including
+F4 or the Test cases menu entry opens a modal test-case picker. From Rustrace
+0.2.0, it lists discovered Cargo integration tests alongside packaged cases;
+see [Cargo integration tests in the picker](#cargo-integration-tests-in-the-picker).
+For packaged cases in a version 1 or 2 assignment, it lists complete
+`.in`/`.expected` paired cases; for a version 3 assignment, it lists every case that has a `NAME.expected`, including
 cases without `NAME.in`. Cases appear in bytewise name order, and the list ends
 with a `Run all` row. Each case shows `—`, `PASS`, `FAIL line N`, or `ERROR` for
 its last result in this session. Up and Down select with wrapping; mouse hover
@@ -939,21 +958,21 @@ finishes. The output pane shows the controlled command and then one test-case
 result line, retaining each result line as a Run all queue advances. A later
 non-test command takes ownership of the output pane. Run all runs every listed
 case serially in that order through the single runner; it never starts cases in
-parallel. Each case may run for at most 10 seconds, including the `cargo run`
-build, so a program that hangs fails that case with a deadline ERROR and Run
+parallel. Each packaged case may run for at most 10 seconds, including the
+`cargo run` build, so a program that hangs fails that case with a deadline ERROR and Run
 all moves on. During a run the mode bar reads `esc/ctrl-c cancel`: Esc or
 Ctrl-C cancels the active run and the rest of the queue; F1, F7, and F9 wait
 until that sequence finishes. Menu commands other than Run show the same hint
 while they run. If the picker was opened over the Console view, closing its
 final reopened modal restores that view. A
-selected case uses the same prepared, policy-checked, limited, and recorded
-Cargo action as typing `cargo run < NAME.in` in the console, apart from its
+selected packaged case uses the same prepared, policy-checked, limited, and
+recorded Cargo action as typing `cargo run < NAME.in` in the console, apart from its
 shorter deadline. A version 3 case reads its `NAME.args` and `NAME.in` when it
 starts, so a case behaves like `cargo run -- ARG... < NAME.in` from the
 [folder described above](#where-a-version-3-program-runs). Its `NAME.in` bytes
 are read first and reach your program through a pipe, not as a file, and a
 case without `NAME.in` runs with standard input closed. Every completed
-picker run records one `test_case_compared` event immediately after its
+packaged-case run records one `test_case_compared` event immediately after its
 controlled command finishes. That event retains the command ID, case name,
 expected BLAKE3 digest, optional actual BLAKE3 digest, and typed result.
 Mismatch details retain the positive one-based line and expected and actual
@@ -995,7 +1014,7 @@ cannot show how files you produced elsewhere were made.
 
 ### Cargo integration tests in the picker
 
-With the course-provided update, F4 also discovers `#[test]` functions in
+From Rustrace 0.2.0, F4 also discovers `#[test]` functions in
 `tests/*.rs`, including functions inside inline modules. These rows use names
 such as `cargo:public_cli::get_prints_plain_text`. Opening or refreshing the
 picker reads the source; running a test builds and executes it through Cargo.
@@ -1010,9 +1029,10 @@ a failed assertion reports FAIL, and a build failure, missing or ignored test,
 cancellation, or incomplete output reports ERROR. Changes to source can change
 which tests are discovered; press R to refresh the list.
 
-Cargo test runs retain the normal controlled-command recording and output
-limits. They do not produce a packaged `test_case_compared` event: their
-assertions determine the result. Instructor grading uses the course's
+Cargo test runs retain the normal controlled-command recording, output limits,
+and command deadline (at most five minutes), rather than the packaged-case
+ten-second deadline. They do not produce a packaged `test_case_compared` event:
+their assertions determine the result. Instructor grading uses the course's
 authoritative tests.
 
 ### Version 3 cases in the picker
@@ -1086,12 +1106,11 @@ three rows of arguments, and the remaining files. Arguments that do not fit end
 with `… N arguments`, where N counts them all.
 
 To reproduce a case in the F9 console, type its arguments after `cargo run --`,
-separated by spaces and without the marks, and add `< NAME.in` if the case has
-input. The console's `cargo run` already starts in the same folder as the case.
-For the case shown above, `cargo run -- -n fn main tests/grep.md` would not be
-the same: `fn main` is one argument with a space, which the console cannot
-type, because it has no quoting and a backslash does not escape a space. A
-case such as `«-n» «fn» «tests/grep.md»` with input `grep_n.in` is typed as
+without the `«…»` display marks, and add `< NAME.in` if the case has input.
+Quote arguments containing spaces or quotes as described above. The console's
+`cargo run` already starts in the same folder as the case. For the case shown
+above, type `cargo run -- -n 'fn main' tests/grep.md`; `fn main` is one argument.
+A case such as `«-n» «fn» «tests/grep.md»` with input `grep_n.in` is typed as
 `cargo run -- -n fn tests/grep.md < grep_n.in`. An argument shown with an
 escape such as `\u{a0}` cannot be typed that way either: the console does not
 read escapes, so typing `\u{a0}` passes those six characters rather than the
@@ -1109,8 +1128,9 @@ program in that folder: a case run from the picker, a `cargo run` typed in the
 console with or without arguments, and the menu's Run. A program therefore
 opens the case's files by the same relative names that its arguments and
 expected output use. Typing a case's arguments and input in the console, such
-as `cargo run -- -n main < NAME.in`, runs the program the same way, except that
-the console cannot type an argument containing a space. Cargo still builds your workspace into its own `target` folder;
+as `cargo run -- -n main < NAME.in`, runs the program the same way, with
+quoting when an argument contains spaces. Cargo still builds your workspace
+into its own `target` folder;
 the recorded command adds `--manifest-path ../../WORKSPACE/Cargo.toml`, which
 names only your workspace folder. Other commands, such as `cargo check` and
 `cargo test`, still run in the workspace. A version 3 package without `files/`,

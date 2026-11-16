@@ -649,7 +649,7 @@ fn format3_without_fixtures_parent() {
     }
     let (parent, root) = format3_fixture_with("without-fixtures", |parent| {
         vec![
-            // Packaged arguments may hold what the console cannot type.
+            // Packaged arguments are literal, without console quoting.
             ("shell.args".into(), b"<tag>\n*.txt\n'q' \"d\"\n$HOME;&\n".to_vec()),
             (
                 "shell.expected".into(),
@@ -869,18 +869,36 @@ fn console_arguments_in_a_workspace_run_child() {
         serde_json::from_slice(&fs::read(root.join("target/invocation.json")).unwrap()).unwrap();
     assert_eq!(invocation["working_directory"], root.to_str().unwrap());
     assert_eq!(invocation["program_args"], json!(["-n", "fn(x)=$HOME"]));
+    let json_args = json!([
+        "https://example.com",
+        "--json",
+        r#"{"name": "Alice", "role": "admin"}"#,
+        ">"
+    ]);
+    session.start_console_command(
+        r#"cargo run -- https://example.com --json '{"name": "Alice", "role": "admin"}' '>' < input.txt"#,
+    ).unwrap();
+    wait(&mut session);
+    let invocation: Value =
+        serde_json::from_slice(&fs::read(root.join("target/invocation.json")).unwrap()).unwrap();
+    assert_eq!(invocation["program_args"], json_args);
     for line in [
         "cargo run -- a < in.txt extra",
         "cargo run < input.txt -- a",
-        "cargo run -- 'quoted'",
+        "cargo run -- 'unfinished",
         "cargo run -- a;b",
     ] {
         assert!(session.start_console_command(line).is_err(), "{line}");
     }
-    session.quit().unwrap();
+    let receipt = session.finalize("student-1").unwrap();
+    let bundle = root.parent().unwrap().join("quoted-arguments.zip");
+    create_bundle(&receipt, &bundle).unwrap();
+    let verified = verify_path(&bundle, None);
+    assert!(verified.is_clean(), "{verified:#?}");
     let events = journal_events(&root);
     let starts = payloads(&events, "controlled_command_started");
-    assert_eq!(starts.len(), 1);
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[1]["console"]["args"], json_args);
     assert_eq!(
         starts[0]["console"],
         json!({"stdin": {"kind": "file", "path": "input.txt"},
